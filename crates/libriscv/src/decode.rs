@@ -1,4 +1,4 @@
-//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64I/M) and the
+//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64I/M/C) and the
 //! handler selection of `decode_bytecodes.cpp` + `threaded_rewriter.cpp`.
 //!
 //! Two decoders, mirroring the two in C++:
@@ -16,9 +16,11 @@
 
 use crate::decoder_cache::COMPRESSED;
 use crate::dispatch::{self, Handler};
-use crate::instruction::Instr;
+use crate::instruction::{CInstr, Instr, ci_code};
+use crate::isa::rvc::*;
 use crate::isa::rvi::*;
 use crate::isa::{InstrFn, Op};
+use crate::registers::REG_SP;
 
 pub(crate) const LOAD: u32 = 0b000_0011;
 pub(crate) const STORE: u32 = 0b010_0011;
@@ -47,6 +49,9 @@ pub(crate) struct OpInfo {
     /// Tail-call handler for an instruction that ends an over-long block
     /// (C++ `RV32I_BC_FUNCBLOCK`).
     pub funcblock: Handler,
+    /// Tail-call handler for a compressed slow-path instruction (C++
+    /// `RV32C_BC_FUNCTION`).
+    pub cfunction: Handler,
 }
 
 impl OpInfo {
@@ -56,11 +61,12 @@ impl OpInfo {
             exec: O::exec,
             function: dispatch::function::<O>,
             funcblock: dispatch::funcblock::<O>,
+            cfunction: dispatch::cseq::<O>,
         }
     }
 }
 
-/// Port of `CPU::decode` / `instr_decoding.inc` for RV64I + M.
+/// Port of `CPU::decode` / `instr_decoding.inc` for RV64I + M + C.
 pub(crate) fn decode(i: Instr) -> OpInfo {
     if i.is_long() {
         let it = i.itype();
@@ -192,12 +198,393 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
             _ => {}
         }
     }
-    // Compressed instructions: Phase 2.
+    if COMPRESSED
+        && i.is_compressed()
+        && let Some(info) = decode_compressed(CInstr::from(i))
+    {
+        return info;
+    }
     // All zeroes is an illegal instruction.
     if i.whole() == 0 {
         return OpInfo::of::<Illegal>();
     }
     OpInfo::of::<Unimplemented>()
+}
+
+/// The compressed half of `instr_decoding.inc` (RV64). `None` falls through
+/// to the illegal/unimplemented handling shared with 4-byte instructions,
+/// which C++ only reaches for opcodes its switch doesn't list.
+fn decode_compressed(ci: CInstr) -> Option<OpInfo> {
+    let rd = ci.rd();
+    Some(match ci.opcode() {
+        // Quadrant 0
+        x if x == ci_code(0b000, 0b00) => {
+            // All zeroes is illegal, and C.ADDI4SPN with nzuimm = 0 is
+            // reserved (insn:c-addi4spn_rsv).
+            if ci.whole() != 0 && ci.ciw_offset() != 0 {
+                OpInfo::of::<CAddi4spn>()
+            } else {
+                OpInfo::of::<Illegal>()
+            }
+        }
+        x if x == ci_code(0b001, 0b00)
+            || x == ci_code(0b010, 0b00)
+            || x == ci_code(0b011, 0b00) =>
+        {
+            match ci.funct3() {
+                0x1 => OpInfo::of::<CFld>(),
+                0x2 => OpInfo::of::<CLw>(),
+                _ => OpInfo::of::<CLd>(),
+            }
+        }
+        // Reserved in the base C extension; Zcb fills it with the byte and
+        // halfword loads and stores.
+        x if x == ci_code(0b100, 0b00) => match ci.czb_subf3() {
+            0b000 => OpInfo::of::<CLbu>(),
+            0b001 if ci.czb_half_signed() => OpInfo::of::<CLh>(),
+            0b001 => OpInfo::of::<CLhu>(),
+            0b010 => OpInfo::of::<CSb>(),
+            // C.SH has no second form
+            0b011 if !ci.czb_half_signed() => OpInfo::of::<CSh>(),
+            _ => OpInfo::of::<Illegal>(),
+        },
+        x if x == ci_code(0b101, 0b00)
+            || x == ci_code(0b110, 0b00)
+            || x == ci_code(0b111, 0b00) =>
+        {
+            match ci.funct3() {
+                5 => OpInfo::of::<CFsd>(),
+                6 => OpInfo::of::<CSw>(),
+                _ => OpInfo::of::<CSd>(),
+            }
+        }
+        // Quadrant 1
+        x if x == ci_code(0b000, 0b01) => {
+            if rd != 0 {
+                OpInfo::of::<CAddi>()
+            } else {
+                OpInfo::of::<Nop>()
+            }
+        }
+        x if x == ci_code(0b001, 0b01) => {
+            // C.ADDIW with rd = x0 is reserved (insn:c-addiw_rsv).
+            if rd != 0 {
+                OpInfo::of::<CAddiw>()
+            } else {
+                OpInfo::of::<Illegal>()
+            }
+        }
+        x if x == ci_code(0b010, 0b01) => {
+            if rd != 0 {
+                OpInfo::of::<CLi>()
+            } else {
+                OpInfo::of::<Nop>()
+            }
+        }
+        x if x == ci_code(0b011, 0b01) => {
+            if rd == 2 {
+                if ci.ci16_imm() != 0 {
+                    return Some(OpInfo::of::<CAddi16sp>());
+                }
+            } else if rd != 0 {
+                if ci.ci_upper_imm() != 0 {
+                    return Some(OpInfo::of::<CLui>());
+                }
+                // C.MOP.n
+                if rd & 1 != 0 && rd < 16 {
+                    return Some(OpInfo::of::<Nop>());
+                }
+            } else if ci.ci_upper_imm() != 0 {
+                // C.LUI hint
+                return Some(OpInfo::of::<Nop>());
+            }
+            OpInfo::of::<Illegal>()
+        }
+        x if x == ci_code(0b100, 0b01) => OpInfo::of::<CAluOps>(),
+        x if x == ci_code(0b101, 0b01) => OpInfo::of::<CJump>(),
+        x if x == ci_code(0b110, 0b01) => OpInfo::of::<CBeqz>(),
+        x if x == ci_code(0b111, 0b01) => OpInfo::of::<CBnez>(),
+        // Quadrant 2
+        x if x == ci_code(0b000, 0b10)
+            || x == ci_code(0b001, 0b10)
+            || x == ci_code(0b010, 0b10)
+            || x == ci_code(0b011, 0b10) =>
+        {
+            match ci.funct3() {
+                0x0 if rd != 0 => OpInfo::of::<CSlli>(),
+                0x1 => OpInfo::of::<CFldsp>(),
+                0x2 if rd != 0 => OpInfo::of::<CLwsp>(),
+                0x3 if rd != 0 => OpInfo::of::<CLdsp>(),
+                // C.LDSP with rd = x0 falls out of C++'s if-chain before
+                // the HINT check.
+                0x3 => OpInfo::of::<Unimplemented>(),
+                // C.SLLI and C.LWSP with rd = x0: HINTs
+                _ => OpInfo::of::<Nop>(),
+            }
+        }
+        x if x == ci_code(0b100, 0b10) => {
+            let topbit = ci.bit12() != 0;
+            let rs2 = ci.rs2();
+            if !topbit && rd != 0 && rs2 == 0 {
+                OpInfo::of::<CJr>()
+            } else if topbit && rd != 0 && rs2 == 0 {
+                OpInfo::of::<CJalr>()
+            } else if !topbit && rd != 0 && rs2 != 0 {
+                OpInfo::of::<CMv>()
+            } else if rd != 0 {
+                OpInfo::of::<CAdd>()
+            } else if topbit && rs2 == 0 {
+                OpInfo::of::<CEbreak>()
+            } else if rs2 != 0 {
+                // C.MV and C.ADD with rd = x0 are HINTs (insn:c-mv_hint,
+                // insn:c-add_hint).
+                OpInfo::of::<Nop>()
+            } else {
+                OpInfo::of::<Unimplemented>()
+            }
+        }
+        x if x == ci_code(0b101, 0b10)
+            || x == ci_code(0b110, 0b10)
+            || x == ci_code(0b111, 0b10) =>
+        {
+            match ci.funct3() {
+                5 => OpInfo::of::<CFsdsp>(),
+                6 => OpInfo::of::<CSwsp>(),
+                _ => OpInfo::of::<CSdsp>(),
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// The compressed bytecodes of C++ `computed_index_for`. Several
+/// instructions share one bytecode in C++ (C.ADDI4SPN, C.ADDI16SP and C.ADDI
+/// are all `RV32C_BC_ADDI`); the handler picked here still tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CBytecode {
+    Invalid,
+    Function,
+    Addi,
+    Li,
+    Mv,
+    Slli,
+    Srli,
+    Andi,
+    Add,
+    Xor,
+    Or,
+    Beqz,
+    Bnez,
+    Jmp,
+    Addiw,
+    Jr,
+    Jalr,
+    Ldd,
+    Std,
+    Ldw,
+    Stw,
+}
+
+/// Port of the compressed half of `CPU::computed_index_for` (RV64).
+fn compressed_bytecode(ci: CInstr) -> CBytecode {
+    use CBytecode as B;
+    let rd = ci.rd();
+    match ci.opcode() {
+        x if x == ci_code(0b000, 0b00) => {
+            if ci.whole() != 0 && ci.ciw_offset() != 0 {
+                B::Addi // C.ADDI4SPN
+            } else {
+                B::Invalid
+            }
+        }
+        // C.FLD, C.LW, C.LD (C.LD takes the slow path in C++)
+        x if x == ci_code(0b001, 0b00)
+            || x == ci_code(0b010, 0b00)
+            || x == ci_code(0b011, 0b00) =>
+        {
+            if ci.funct3() == 0x2 {
+                B::Ldw
+            } else {
+                B::Function
+            }
+        }
+        x if x == ci_code(0b101, 0b00)
+            || x == ci_code(0b110, 0b00)
+            || x == ci_code(0b111, 0b00) =>
+        {
+            match ci.funct3() {
+                6 => B::Stw, // C.SW
+                7 => B::Std, // C.SD
+                _ => B::Function,
+            }
+        }
+        x if x == ci_code(0b000, 0b01) => {
+            if rd != 0 {
+                B::Addi
+            } else {
+                B::Function
+            }
+        }
+        x if x == ci_code(0b010, 0b01) => {
+            if rd != 0 {
+                B::Li
+            } else {
+                B::Function
+            }
+        }
+        x if x == ci_code(0b011, 0b01) => {
+            if rd == 2 && ci.ci16_imm() != 0 {
+                B::Addi // C.ADDI16SP
+            } else {
+                B::Function // C.LUI, C.MOP.n, hints, illegal
+            }
+        }
+        x if x == ci_code(0b001, 0b01) => {
+            if rd != 0 {
+                B::Addiw
+            } else {
+                B::Invalid
+            }
+        }
+        x if x == ci_code(0b101, 0b01) => B::Jmp,
+        x if x == ci_code(0b110, 0b01) => B::Beqz,
+        x if x == ci_code(0b111, 0b01) => B::Bnez,
+        x if x == ci_code(0b000, 0b10)
+            || x == ci_code(0b001, 0b10)
+            || x == ci_code(0b010, 0b10)
+            || x == ci_code(0b011, 0b10) =>
+        {
+            match ci.funct3() {
+                0x0 if rd != 0 => B::Slli,
+                0x2 if rd != 0 => B::Ldw, // C.LWSP
+                0x3 if rd != 0 => B::Ldd, // C.LDSP
+                _ => B::Function,
+            }
+        }
+        x if x == ci_code(0b100, 0b01) => match ci.ca_funct6() & 0x3 {
+            0x0 => B::Srli,
+            0x2 => B::Andi,
+            0x3 => match ci.ca_funct2() | (ci.ca_funct6() & 0x4) {
+                0x1 => B::Xor,
+                0x2 => B::Or,
+                _ => B::Function,
+            },
+            _ => B::Function, // C.SRAI
+        },
+        x if x == ci_code(0b100, 0b10) => {
+            let topbit = ci.bit12() != 0;
+            let rs2 = ci.rs2();
+            if !topbit && rd != 0 && rs2 == 0 {
+                B::Jr
+            } else if topbit && rd != 0 && rs2 == 0 {
+                B::Jalr
+            } else if !topbit && rd != 0 && rs2 != 0 {
+                B::Mv
+            } else if rd != 0 {
+                B::Add
+            } else {
+                B::Function // C.EBREAK, hints
+            }
+        }
+        x if x == ci_code(0b101, 0b10)
+            || x == ci_code(0b110, 0b10)
+            || x == ci_code(0b111, 0b10) =>
+        {
+            match ci.funct3() {
+                6 => B::Stw, // C.SWSP
+                7 => B::Std, // C.SDSP
+                _ => B::Function,
+            }
+        }
+        // Zcb loads and stores
+        _ => B::Function,
+    }
+}
+
+/// The compressed half of `fast_handler`: the handler for `ci`'s bytecode,
+/// with `threaded_rewrite`'s target checks. `None` is `RV32I_BC_INVALID`.
+fn compressed_fast_handler(
+    ci: CInstr,
+    i: Instr,
+    within: impl Fn(u64, u64) -> bool,
+    pc: u64,
+) -> Option<Handler> {
+    use CBytecode as B;
+    use dispatch::cseq;
+    // Branches and jumps out of the execute segment, or to misaligned
+    // addresses, become invalid instructions.
+    let target_ok = |offset: i32, len: u64| {
+        let addr = pc.wrapping_add(offset as i64 as u64);
+        within(addr, len) && addr.is_multiple_of(2)
+    };
+    let quadrant0 = ci.quadrant() == 0;
+    Some(match compressed_bytecode(ci) {
+        B::Invalid => return None,
+        B::Function => decode(i).cfunction,
+        B::Addi if ci.opcode() == ci_code(0b000, 0b00) => cseq::<CAddi4spn>,
+        B::Addi if ci.opcode() == ci_code(0b011, 0b01) => cseq::<CAddi16sp>,
+        B::Addi => cseq::<CAddi>,
+        B::Li => cseq::<CLiFast>,
+        B::Mv => cseq::<CMv>,
+        B::Slli => cseq::<CSlli>,
+        B::Srli => cseq::<CSrli>,
+        B::Andi => cseq::<CAndi>,
+        B::Add => cseq::<CAdd>,
+        B::Xor => cseq::<CXor>,
+        B::Or => cseq::<COr>,
+        B::Beqz | B::Bnez if !target_ok(ci.cb_imm(), 2) => return None,
+        B::Beqz => dispatch::c_beqz,
+        B::Bnez => dispatch::c_bnez,
+        B::Jmp if !target_ok(ci.cj_imm(), 4) => return None,
+        B::Jmp => dispatch::c_jmp,
+        B::Addiw => cseq::<CAddiw>,
+        B::Jr => dispatch::c_jr,
+        B::Jalr => dispatch::c_jalr,
+        B::Ldd => cseq::<CLdsp>,
+        B::Std if quadrant0 => cseq::<CSd>,
+        B::Std => cseq::<CSdsp>,
+        B::Ldw if quadrant0 => cseq::<CLw>,
+        B::Ldw => cseq::<CLwsp>,
+        B::Stw if quadrant0 => cseq::<CSw>,
+        B::Stw => cseq::<CSwsp>,
+    })
+}
+
+/// The compressed half of [`cpp_entry_bits`] (the compressed cases of
+/// `threaded_rewrite`). Fields C++ leaves uninitialised are zero here.
+fn compressed_entry_bits(ci: CInstr, original: u32) -> u32 {
+    use CBytecode as B;
+    // FasterItype: imm16 | rs2 << 16 | rs1 << 24
+    let itype = |rs1: u32, rs2: u32, imm: i32| (imm as u32 & 0xFFFF) | (rs2 << 16) | (rs1 << 24);
+    let (rd, rs2) = (ci.rd(), ci.rs2());
+    let (srd, srs1) = (ci.srd_lo() + 8, ci.srs1_hi() + 8);
+    let quadrant0 = ci.quadrant() == 0;
+    match compressed_bytecode(ci) {
+        B::Invalid | B::Function => original,
+        B::Addi if ci.opcode() == ci_code(0b000, 0b00) => {
+            itype(srd, REG_SP, ci.ciw_offset() as i32)
+        }
+        B::Addi if ci.opcode() == ci_code(0b011, 0b01) => itype(REG_SP, REG_SP, ci.ci16_imm()),
+        B::Addi | B::Addiw => itype(rd, rd, ci.ci_imm()),
+        B::Li => itype(rd, 0, ci.ci_imm()),
+        // FasterMove: rs1 | rd << 8
+        B::Mv => rs2 | (rd << 8),
+        B::Slli => itype(rd, 0, ci.ci_shamt() as i32),
+        B::Srli => itype(srs1, 0, ci.cab_shamt() as i32),
+        B::Andi => itype(srs1, 0, ci.cab_imm()),
+        B::Add => itype(rd, rs2, 0),
+        B::Xor | B::Or => itype(srs1, srd, 0),
+        B::Beqz | B::Bnez => itype(srs1, 0, ci.cb_imm()),
+        B::Jmp => ci.cj_imm() as u32,
+        B::Jr | B::Jalr => rd,
+        B::Ldd => itype(rd, REG_SP, ci.cifld_offset() as i32),
+        B::Std if quadrant0 => itype(srs1, srd, ci.csd_offset() as i32),
+        B::Std => itype(REG_SP, rs2, ci.csfsd_offset() as i32),
+        B::Ldw if quadrant0 => itype(srd, srs1, ci.cl_offset() as i32),
+        B::Ldw => itype(rd, REG_SP, ci.ci2_offset() as i32),
+        B::Stw if quadrant0 => itype(srs1, srd, ci.cl_offset() as i32),
+        B::Stw => itype(REG_SP, rs2, ci.css_offset4() as i32),
+    }
 }
 
 /// Port of `CPU::computed_index_for` plus the target checks in
@@ -214,8 +601,11 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
     const PCAL: u64 = if COMPRESSED { 2 } else { 4 };
 
     if i.is_compressed() {
-        // Compressed instructions arrive in Phase 2. An all-zero one is
-        // invalid already at decode time.
+        if COMPRESSED {
+            return compressed_fast_handler(CInstr::from(i), i, within, pc);
+        }
+        // Without the C extension, an all-zero one is invalid already at
+        // decode time.
         if i.half0() == 0 {
             return None;
         }
@@ -386,9 +776,14 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
 /// zero here.
 pub(crate) fn cpp_entry_bits(i: Instr, pc: u64, begin: u64, end: u64) -> u32 {
     let original = i.whole();
-    // TODO(phase 2): compressed instructions are re-encoded too.
     // Entries that are invalid already keep their bits.
-    if i.is_compressed() || fast_handler(i, pc, begin, end).is_none() {
+    if fast_handler(i, pc, begin, end).is_none() {
+        return original;
+    }
+    if i.is_compressed() {
+        if COMPRESSED {
+            return compressed_entry_bits(CInstr::from(i), original);
+        }
         return original;
     }
     // FasterItype: imm16 | rs2 << 16 | rs1 << 24

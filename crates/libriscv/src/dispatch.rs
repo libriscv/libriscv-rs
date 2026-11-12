@@ -1,4 +1,4 @@
-//! Port of `tailcall_dispatch.cpp` and the RV64I/M handlers of
+//! Port of `tailcall_dispatch.cpp` and the RV64I/M/C handlers of
 //! `bytecode_impl.cpp`.
 //!
 //! Every decoder cache entry stores a handler with the [`Handler`]
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::decode;
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
 use crate::error::{ExceptionKind, MachineError, Result};
-use crate::instruction::Instr;
+use crate::instruction::{CInstr, Instr};
 use crate::isa::Op;
 use crate::machine::Machine;
 use crate::registers::{REG_ECALL, REG_RA};
@@ -199,6 +199,24 @@ pub(crate) fn seq<O: Op>(
     execute!(exec, i + STEP, m, pc, c)
 }
 
+/// A compressed instruction executed through its handler, continuing with
+/// the next entry (C++ `NEXT_C_INSTR`). Used both for compressed bytecodes
+/// with a dedicated handler in C++ and for `RV32C_BC_FUNCTION`, which unlike
+/// `RV32I_BC_FUNCTION` doesn't check for a stale segment afterwards.
+pub(crate) fn cseq<O: Op>(
+    exec: &DecodedSegment,
+    i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+) -> Exit {
+    let e = entry!(exec, i, m, pc);
+    if let Err(err) = O::exec(m, Instr(e.instr)) {
+        return fault(m, err);
+    }
+    execute!(exec, i + 1, m, pc, c)
+}
+
 /// C++ `RV32I_BC_FUNCTION`: a slow-path instruction in the middle of a
 /// block. Like C++ it re-checks the segment afterwards, since the
 /// instruction may have made it stale (FENCE.I).
@@ -322,6 +340,64 @@ pub(crate) fn jalr(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c:
         );
     }
     overflow_checked_jump!(exec, m, target, c)
+}
+
+/// C.BEQZ (C++ `rv32c_beqz`). Unlike the 4-byte branches, C++ checks the
+/// counter on forward branches too (`PERFORM_BRANCH`).
+pub(crate) fn c_beqz(
+    exec: &DecodedSegment,
+    i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+) -> Exit {
+    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
+    if m.cpu.regs.get(ci.srs1_hi() + 8) == 0 {
+        next_block!(exec, i, m, pc, c, i64::from(ci.cb_imm()), true)
+    }
+    next_block!(exec, i, m, pc, c, 2, false)
+}
+
+/// C.BNEZ (C++ `rv32c_bnez`).
+pub(crate) fn c_bnez(
+    exec: &DecodedSegment,
+    i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+) -> Exit {
+    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
+    if m.cpu.regs.get(ci.srs1_hi() + 8) != 0 {
+        next_block!(exec, i, m, pc, c, i64::from(ci.cb_imm()), true)
+    }
+    next_block!(exec, i, m, pc, c, 2, false)
+}
+
+/// C.J (C++ `rv32c_jmp`).
+pub(crate) fn c_jmp(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
+    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
+    next_block!(exec, i, m, pc, c, i64::from(ci.cj_imm()), true)
+}
+
+/// C.JR (C++ `rv32c_jr`).
+pub(crate) fn c_jr(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
+    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
+    let target = m.cpu.regs.get(ci.rd()) & !1;
+    overflow_checked_jump!(exec, m, target, c)
+}
+
+/// C.JALR (C++ `rv32c_jalr`). Reads the target before writing RA.
+pub(crate) fn c_jalr(
+    exec: &DecodedSegment,
+    i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+) -> Exit {
+    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
+    let target = m.cpu.regs.get(ci.rd());
+    m.cpu.regs.set(REG_RA, pc.wrapping_add(2));
+    overflow_checked_jump!(exec, m, target & !1, c)
 }
 
 /// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).

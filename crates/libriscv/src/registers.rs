@@ -1,7 +1,9 @@
-//! Port of `registers.hpp` (integer registers, PC and FCSR).
+//! Port of `registers.hpp` (integer and floating-point registers, PC and
+//! FCSR).
 //!
-//! Floating-point and vector registers are added with their extensions
-//! (Phase 2 and Phase 5).
+//! Floating-point registers are stored as raw 64-bit patterns (C++
+//! `fp64reg`); the F/D extension adds the NaN-boxing views. Vector registers
+//! come with the V extension (Phase 5).
 
 /// `x1`, the return address register.
 pub const REG_RA: u32 = 1;
@@ -66,7 +68,7 @@ impl Fcsr {
     }
 }
 
-/// Integer register file, program counter and FCSR.
+/// Integer and floating-point register files, program counter and FCSR.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registers {
     x: [u64; 32],
@@ -74,6 +76,7 @@ pub struct Registers {
     /// (system calls, faults, stop), exactly as in C++.
     pub pc: u64,
     fcsr: Fcsr,
+    f: [u64; 32],
 }
 
 impl Registers {
@@ -102,6 +105,31 @@ impl Registers {
     /// All 32 integer registers.
     pub const fn all(&self) -> &[u64; 32] {
         &self.x
+    }
+
+    /// The raw 64 bits of floating-point register `idx` (only the low 5
+    /// bits are used); C++ `getfl(idx).i64`.
+    #[inline(always)]
+    pub const fn fp_bits(&self, idx: u32) -> u64 {
+        // The index is masked to 0..32, so it is always in bounds.
+        #[allow(clippy::indexing_slicing)]
+        self.f[(idx & 31) as usize]
+    }
+
+    /// Set the raw 64 bits of floating-point register `idx`; C++
+    /// `getfl(idx).load_u64(value)`.
+    #[inline(always)]
+    pub const fn set_fp_bits(&mut self, idx: u32, value: u64) {
+        // The index is masked to 0..32, so it is always in bounds.
+        #[allow(clippy::indexing_slicing)]
+        {
+            self.f[(idx & 31) as usize] = value;
+        }
+    }
+
+    /// All 32 floating-point registers as raw bits.
+    pub const fn all_fp(&self) -> &[u64; 32] {
+        &self.f
     }
 
     pub const fn fcsr(&self) -> Fcsr {

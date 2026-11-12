@@ -5,7 +5,7 @@ RISC-V userspace emulator for embedding and scripting — to 100% safe Rust.
 
 RV64 only.
 
-**Status:** early. RV64IM freestanding guests run on the tail-call
+**Status:** early. RV64IMC (+Zcb) freestanding guests run on the tail-call
 interpreter and match the C++ emulator's output and instruction counts;
 Linux userspace support is next. See [PORTING.md](PORTING.md) for scope,
 design and progress.

@@ -7,6 +7,7 @@
 //! (`dispatch::seq::<O>` etc.), so both interpreters share one definition of
 //! every instruction.
 
+pub(crate) mod rvc;
 pub(crate) mod rvi;
 
 use crate::error::Result;

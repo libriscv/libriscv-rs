@@ -197,8 +197,8 @@ LCG loop, 206.8M instructions, same machine and date:
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load` |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Phase 1: freestanding RV64IM guests, including one assembly program per dispatcher edge case |
-| Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case |
+| Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
 
@@ -243,8 +243,6 @@ timeouts.
 
 Expected until the listed phase:
 
-- Compressed instructions raise `UNIMPLEMENTED_INSTRUCTION` (Phase 2). The
-  decoder already measures blocks with them, so counting will not change.
 - Zba/Zbb/Zbc/Zbs/Zicond/Zbkb encodings raise `UNIMPLEMENTED_INSTRUCTION`
   (Phase 2). Vector CSRs go to `on_unhandled_csr` (Phase 5).
 - The oracle is built with virtual paging, the port is not yet (Phase 5).
@@ -274,7 +272,18 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - CSRRW on an unknown CSR falls through to CSRRS.
 - Exception data for a force-ended segment end is C++'s re-encoded bytecode
   operand bits (`decode::cpp_entry_bits`); the uninitialised bytes C++
-  leaves in LI/MV encodings are zero here.
+  leaves in LI/MV and several compressed encodings are zero here.
+- The dispatcher runs C.LI as C.ADDI with `x0` as the source (C++ rewrites
+  it to `RV32C_BC_ADDI`), so after the OP-32 clobber it reads the clobbered
+  `x0`; the precise C.LI doesn't (`c_li_after_x0_clobber` difftest).
+- The precise C.JALR writes RA before reading the target register, so
+  `c.jalr ra` falls through to the next instruction; the dispatcher reads
+  the target first and jumps.
+- C.J is only decoded if 4 bytes at its target are inside the segment
+  (C.BEQZ/C.BNEZ: 2 bytes), so a `c.j` to the segment's last halfword is an
+  illegal instruction. C.LD takes the slow path while C.LDSP has a bytecode.
+- The compressed slow path (`RV32C_BC_FUNCTION`) doesn't check for a stale
+  segment afterwards, unlike the 4-byte one.
 - Not reproduced: C++ registers an execute segment before decoding it and
   leaves it registered if decoding throws; here it's registered only when
   complete.
@@ -283,7 +292,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 
 Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
-- [ ] C extension (`rvc.hpp`, `rvc_instr.cpp`), Zcb
+- [x] C extension (`rvc.hpp`, `rvc_instr.cpp`), Zcb; FP register file (raw bits) for C.FLD/C.FSD
 - [ ] A extension (`rva.hpp`, `rva_instr.cpp`)
 - [ ] F/D (+Zfh) (`rvfd.hpp`, `rvf_instr.cpp`, `fp16.hpp`)
 - [ ] Zba/Zbb/Zbc/Zbs/Zicond (in `rvi_instr.cpp`)
@@ -343,22 +352,22 @@ phase starts; names below are the intended targets.
 | `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp`, `page.hpp` | `memory/` | 1 | ✅ flat arena (`page.hpp`: Phase 5) |
 | `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | |
 | `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | |
-| `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1 | ✅ integer + FCSR (FP: Phase 2, vector: Phase 5) |
+| `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (NaN-boxing views: F/D, vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate) |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | |
-| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1 | ✅ RV64IM (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
+| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMC + Zcb (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
 | `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1 | ✅ I + M (B-family cases: Phase 2) |
-| `rvc.hpp`, `rvc_instr.cpp` | `isa/rvc.rs` | 2 | |
+| `rvc.hpp`, `rvc_instr.cpp` | `instruction.rs` (`CInstr`), `isa/rvc.rs` | 2 | ✅ RV64 C + Zcb |
 | `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | |
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
 | `rvi_fuse.cpp` | `isa/fuse.rs` | 4 | |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
 | `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | Phase 1 part ✅ (shared segments: Phase 4) |
-| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` (handler selection, target checks) | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1 | ✅ RV64IM |
+| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` (handler selection, target checks) | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–2 | ✅ RV64IMC + Zcb |
 | `decode_bytecodes.cpp`, `bytecode_*.cpp`, `threaded_bytecodes.hpp`, `threaded_bytecode_array.hpp`, `threaded_rewriter.cpp` | `decoder_cache/bytecodes.rs` | 4 | |
 | `shared_rodata.*` | `memory/shared.rs` | 4 | |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |
