@@ -298,16 +298,6 @@ ops! {
     // (`threaded_rewrite`), where they are cheaper than the precise
     // handler or behave differently from it.
 
-    /// C.LI as the dispatcher runs it: C++ rewrites it to its C.ADDI
-    /// bytecode with `x0` as the source, so unlike the precise C.LI it
-    /// reads `x0` (observable once `x0` has been clobbered; see the OP-32
-    /// note in `decode.rs`).
-    CLiFast = |m, i| {
-        let ci = c(i);
-        let v = reg(m, 0).wrapping_add(ci.ci_imm() as i64 as u64);
-        set(m, ci.rd(), v);
-        Ok(())
-    }
     /// C.SRLI (C++ `RV32C_BC_SRLI`).
     CSrli = |m, i| {
         let ci = c(i);

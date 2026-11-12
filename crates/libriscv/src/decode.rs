@@ -1,4 +1,4 @@
-//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64I/M/C) and the
+//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64IMAC + B) and the
 //! handler selection of `decode_bytecodes.cpp` + `threaded_rewriter.cpp`.
 //!
 //! Two decoders, mirroring the two in C++:
@@ -174,7 +174,7 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
                 return match it.funct3() {
                     0x0 => OpInfo::of::<Addiw>(),
                     0x1 if it.high_bits() == 0 && shamt_ok => OpInfo::of::<Slliw>(),
-                    // (C++ also decodes SLLI.UW here; Zba is Phase 2.)
+                    0x1 if it.high_bits() == 0x080 => OpInfo::of::<SlliUw>(),
                     0x1 => OpInfo::of::<OpImm32>(),
                     0x5 if it.high_bits() == 0 && shamt_ok => OpInfo::of::<Srliw>(),
                     0x5 if it.high_bits() == 0x400 && shamt_ok => OpInfo::of::<Sraiw>(),
@@ -570,7 +570,9 @@ fn compressed_fast_handler(
         B::Addi if ci.opcode() == ci_code(0b000, 0b00) => cseq::<CAddi4spn>,
         B::Addi if ci.opcode() == ci_code(0b011, 0b01) => cseq::<CAddi16sp>,
         B::Addi => cseq::<CAddi>,
-        B::Li => cseq::<CLiFast>,
+        // C++ runs C.LI as C.ADDI rd, x0, imm; x0 is always zero, so the
+        // precise C.LI is equivalent.
+        B::Li => cseq::<CLi>,
         B::Mv => cseq::<CMv>,
         B::Slli => cseq::<CSlli>,
         B::Srli => cseq::<CSrli>,
@@ -745,7 +747,11 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
                 0x5 if it.is_srai() => Some(seq::<Srai>),
                 0x6 => Some(seq::<Ori>),
                 0x7 => Some(seq::<Andi>),
-                // SEXT.B/H, BSETI, BEXTI and the rest: Phase 2
+                0x1 if it.imm() == 0b0110_0000_0100 => Some(seq::<SextB>),
+                0x1 if it.imm() == 0b0110_0000_0101 => Some(seq::<SextH>),
+                0x1 if it.high_bits() == 0x280 => Some(seq::<Bseti>),
+                0x5 if it.high_bits() == 0x480 => Some(seq::<Bexti>),
+                // CLZ, RORI, REV8 and the rest
                 _ => function(),
             }
         }
@@ -769,20 +775,33 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
                 0x16 => Some(seq::<Rem>),
                 0x17 => Some(seq::<Remu>),
                 0x205 => Some(seq::<Sra>),
-                // MULH* and SH*ADD (Phase 2) and the rest
+                0x102 => Some(seq::<Sh1add>),
+                0x104 => Some(seq::<Sh2add>),
+                0x106 => Some(seq::<Sh3add>),
+                // MULH*, PACK, MIN/MAX, CZERO.*, BSET, ROL and the rest
                 _ => function(),
             }
         }
-        // Note: unlike every other ALU opcode, C++ doesn't route rd == x0 to
-        // the slow path here, so ADDW/SUBW/MULW with rd == x0 write x0.
-        // Kept for parity; see PORTING.md, "Known C++ quirks".
-        OP32 => match i.rtype().jumptable_friendly_op() {
-            0x0 => Some(seq::<Addw>),
-            0x200 => Some(seq::<Subw>),
-            0x10 => Some(seq::<Mulw>),
-            // ADD.UW and ZEXT.H (Phase 2) and the rest
-            _ => function(),
-        },
+        // Unlike the other ALU opcodes, C++ picks the OP-32 bytecodes before
+        // looking at rd; `threaded_rewrite` then turns those with rd == x0
+        // into `LI x0, 0`, a no-op that is still a sequential bytecode (not
+        // the FUNCTION slow path).
+        OP32 => {
+            let handler: Handler = match i.rtype().jumptable_friendly_op() {
+                0x0 => seq::<Addw>,
+                0x200 => seq::<Subw>,
+                0x10 => seq::<Mulw>,
+                0x40 => seq::<AddUw>,
+                0x44 if i.rtype().rs2() == 0 => seq::<ZextH>,
+                // SH*ADD.UW, PACKW, ROLW and the rest
+                _ => return function(),
+            };
+            Some(if i.rtype().rd() == 0 {
+                seq::<Nop>
+            } else {
+                handler
+            })
+        }
         OP_IMM32 => {
             if it.rd() == 0 {
                 return function();
@@ -792,7 +811,7 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
                 0x0 => Some(seq::<Addiw>),
                 0x1 if it.high_bits() == 0 && shamt_ok => Some(seq::<Slliw>),
                 0x5 if it.high_bits() == 0 && shamt_ok => Some(seq::<Srliw>),
-                // SRAIW takes the slow path in C++ too
+                // SRAIW and SLLI.UW take the slow path in C++ too
                 _ => function(),
             }
         }
@@ -876,6 +895,9 @@ pub(crate) fn cpp_entry_bits(i: Instr, pc: u64, begin: u64, end: u64) -> u32 {
             _ => original,
         },
         OP32 => match rt.jumptable_friendly_op() {
+            // Rewritten to LI x0, 0 (all operand bits zero).
+            0x0 | 0x10 | 0x40 | 0x200 if rd == 0 => 0,
+            0x44 if rd == 0 && rt.rs2() == 0 => 0,
             0x0 | 0x10 | 0x40 | 0x200 => optype(rt.rd(), rt.rs1(), rt.rs2()),
             0x44 if rt.rs2() == 0 => optype(rt.rd(), rt.rs1(), rt.rs2()),
             _ => original,

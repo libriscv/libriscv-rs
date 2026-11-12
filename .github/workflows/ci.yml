@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   # C++ libriscv commit used as the differential-testing oracle.
   # Keep in sync with PORTING.md.
-  LIBRISCV_CPP_REF: bd7ea507fb8e4b5755386e83fb0ef7788c1aa2f2
+  LIBRISCV_CPP_REF: 6b81381257f00826da357c40e7288a0e5e523274
 
 jobs:
   lint:

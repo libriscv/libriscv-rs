@@ -1,8 +1,6 @@
-//! Port of `rvi_instr.cpp` (the RV64I and M parts) and `rv64i.cpp`.
-//!
-//! Zba/Zbb/Zbc/Zbs/Zicond/Zbkb live in the same C++ switch statements and
-//! arrive with Phase 2; until then those encodings raise
-//! `UNIMPLEMENTED_INSTRUCTION` like any unknown encoding.
+//! Port of `rvi_instr.cpp` and `rv64i.cpp`: RV64I, M, and the bit
+//! manipulation extensions that share their opcodes (Zba, Zbb, Zbc, Zbs,
+//! Zicond and the RV64 part of Zbkb: PACK, PACKH, PACKW, BREV8).
 
 use super::ops;
 use crate::error::{ExceptionKind, MachineError, Result};
@@ -102,6 +100,64 @@ const fn mulhsu(a: u64, b: u64) -> u64 {
 #[inline(always)]
 const fn mulhu(a: u64, b: u64) -> u64 {
     (((a as u128) * (b as u128)) >> 64) as u64
+}
+
+/// Port of `rv_brev8`: reverse the bits within each byte.
+#[inline(always)]
+const fn brev8(v: u64) -> u64 {
+    u64::from_le_bytes(v.to_be_bytes()).reverse_bits()
+}
+/// ORC.B: each non-zero byte becomes `0xFF`.
+#[inline(always)]
+const fn orc_b(v: u64) -> u64 {
+    let mut r = 0;
+    let mut shift = 0;
+    while shift < 64 {
+        if (v >> shift) & 0xFF != 0 {
+            r |= 0xFF << shift;
+        }
+        shift += 8;
+    }
+    r
+}
+/// Carry-less multiply, low half (CLMUL).
+#[inline(always)]
+const fn clmul(a: u64, b: u64) -> u64 {
+    let mut r = 0;
+    let mut n = 0;
+    while n < 64 {
+        if (b >> n) & 1 != 0 {
+            r ^= a << n;
+        }
+        n += 1;
+    }
+    r
+}
+/// Carry-less multiply, bits `2*XLEN-2 .. XLEN-1` (CLMULR).
+#[inline(always)]
+const fn clmulr(a: u64, b: u64) -> u64 {
+    let mut r = 0;
+    let mut n = 0;
+    while n < 64 {
+        if (b >> n) & 1 != 0 {
+            r ^= a >> (63 - n);
+        }
+        n += 1;
+    }
+    r
+}
+/// Carry-less multiply, high half (CLMULH).
+#[inline(always)]
+const fn clmulh(a: u64, b: u64) -> u64 {
+    let mut r = 0;
+    let mut n = 1;
+    while n < 64 {
+        if (b >> n) & 1 != 0 {
+            r ^= a >> (64 - n);
+        }
+        n += 1;
+    }
+    r
 }
 
 /// Load effective address: `rs1 + imm`.
@@ -265,11 +321,33 @@ ops! {
     OpImm = |m, i| {
         let it = i.itype();
         let src = reg(m, it.rs1());
+        let shamt = it.shift64_imm();
         let v = match it.funct3() {
+            0x1 => match it.imm() {
+                0b0110_0000_0100 => SextB::compute(src, i),
+                0b0110_0000_0101 => SextH::compute(src, i),
+                0b0110_0000_0000 => u64::from(src.leading_zeros()),  // CLZ
+                0b0110_0000_0001 => u64::from(src.trailing_zeros()), // CTZ
+                0b0110_0000_0010 => u64::from(src.count_ones()),     // CPOP
+                _ => match it.high_bits() {
+                    0x280 => Bseti::compute(src, i),
+                    0x480 => src & !(1u64 << shamt), // BCLRI
+                    0x680 => src ^ (1u64 << shamt),  // BINVI
+                    _ => return Err(unimplemented(i)),
+                },
+            },
             0x2 => Slti::compute(src, i),
             0x3 => Sltiu::compute(src, i),
             0x4 => Xori::compute(src, i),
             0x5 if it.is_srai() => Srai::compute(src, i),
+            0x5 if it.is_rori() => src.rotate_right(shamt), // RORI
+            0x5 if it.high_bits() == 0x480 => Bexti::compute(src, i),
+            0x5 => match it.imm() {
+                0x287 => orc_b(src),                    // ORC.B
+                0b0110_1011_1000 => src.swap_bytes(),   // REV8
+                0b0110_1000_0111 => brev8(src),         // BREV8
+                _ => return Err(unimplemented(i)),
+            },
             0x6 => Ori::compute(src, i),
             _ => return Err(unimplemented(i)),
         };
@@ -277,8 +355,7 @@ ops! {
         Ok(())
     }
     /// ADDI with `rs1 = x0` (C++ `OP_IMM_LI`): writes the immediate without
-    /// reading `x0`, which matters once `x0` has been clobbered (see the
-    /// OP-32 note in `decode.rs`).
+    /// reading `x0`.
     Li = |m, i| {
         set(m, i.itype().rd(), imm_i(i));
         Ok(())
@@ -313,6 +390,10 @@ ops! {
     Xori = |m, i| { itype_alu::<Xori>(m, i) }
     Ori = |m, i| { itype_alu::<Ori>(m, i) }
     Srai = |m, i| { itype_alu::<Srai>(m, i) }
+    SextB = |m, i| { itype_alu::<SextB>(m, i) }
+    SextH = |m, i| { itype_alu::<SextH>(m, i) }
+    Bseti = |m, i| { itype_alu::<Bseti>(m, i) }
+    Bexti = |m, i| { itype_alu::<Bexti>(m, i) }
 
     /// The remaining OP encodings (C++ `OP`).
     OpReg = |m, i| {
@@ -335,7 +416,30 @@ ops! {
             0x15 => divu64(a, b),                       // DIVU
             0x16 => rem64(a, b),                        // REM
             0x17 => remu64(a, b),                       // REMU
+            0x44 => (a & 0xFFFF_FFFF) | (b << 32),      // PACK
+            0x47 => u64::from(a as u8) | (u64::from(b as u8) << 8), // PACKH
+            0x51 => clmul(a, b),                        // CLMUL
+            0x52 => clmulr(a, b),                       // CLMULR
+            0x53 => clmulh(a, b),                       // CLMULH
+            0x54 => if (a as i64) < (b as i64) { a } else { b }, // MIN
+            0x55 => a.min(b),                           // MINU
+            0x56 => if (a as i64) > (b as i64) { a } else { b }, // MAX
+            0x57 => a.max(b),                           // MAXU
+            0x75 => if b == 0 { 0 } else { a },         // CZERO.EQZ
+            0x77 => if b != 0 { 0 } else { a },         // CZERO.NEZ
+            0x102 => Sh1add::compute(a, b),             // SH1ADD
+            0x104 => Sh2add::compute(a, b),             // SH2ADD
+            0x106 => Sh3add::compute(a, b),             // SH3ADD
+            0x141 => a | (1u64 << (b & 63)),            // BSET
+            0x204 => !(a ^ b),                          // XNOR
             0x205 => ((a as i64) >> (b & 63)) as u64,   // SRA
+            0x206 => a | !b,                            // ORN
+            0x207 => a & !b,                            // ANDN
+            0x241 => a & !(1u64 << (b & 63)),           // BCLR
+            0x245 => (a >> (b & 63)) & 1,               // BEXT
+            0x301 => a.rotate_left((b & 63) as u32),    // ROL
+            0x305 => a.rotate_right((b & 63) as u32),   // ROR
+            0x341 => a ^ (1u64 << (b & 63)),            // BINV
             _ => return Err(unimplemented(i)),
         };
         set(m, rt.rd(), v);
@@ -356,6 +460,9 @@ ops! {
     Rem = |m, i| { rtype_alu::<Rem>(m, i) }
     Remu = |m, i| { rtype_alu::<Remu>(m, i) }
     Sra = |m, i| { rtype_alu::<Sra>(m, i) }
+    Sh1add = |m, i| { rtype_alu::<Sh1add>(m, i) }
+    Sh2add = |m, i| { rtype_alu::<Sh2add>(m, i) }
+    Sh3add = |m, i| { rtype_alu::<Sh3add>(m, i) }
 
     /// Any SYSTEM instruction other than ECALL/WFI/STOP (C++ `SYSTEM`).
     System = |m, i| { m.system(i) }
@@ -401,9 +508,33 @@ ops! {
         set(m, it.rd(), ((reg(m, it.rs1()) as i32) >> it.shift_imm()) as i64 as u64);
         Ok(())
     }
-    /// The remaining OP-IMM-32 encodings (C++ `OP_IMM32`): only Zbb ones,
-    /// which arrive in Phase 2.
-    OpImm32 = |m, i| { Err(unimplemented(i)) }
+    /// SLLI.UW: the shift amount is a full 6-bit shamt, not the 5-bit one
+    /// of the other *W shifts.
+    SlliUw = |m, i| {
+        let it = i.itype();
+        set(m, it.rd(), (reg(m, it.rs1()) & 0xFFFF_FFFF) << it.shift64_imm());
+        Ok(())
+    }
+    /// The remaining OP-IMM-32 encodings (C++ `OP_IMM32`).
+    OpImm32 = |m, i| {
+        let it = i.itype();
+        let src = reg(m, it.rs1()) as u32;
+        let v = match it.funct3() {
+            0x1 => match it.imm() {
+                0b0110_0000_0000 => src.leading_zeros(),  // CLZW
+                0b0110_0000_0001 => src.trailing_zeros(), // CTZW
+                0b0110_0000_0010 => src.count_ones(),     // CPOPW
+                _ => return Err(unimplemented(i)),
+            }.into(),
+            // RORIW
+            0x5 if it.high_bits() == 0x600 && it.imm() & 0x20 == 0 => {
+                sext32(src.rotate_right(it.shift_imm()))
+            }
+            _ => return Err(unimplemented(i)),
+        };
+        set(m, it.rd(), v);
+        Ok(())
+    }
 
     /// The remaining OP-32 encodings (C++ `OP32`).
     Op32 = |m, i| {
@@ -418,8 +549,16 @@ ops! {
             0x15 => a.checked_div(b).map_or(u64::MAX, sext32),    // DIVUW
             0x16 => sext32(rem32(a, b)),                       // REMW
             0x17 => sext32(a.checked_rem(b).unwrap_or(a)),       // REMUW
+            0x40 => AddUw::compute(a.into(), reg(m, rt.rs2())), // ADD.UW
+            0x44 if rt.rs2() == 0 => u64::from(a as u16),      // ZEXT.H
+            0x44 => sext32(u32::from(a as u16) | (b << 16)),    // PACKW
+            0x102 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 1), // SH1ADD.UW
+            0x104 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 2), // SH2ADD.UW
+            0x106 => reg(m, rt.rs2()).wrapping_add(u64::from(a) << 3), // SH3ADD.UW
             0x200 => sext32(a.wrapping_sub(b)),                // SUBW
             0x205 => ((a as i32) >> (b & 31)) as i64 as u64,   // SRAW
+            0x301 => sext32(a.rotate_left(b & 31)),            // ROLW
+            0x305 => sext32(a.rotate_right(b & 31)),           // RORW
             _ => return Err(unimplemented(i)),
         };
         set(m, rt.rd(), v);
@@ -428,6 +567,9 @@ ops! {
     Addw = |m, i| { rtype_alu::<Addw>(m, i) }
     Subw = |m, i| { rtype_alu::<Subw>(m, i) }
     Mulw = |m, i| { rtype_alu::<Mulw>(m, i) }
+    AddUw = |m, i| { rtype_alu::<AddUw>(m, i) }
+    /// OP-32 ZEXT.H (PACKW with `rs2 = x0`).
+    ZextH = |m, i| { rtype_alu::<ZextH>(m, i) }
 
     Fence = |m, i| {
         if i.itype().funct3() == 0x1 {
@@ -493,6 +635,30 @@ impl ItypeAlu for Srai {
         ((src as i64) >> i.itype().shift64_imm()) as u64
     }
 }
+impl ItypeAlu for SextB {
+    #[inline(always)]
+    fn compute(src: u64, _: Instr) -> u64 {
+        src as i8 as i64 as u64
+    }
+}
+impl ItypeAlu for SextH {
+    #[inline(always)]
+    fn compute(src: u64, _: Instr) -> u64 {
+        src as i16 as i64 as u64
+    }
+}
+impl ItypeAlu for Bseti {
+    #[inline(always)]
+    fn compute(src: u64, i: Instr) -> u64 {
+        src | (1u64 << i.itype().shift64_imm())
+    }
+}
+impl ItypeAlu for Bexti {
+    #[inline(always)]
+    fn compute(src: u64, i: Instr) -> u64 {
+        (src >> i.itype().shift64_imm()) & 1
+    }
+}
 #[inline(always)]
 fn itype_alu<T: ItypeAlu>(m: &mut Machine, i: Instr) -> Result<()> {
     let it = i.itype();
@@ -532,6 +698,11 @@ rtype_alu! {
     Addw => |a, b| sext32((a as u32).wrapping_add(b as u32));
     Subw => |a, b| sext32((a as u32).wrapping_sub(b as u32));
     Mulw => |a, b| sext32((a as u32).wrapping_mul(b as u32));
+    Sh1add => |a, b| b.wrapping_add(a << 1);
+    Sh2add => |a, b| b.wrapping_add(a << 2);
+    Sh3add => |a, b| b.wrapping_add(a << 3);
+    AddUw => |a, b| b.wrapping_add(a & 0xFFFF_FFFF);
+    ZextH => |a, _b| a & 0xFFFF;
 }
 #[inline(always)]
 fn rtype_alu<T: RtypeAlu>(m: &mut Machine, i: Instr) -> Result<()> {

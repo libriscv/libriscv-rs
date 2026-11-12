@@ -4,7 +4,7 @@ This is the plan and progress tracker for the port. Update the status column
 in the same commit that changes it.
 
 **Reference:** C++ libriscv at `../libriscv` (override with `$LIBRISCV_CPP`),
-tracking upstream commit `bd7ea507fb8e4b5755386e83fb0ef7788c1aa2f2` (v1.11).
+tracking upstream commit `6b81381257f00826da357c40e7288a0e5e523274` (v1.11+).
 When the C++ side moves, bump this hash and the one in `.github/workflows/ci.yml`
 together.
 
@@ -29,7 +29,7 @@ together.
 ## Scope
 
 In scope: the interpreter, **RV64 only**, extensions I M A C F D Zba Zbb Zbc
-Zbs Zicond Zfh(min) Zcb Zimop/Zcmop and V; ELF loading; flat arena memory and
+Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V; ELF loading; flat arena memory and
 (later) virtual paging; Linux, newlib and minimal syscall sets; vmcall/preempt;
 fork/CoW; serialization; threads; native heap/libc; debugger, disassembler and
 GDB stub.
@@ -197,7 +197,7 @@ LCG loop, 206.8M instructions, same machine and date:
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load` |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
@@ -243,8 +243,7 @@ timeouts.
 
 Expected until the listed phase:
 
-- Zba/Zbb/Zbc/Zbs/Zicond/Zbkb encodings raise `UNIMPLEMENTED_INSTRUCTION`
-  (Phase 2). Vector CSRs go to `on_unhandled_csr` (Phase 5).
+- Vector CSRs go to `on_unhandled_csr` (Phase 5).
 - The oracle is built with virtual paging, the port is not yet (Phase 5).
   Accesses outside the arena fault here, where the oracle creates pages; a
   store into a read-only segment reports the address here and the page base
@@ -261,11 +260,6 @@ Expected until the listed phase:
 
 Bugs or oddities in C++ that the port reproduces on purpose:
 
-- OP-32 instructions with `rd = x0` (ADDW/SUBW/MULW) **write `x0`**: unlike
-  every other opcode, `computed_index_for` doesn't route them to the slow
-  path. LI then still writes its immediate, but anything reading `x0` sees
-  the clobbered value. Confirmed against the oracle (`x0_read_after_clobber`
-  difftest).
 - C++'s tail-call and threaded dispatchers disagree observably (see
   "Dispatch"); the port follows the threaded one.
 - `R_RISCV_RELATIVE` relocations write the symbol value, not base + addend.
@@ -275,9 +269,6 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - Exception data for a force-ended segment end is C++'s re-encoded bytecode
   operand bits (`decode::cpp_entry_bits`); the uninitialised bytes C++
   leaves in LI/MV and several compressed encodings are zero here.
-- The dispatcher runs C.LI as C.ADDI with `x0` as the source (C++ rewrites
-  it to `RV32C_BC_ADDI`), so after the OP-32 clobber it reads the clobbered
-  `x0`; the precise C.LI doesn't (`c_li_after_x0_clobber` difftest).
 - The precise C.JALR writes RA before reading the target register, so
   `c.jalr ra` falls through to the next instruction; the dispatcher reads
   the target first and jumps.
@@ -300,7 +291,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] C extension (`rvc.hpp`, `rvc_instr.cpp`), Zcb; FP register file (raw bits) for C.FLD/C.FSD
 - [x] A extension (`rva.hpp`, `rva_instr.cpp`)
 - [ ] F/D (+Zfh) (`rvfd.hpp`, `rvf_instr.cpp`, `fp16.hpp`)
-- [ ] Zba/Zbb/Zbc/Zbs/Zicond (in `rvi_instr.cpp`)
+- [x] Zba/Zbb/Zbc/Zbs/Zicond and the RV64 part of Zbkb (in `rvi_instr.cpp`)
 - [ ] `setup_linux` stack/auxv/argv/env (`machine.cpp`, `util/auxvec.hpp`)
 - [ ] mmap/brk allocator (`memory_mmap.cpp`, `mmap_cache.hpp`)
 - [ ] Linux syscalls incl. sandboxed fd table (`linux/system_calls.cpp`, `linux/syscalls_*.cpp`, `posix/filedesc.hpp`)
@@ -363,8 +354,8 @@ phase starts; names below are the intended targets.
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate) |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | |
-| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMC + Zcb (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
-| `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1 | ✅ I + M (B-family cases: Phase 2) |
+| `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMAC + Zcb + B (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
+| `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1–2 | ✅ I + M + Zba/Zbb/Zbc/Zbs/Zicond/Zbkb (Zbkb's ZIP/UNZIP are RV32-only and unimplemented, as in C++) |
 | `rvc.hpp`, `rvc_instr.cpp` | `instruction.rs` (`CInstr`), `isa/rvc.rs` | 2 | ✅ RV64 C + Zcb |
 | `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (copying the reservation on fork/deserialize: Phase 3) |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | |
@@ -372,7 +363,7 @@ phase starts; names below are the intended targets.
 | `rvi_fuse.cpp` | `isa/fuse.rs` | 4 | |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
 | `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | Phase 1 part ✅ (shared segments: Phase 4) |
-| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` (handler selection, target checks) | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–2 | ✅ RV64IMC + Zcb |
+| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` (handler selection, target checks) | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–2 | ✅ RV64IMAC + Zcb + B |
 | `decode_bytecodes.cpp`, `bytecode_*.cpp`, `threaded_bytecodes.hpp`, `threaded_bytecode_array.hpp`, `threaded_rewriter.cpp` | `decoder_cache/bytecodes.rs` | 4 | |
 | `shared_rodata.*` | `memory/shared.rs` | 4 | |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |

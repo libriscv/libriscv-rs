@@ -203,15 +203,21 @@ fn freestanding_timeouts() {
 
 /// One freestanding assembly program per dispatcher edge case.
 const ASM_CASES: &[(&str, &str)] = &[
-    // Writing x0 through ADDW: C++ doesn't route rd == x0 to the slow path
-    // for OP-32, so x0 is clobbered. LI must not read it; ADD does.
+    // OP-32 bytecodes with rd == x0 (here ADDW, SUBW, MULW) are rewritten
+    // to `LI x0, 0`: x0 stays zero. (Before upstream 6b813812 they wrote x0.)
     (
-        "x0_clobbered_by_addw",
-        "li a1, 5\n li a2, 7\n .word 0x00c5803b\n mv a0, x0\n add a1, x0, x0\n li a7, 93\n ecall",
+        "x0_not_written_by_op32",
+        "li a1, 5\n li a2, 7\n .word 0x00c5803b\n .word 0x40c5803b\n .word 0x02c5803b\n\
+         add a0, x0, x0\n li a7, 93\n ecall",
+    ),
+    // The same just before a force-ended (invalid) last instruction.
+    (
+        "fall_off_end_after_addw_x0",
+        "li a0, 3\n li a7, 93\n .word 0x00c5803b\n addi a0, a0, 1",
     ),
     (
-        "x0_read_after_clobber",
-        "li a1, 5\n li a2, 7\n .word 0x00c5803b\n add a0, x0, x0\n li a7, 93\n ecall",
+        "fall_off_end_addw",
+        "li a0, 3\n li a7, 93\n addw a0, a1, a2",
     ),
     // A branch to outside the segment is invalid even when not taken.
     (
@@ -283,10 +289,10 @@ const ASM_CASES: &[(&str, &str)] = &[
 /// Edge cases for the C extension, assembled with it only. Raw `.half`
 /// encodings pin the exact instruction under test.
 const COMPRESSED_ASM_CASES: &[(&str, &str)] = &[
-    // The dispatcher runs C.LI as C.ADDI rd, x0, imm, so it reads a
-    // clobbered x0 (the precise C.LI doesn't).
+    // C++ runs C.LI as C.ADDI rd, x0, imm; an OP-32 instruction with
+    // rd == x0 before it must not change the result.
     (
-        "c_li_after_x0_clobber",
+        "c_li_after_op32_x0",
         "li a1, 5\n li a2, 7\n .word 0x00c5803b\n c.li a0, 3\n li a7, 93\n ecall",
     ),
     // Compressed branches out of the segment are invalid even when not taken.
@@ -539,6 +545,210 @@ fn freestanding_atomic_edge_cases() {
     }
     for march in ATOMIC_MARCHES {
         for (name, body) in ATOMIC_ASM_CASES {
+            eprintln!("difftest: {name} ({march})");
+            diff(&build_asm(body, march));
+        }
+    }
+}
+
+/// The bit-manipulation extensions, without and with the C extension (where
+/// Zcb also compresses ZEXT.H/SEXT.B/SEXT.H/...).
+const BITMANIP_MARCHES: &[&str] = &[
+    "rv64im_zba_zbb_zbc_zbs_zicond_zbkb_zicsr",
+    "rv64imc_zcb_zba_zbb_zbc_zbs_zicond_zbkb_zicsr",
+];
+
+/// Every Zba/Zbb/Zbc/Zbs/Zicond/Zbkb instruction over a sweep of operands
+/// (one hash per instruction), plus what the compiler emits for the usual
+/// bit-twiddling builtins.
+const BITMANIP: &str = r#"
+typedef unsigned long ulong;
+static long sys(long n, long a, long b, long c) {
+    register long a0 asm("a0") = a; register long a1 asm("a1") = b;
+    register long a2 asm("a2") = c; register long a7 asm("a7") = n;
+    asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0;
+}
+static void put(const char* s) { long n = 0; while (s[n]) n++; sys(64, 1, (long)s, n); }
+static void puthex(ulong v) {
+    char b[17]; for (int i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+    b[16] = 0; put(b);
+}
+static ulong h[80];
+static int n;
+static void fold(ulong v) { h[n] = (h[n] ^ v) * 0x100000001b3ul; h[n] = (h[n] << 7) | (h[n] >> 57); n++; }
+
+#define R(op) do { ulong r; asm volatile(op " %0, %1, %2" : "=r"(r) : "r"(a), "r"(b)); fold(r); } while (0)
+#define U(op) do { ulong r; asm volatile(op " %0, %1" : "=r"(r) : "r"(a)); fold(r); } while (0)
+#define I(op, imm) do { ulong r; asm volatile(op " %0, %1, " #imm : "=r"(r) : "r"(a)); fold(r); } while (0)
+
+static void __attribute__((noinline)) run(ulong a, ulong b) {
+    n = 0;
+    R("sh1add"); R("sh2add"); R("sh3add");
+    R("add.uw"); R("sh1add.uw"); R("sh2add.uw"); R("sh3add.uw");
+    I("slli.uw", 0); I("slli.uw", 31); I("slli.uw", 32); I("slli.uw", 63);
+    R("andn"); R("orn"); R("xnor");
+    U("clz"); U("clzw"); U("ctz"); U("ctzw"); U("cpop"); U("cpopw");
+    R("max"); R("maxu"); R("min"); R("minu");
+    U("sext.b"); U("sext.h"); U("zext.h");
+    R("rol"); R("rolw"); R("ror"); R("rorw");
+    I("rori", 0); I("rori", 1); I("rori", 63); I("roriw", 0); I("roriw", 31);
+    U("orc.b"); U("rev8");
+    R("clmul"); R("clmulh"); R("clmulr");
+    R("bclr"); R("bext"); R("binv"); R("bset");
+    I("bclri", 0); I("bclri", 63); I("bexti", 31); I("bexti", 63);
+    I("binvi", 32); I("bseti", 0); I("bseti", 63);
+    R("czero.eqz"); R("czero.nez");
+    R("pack"); R("packh"); R("packw"); U("brev8");
+    /* compiler-generated */
+    fold(__builtin_popcountl(a) + __builtin_clzl(a | 1) + __builtin_ctzl(b | (1ul << 63)));
+    fold(__builtin_bswap64(a) ^ __builtin_bswap32((unsigned)b));
+    fold((a << (b & 63)) | (a >> (-b & 63)));
+    fold((long)a < (long)b ? a : b);
+    fold(b ? 0 : a);
+    fold(a + (unsigned)b * 8);
+}
+
+int main(void) {
+    static const ulong special[] = {
+        0, 1, 2, 31, 32, 33, 63, 64, 0x7f, 0x80, 0xff, 0x8000, 0xffff,
+        0x7fffffff, 0x80000000, 0xffffffff, 0x100000000, 0x8000000000000000ul,
+        0x7fffffffffffffff, 0xffffffffffffffff, 0x0123456789abcdef, 0xfedcba9876543210,
+    };
+    const int ns = sizeof(special) / sizeof(special[0]);
+    ulong x = 0x9e3779b97f4a7c15;
+    int ops = 0;
+    for (int i = 0; i < ns; i++)
+        for (int j = 0; j < ns; j++) { run(special[i], special[j]); ops = n; }
+    for (int i = 0; i < 200; i++) {
+        ulong a = x; x = x * 6364136223846793005ul + 1442695040888963407ul;
+        ulong b = x >> (x & 63); x = x * 6364136223846793005ul + 1442695040888963407ul;
+        run(a, b);
+    }
+    for (int i = 0; i < ops; i++) { puthex(h[i]); put("\n"); }
+    return ops;
+}
+void _start(void) { sys(93, main(), 0, 0); }
+"#;
+
+#[test]
+fn freestanding_bitmanip() {
+    if !have_tools() {
+        return;
+    }
+    for march in BITMANIP_MARCHES {
+        for opt in ["-O0 -mno-relax", "-O2 -mno-relax"] {
+            let out = diff(&build_freestanding(BITMANIP, march, opt));
+            assert_eq!(out.exit_code, Some(64), "{}", out.stdout);
+        }
+        let elf = build_freestanding(BITMANIP, march, "-O2 -mno-relax");
+        for fuel in [1, 10, 100, 1000, 4321, 10_000, 54_321] {
+            diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+        }
+    }
+}
+
+/// Bit-manipulation edge cases: `rd = x0`, holes in the encoding space,
+/// and the fault data of a force-ended segment end, which is C++'s
+/// re-encoded bytecode operand (or the original bits on the slow path).
+const BITMANIP_ASM_CASES: &[(&str, &str)] = &[
+    // rd == x0 is a no-op for all of them: the OP-32 fast paths ADD.UW and
+    // ZEXT.H become `LI x0, 0`, the others take the slow path (a NOP).
+    (
+        "x0_not_written_by_add_uw",
+        "li a1, 5\n li a2, 7\n add.uw x0, a1, a2\n add a0, x0, x0\n li a7, 93\n ecall",
+    ),
+    (
+        "x0_not_written_by_zext_h",
+        "li a1, 0x12345\n zext.h x0, a1\n add a0, x0, x0\n li a7, 93\n ecall",
+    ),
+    (
+        "fall_off_end_after_add_uw_x0",
+        "li a0, 3\n li a7, 93\n add.uw x0, a1, a2\n addi a0, a0, 1",
+    ),
+    (
+        "fall_off_end_after_zext_h_x0",
+        "li a0, 3\n li a7, 93\n zext.h x0, a1\n addi a0, a0, 1",
+    ),
+    (
+        "x0_not_written_by_sh1add",
+        "li a1, 5\n li a2, 7\n sh1add x0, a1, a2\n sext.b x0, a1\n bseti x0, a1, 3\n\
+         sh1add.uw x0, a1, a2\n add a0, x0, x0\n li a7, 93\n ecall",
+    ),
+    (
+        "zip_unimplemented",
+        "li a0, 1\n .insn i 0x13, 1, a0, a1, 0x08f\n li a7, 93\n ecall",
+    ),
+    (
+        "unzip_unimplemented",
+        "li a0, 1\n .insn i 0x13, 5, a0, a1, 0x08f\n li a7, 93\n ecall",
+    ),
+    (
+        "op_imm_hole",
+        "li a0, 1\n .insn i 0x13, 1, a0, a1, 0x603\n li a7, 93\n ecall",
+    ),
+    (
+        "op_imm32_hole",
+        "li a0, 1\n .insn i 0x1b, 1, a0, a1, 0x603\n li a7, 93\n ecall",
+    ),
+    (
+        "roriw_shamt_32",
+        "li a0, 1\n .insn i 0x1b, 5, a0, a1, 0x620\n li a7, 93\n ecall",
+    ),
+    (
+        "op_hole",
+        "li a0, 1\n .insn r 0x33, 0, 0x28, a0, a1, a2\n li a7, 93\n ecall",
+    ),
+    (
+        "op32_hole",
+        "li a0, 1\n .insn r 0x3b, 7, 0x04, a0, a1, a2\n li a7, 93\n ecall",
+    ),
+    (
+        "fall_off_end_sext_b",
+        "li a0, 3\n li a7, 93\n sext.b a0, a1",
+    ),
+    (
+        "fall_off_end_sext_h",
+        "li a0, 3\n li a7, 93\n sext.h a0, a1",
+    ),
+    (
+        "fall_off_end_bseti",
+        "li a0, 3\n li a7, 93\n bseti a0, a1, 45",
+    ),
+    (
+        "fall_off_end_bexti",
+        "li a0, 3\n li a7, 93\n bexti a0, a1, 45",
+    ),
+    (
+        "fall_off_end_sh3add",
+        "li a0, 3\n li a7, 93\n sh3add a0, a1, a2",
+    ),
+    (
+        "fall_off_end_add_uw",
+        "li a0, 3\n li a7, 93\n add.uw a0, a1, a2",
+    ),
+    (
+        "fall_off_end_zext_h",
+        "li a0, 3\n li a7, 93\n zext.h a0, a1",
+    ),
+    ("fall_off_end_clz", "li a0, 3\n li a7, 93\n clz a0, a1"),
+    (
+        "fall_off_end_slli_uw",
+        "li a0, 3\n li a7, 93\n slli.uw a0, a1, 40",
+    ),
+    (
+        "fall_off_end_czero",
+        "li a0, 3\n li a7, 93\n czero.eqz a0, a1, a2",
+    ),
+];
+
+#[test]
+fn freestanding_bitmanip_edge_cases() {
+    if !have_tools() {
+        return;
+    }
+    for march in BITMANIP_MARCHES {
+        for (name, body) in BITMANIP_ASM_CASES {
             eprintln!("difftest: {name} ({march})");
             diff(&build_asm(body, march));
         }
