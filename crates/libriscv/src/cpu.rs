@@ -11,6 +11,7 @@ use crate::decoder_cache::{COMPRESSED, DecodedSegment};
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::instruction::Instr;
 use crate::machine::Machine;
+use crate::memory::PAGE_SIZE;
 use crate::registers::{REG_SP, Registers};
 
 /// Registers plus the current execute segment.
@@ -91,13 +92,14 @@ impl Machine {
         if !self.cpu.exec.is_empty() {
             let initial_pc = self.memory.start_address();
             // Check that the initial PC is executable.
-            if !self.cpu.exec.is_within(initial_pc, 2)
-                && self.memory.exec_segment_for(initial_pc).is_none()
-            {
-                return Err(MachineError::trigger(
-                    ExceptionKind::ExecutionSpaceProtectionFault,
-                    initial_pc,
-                ));
+            if !self.cpu.exec.is_within(initial_pc, 2) {
+                let (attr, _) = self.memory.get_exec_pageno(initial_pc / PAGE_SIZE)?;
+                if !attr.exec {
+                    return Err(MachineError::trigger(
+                        ExceptionKind::ExecutionSpaceProtectionFault,
+                        initial_pc,
+                    ));
+                }
             }
             self.cpu.jump(initial_pc)?;
         }
@@ -119,9 +121,12 @@ impl Machine {
         Ok(&self.cpu.exec)
     }
 
-    /// Port of `CPU::next_execute_segment` without paging: switch to the
-    /// execute segment containing `pc`. Without paging, segments must be
-    /// registered in advance, so anything else is an execute fault.
+    /// Port of `CPU::next_execute_segment`: switch to the execute segment
+    /// containing `pc`. If there is none (or only a stale one, which is
+    /// evicted), a new segment is decoded from the executable pages around
+    /// `pc`, the way code mapped at runtime (by a dynamic linker, a JIT or
+    /// FENCE.I-style self-modification) becomes executable. Anything else
+    /// is an execute fault. Returns the PC to continue at.
     pub(crate) fn next_execute_segment(&mut self, pc: u64) -> Result<u64> {
         let found = self.memory.exec_segment_for(pc);
         if let Some(segment) = &found
@@ -137,6 +142,18 @@ impl Machine {
         self.cpu.exec = found
             .clone()
             .unwrap_or_else(|| Arc::new(DecodedSegment::empty()));
+
+        // Look at the page first, to verify that it's executable. (The
+        // default execute fault handler raises the fault; custom handlers
+        // and page traps are not ported yet.)
+        let pageno = pc / PAGE_SIZE;
+        if !self.memory.get_pageno(pageno)?.0.exec {
+            return Err(MachineError::trigger(
+                ExceptionKind::ExecutionSpaceProtectionFault,
+                pc,
+            ));
+        }
+
         // Evict stale execute segments.
         if let Some(segment) = found {
             // If we already rebuilt for this exact PC and it's stale again,
@@ -150,11 +167,21 @@ impl Machine {
             self.cpu.stale_restart_pc = pc;
             self.memory.evict_execute_segment(&segment);
         }
-        // Without paging, execute segments must be pre-registered.
-        Err(MachineError::trigger(
-            ExceptionKind::ExecutionSpaceProtectionFault,
-            pc,
-        ))
+
+        // Decode every executable page around PC as one new segment.
+        let max_pages = self.memory.max_exec_pages();
+        let Some((base, code)) = self.memory.executable_area(pageno, max_pages)? else {
+            return Err(MachineError::trigger(
+                ExceptionKind::ExecutionSpaceProtectionFault,
+                pc,
+            ));
+        };
+        let segment = self.init_execute_area(&code, base * PAGE_SIZE)?;
+        // The rebuild produced a usable segment, so re-arm the guard.
+        if !segment.is_stale() {
+            self.cpu.stale_restart_pc = u64::MAX;
+        }
+        Ok(pc)
     }
 
     /// Port of `CPU::simulate_precise`: execute one instruction at a time
@@ -184,22 +211,46 @@ impl Machine {
         Ok(())
     }
 
+    /// Port of `CPU::read_next_instruction_slowpath` with paging: read the
+    /// instruction at `pc` directly from executable page memory.
+    fn read_next_instruction_slowpath(&self, pc: u64) -> Result<Instr> {
+        let pageno = pc / PAGE_SIZE;
+        let (attr, data) = self.memory.get_exec_pageno(pageno)?;
+        if !attr.exec {
+            return Err(MachineError::trigger(
+                ExceptionKind::ExecutionSpaceProtectionFault,
+                pc,
+            ));
+        }
+        let off = (pc % PAGE_SIZE) as usize;
+        if let Some(b) = data.get(off..).and_then(|s| s.first_chunk::<4>()) {
+            return Ok(Instr(u32::from_le_bytes(*b)));
+        }
+        // Only 16 bits are left of the page (PC is at least 2-aligned).
+        let lo = data
+            .get(off..)
+            .and_then(|s| s.first_chunk::<2>())
+            .map_or(0, |b| u16::from_le_bytes(*b));
+        let mut instr = Instr(u32::from(lo));
+        // A 32-bit instruction at a page border: the upper half is on the
+        // next page (which C++ doesn't check for execute permission).
+        if instr.is_long() {
+            let (_, next) = self.memory.get_exec_pageno(pageno.wrapping_add(1))?;
+            let hi = next
+                .first_chunk::<2>()
+                .map_or(0, |b| u16::from_le_bytes(*b));
+            instr = Instr(u32::from(lo) | u32::from(hi) << 16);
+        }
+        Ok(instr)
+    }
+
     /// Port of `CPU::step_one`: execute the instruction at PC precisely.
     pub fn step_one(&mut self, use_instruction_counter: bool) -> Result<()> {
         let pc = self.cpu.regs.pc;
         let instr = if self.cpu.exec.is_within(pc, 2) {
             Instr(self.cpu.exec.read_u32(pc))
         } else {
-            // C++ read_next_instruction_slowpath without paging.
-            match self.memory.exec_segment_for(pc) {
-                Some(segment) => Instr(segment.read_u32(pc)),
-                None => {
-                    return Err(MachineError::trigger(
-                        ExceptionKind::ExecutionSpaceProtectionFault,
-                        pc,
-                    ));
-                }
-            }
+            self.read_next_instruction_slowpath(pc)?
         };
         self.execute(instr)?;
         let len = if COMPRESSED {

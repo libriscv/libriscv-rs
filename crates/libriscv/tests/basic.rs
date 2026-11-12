@@ -124,11 +124,10 @@ fn jit_option_requires_the_feature() {
 const ENV: [&str; 3] = ["LC_TYPE=C", "LC_ALL=C", "USER=root"];
 const MAX_INSTRUCTIONS: u64 = 10_000_000;
 
-/// Linux guests get the default memory size: the main stack is allocated
-/// above the 16 MiB of brk space, which is outside an 8 MiB flat arena.
-/// (The C++ tests use 8 MiB with virtual paging, Phase 5 here.)
+/// Linux guests get 8 MiB, like the C++ tests: the main stack is allocated
+/// above the 16 MiB of brk space, in pages outside the arena.
 fn linux_options() -> MachineOptions {
-    MachineOptions::default()
+    options()
 }
 
 #[test]

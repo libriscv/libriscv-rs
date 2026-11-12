@@ -1,24 +1,30 @@
-//! Port of `memory.hpp`, `memory.cpp`, `memory_inline.hpp` and the flat-arena
-//! paths of `memory_helpers_paging.hpp` / `memory_rw.cpp` / `memory_mmap.cpp`.
+//! Port of `memory.hpp`, `memory.cpp`, `memory_inline.hpp` and
+//! `memory_rw.cpp`, configured like the reference emulator: a flat
+//! read-write arena (`RISCV_FLAT_RW_ARENA`) with virtual paging behind it
+//! (`RISCV_VIRTUAL_PAGING`).
 //!
-//! Guest memory is one flat read-write arena starting at guest address 0, as
-//! in C++ builds without `RISCV_VIRTUAL_PAGING`. Protection is two range
-//! checks, exactly like `memory_inline.hpp`:
+//! Guest memory starts with one flat arena at guest address 0. Guest loads
+//! and stores try it first with two range checks, exactly like
+//! `memory_inline.hpp`:
 //!
-//! * reads must be in `[RWREAD_BEGIN, arena_size)`, so page 0 traps;
-//! * writes must be in `[initial_rodata_end, arena_size)`, so the ELF's
-//!   read-only segments (including code) can't be written.
+//! * reads in `[RWREAD_BEGIN, arena_size)`;
+//! * writes in `[initial_rodata_end, arena_size)`, so the ELF's read-only
+//!   segments (including code) are left to the slow path.
 //!
-//! Like C++, the arena is over-allocated by one page at the end so an access
-//! starting at the last valid address never needs a size check. Page
-//! attributes (`set_page_attr`) only take effect with the paging backend
-//! (Phase 5); without it they are a no-op, as in C++.
+//! Everything else goes through the page table (`paging.rs`), which holds
+//! the page attributes, the guard page at 0, the host code page and pages
+//! outside the arena. Like C++, the arena is over-allocated by one page at
+//! the end so an access starting at the last valid address never needs a
+//! size check.
 
 mod loader;
 mod mmap;
+mod page;
+mod paging;
 
 pub(crate) use mmap::page_round_up;
-pub use mmap::{MEMSTRING_MAX, MmapCache, MmapRange, PageAttributes};
+pub use mmap::{MEMSTRING_MAX, MmapCache, MmapRange};
+pub use page::PageAttributes;
 
 use std::sync::Arc;
 
@@ -43,12 +49,19 @@ pub(crate) const fn protection_fault(addr: u64) -> MachineError {
     MachineError::trigger(ExceptionKind::ProtectionFault, addr)
 }
 
-/// Guest memory: the flat arena, the program layout and the execute segments.
+/// Guest memory: the flat arena, the page table, the program layout and the
+/// execute segments.
 #[derive(Debug)]
 pub struct Memory {
     /// `arena_size` bytes of guest memory plus one page of overrun padding.
     arena: Vec<u8>,
     arena_size: u64,
+    /// `arena_size / PAGE_SIZE` (C++ `m_arena.pages`).
+    arena_pages: u64,
+    /// The page table.
+    paging: paging::PageTable,
+    /// Largest execute segment built from pages, in pages (the memory limit).
+    max_exec_pages: u64,
     read_boundary: u64,
     write_boundary: u64,
     initial_rodata_end: u64,
@@ -88,7 +101,8 @@ pub struct Memory {
 
 macro_rules! read_write {
     ($($read:ident, $write:ident, $t:ty;)*) => {$(
-        /// Read a little-endian value; faults outside the readable range.
+        /// Read a little-endian value (C++ `read<T>`): the arena, or the page
+        /// table.
         #[inline(always)]
         pub fn $read(&self, addr: u64) -> Result<$t> {
             const N: usize = size_of::<$t>();
@@ -102,10 +116,11 @@ macro_rules! read_write {
                     return Ok(<$t>::from_le_bytes(*b));
                 }
             }
-            Err(protection_fault(addr))
+            self.read_slow::<N>(addr).map(<$t>::from_le_bytes)
         }
 
-        /// Write a little-endian value; faults outside the writable range.
+        /// Write a little-endian value (C++ `write<T>`): the arena, or the
+        /// page table.
         #[inline(always)]
         pub fn $write(&mut self, addr: u64, value: $t) -> Result<()> {
             const N: usize = size_of::<$t>();
@@ -119,7 +134,7 @@ macro_rules! read_write {
                     return Ok(());
                 }
             }
-            Err(protection_fault(addr))
+            self.write_slow::<N>(addr, value.to_le_bytes())
         }
     )*};
 }
@@ -130,8 +145,8 @@ macro_rules! read_write {
 #[cfg(feature = "ext-a")]
 macro_rules! read_modify_write {
     ($($rmw:ident, $t:ty;)*) => {$(
-        /// Apply `f` to the value at `addr` and return the old value; faults
-        /// outside the writable range.
+        /// Apply `f` to the value at `addr` and return the old value; the
+        /// address must be writable.
         #[inline(always)]
         pub(crate) fn $rmw(&mut self, addr: u64, f: impl FnOnce($t) -> $t) -> Result<$t> {
             const N: usize = size_of::<$t>();
@@ -146,14 +161,15 @@ macro_rules! read_modify_write {
                     return Ok(old);
                 }
             }
-            Err(protection_fault(addr))
+            self.rmw_slow::<N>(addr, |b| f(<$t>::from_le_bytes(b)).to_le_bytes())
+                .map(<$t>::from_le_bytes)
         }
     )*};
 }
 
 impl Memory {
     /// Port of the `Memory(Machine&, std::string_view, MachineOptions)`
-    /// constructor (flat arena, no paging). Returns the memory and the first
+    /// constructor (flat arena with paging). Returns the memory and the first
     /// execute segment of the program, which becomes the CPU's segment.
     pub(crate) fn new(
         binary: Arc<[u8]>,
@@ -167,32 +183,42 @@ impl Memory {
             ));
         }
         let pages_max = options.memory_max / PAGE_SIZE;
-        let arena_pages = if options.use_memory_arena {
-            pages_max
-        } else {
-            0
-        };
-        let arena_size = arena_pages * PAGE_SIZE;
-        // The arena length must be addressable; C++ gets a failed mmap here.
-        let arena_len = arena_size
+        // The arena length must be addressable; C++ gets a failed mmap here
+        // and continues with paging alone.
+        let arena_len = (pages_max * PAGE_SIZE)
             .checked_add(PAGE_SIZE)
             .filter(|&n| n <= isize::MAX as u64)
             .and_then(|n| usize::try_from(n).ok());
-        let Some(arena_len) = arena_len.filter(|_| arena_pages > 0) else {
-            return Err(MachineError::new(
-                ExceptionKind::OutOfMemory,
-                "Virtual paging is disabled but arena allocation failed",
-                0,
-            ));
+        let (arena_pages, arena_len) = match arena_len {
+            Some(len) if options.use_memory_arena && pages_max > 0 => (pages_max, len),
+            _ => (0, PAGE_SIZE as usize),
+        };
+        let arena_size = arena_pages * PAGE_SIZE;
+        // Bound the page table, including attribute-only pages created
+        // outside of the page fault handler (mmap, mprotect).
+        let table_max = usize::try_from(pages_max.max(1))
+            .unwrap_or(usize::MAX)
+            .saturating_mul(paging::PAGE_TABLE_OVERCOMMIT);
+        // The default page fault handler: with an arena, room for pages
+        // anywhere in the address space besides it (C++ `anywhere_pages`, an
+        // `unsigned`), otherwise the memory limit.
+        let (fault_limit, fault_oom_data) = if arena_pages > 0 {
+            let anywhere = (pages_max / 2) as u32;
+            (anywhere as usize, u64::from(anywhere.wrapping_mul(3)))
+        } else {
+            (usize::try_from(pages_max).unwrap_or(usize::MAX), pages_max)
         };
         let mut memory = Self {
             // Zeroed allocation: the OS hands out pages lazily, like C++'s
             // MAP_NORESERVE mapping.
             arena: vec![0u8; arena_len],
             arena_size,
-            // Without an ELF the whole arena is usable. (C++ without paging
-            // leaves both boundaries at zero; with paging, which the
-            // reference emulator uses, the memory is usable.)
+            arena_pages,
+            paging: paging::PageTable::new(arena_pages, table_max, fault_limit, fault_oom_data),
+            max_exec_pages: pages_max.max(1),
+            // Without an ELF the whole arena is usable. (C++ leaves both
+            // boundaries at zero and serves the arena through the page
+            // table, which is also usable, but slower.)
             read_boundary: arena_size.wrapping_sub(RWREAD_BEGIN).min(arena_size),
             write_boundary: arena_size,
             initial_rodata_end: 0,
@@ -217,6 +243,10 @@ impl Memory {
             #[cfg(feature = "ext-a")]
             atomics: Default::default(),
         };
+        // A guard page catches zero-page accesses (C++ `initial_paging`).
+        // C++ only installs it when loading a binary; here page 0 always
+        // traps, as it did before paging.
+        memory.install_shared_page(0, page::PageData::Zero, PageAttributes::NONE)?;
         let mut first_segment = None;
         if !memory.binary.is_empty() {
             first_segment = memory.binary_loader(options)?;
@@ -235,42 +265,6 @@ impl Memory {
     read_modify_write! {
         rmw_u32, u32;
         rmw_u64, u64;
-    }
-
-    /// Port of `Memory::memcpy` (flat arena): copy host data into the guest.
-    pub fn memcpy(&mut self, dst: u64, src: &[u8]) -> Result<()> {
-        let len = src.len() as u64;
-        let end = dst.checked_add(len);
-        if end.is_none_or(|e| e > self.arena_size) || dst < self.initial_rodata_end {
-            return Err(protection_fault(dst));
-        }
-        let d = usize::try_from(dst).map_err(|_| protection_fault(dst))?;
-        self.arena
-            .get_mut(d..d + src.len())
-            .ok_or(protection_fault(dst))?
-            .copy_from_slice(src);
-        Ok(())
-    }
-
-    /// Port of `Memory::memcpy_out` (flat arena): copy guest memory out.
-    pub fn memcpy_out(&self, dst: &mut [u8], src: u64) -> Result<()> {
-        dst.copy_from_slice(self.memview(src, dst.len() as u64)?);
-        Ok(())
-    }
-
-    /// Zero-copy view of `[addr, addr + len)` (flat-arena
-    /// `gather_buffers_from_range` / `memview`).
-    pub fn memview(&self, addr: u64, len: u64) -> Result<&[u8]> {
-        if len == 0 {
-            return Ok(&[]);
-        }
-        let end = addr.checked_add(len);
-        if addr < RWREAD_BEGIN || end.is_none_or(|e| e > self.arena_size) {
-            return Err(protection_fault(addr));
-        }
-        let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
-        let n = usize::try_from(len).map_err(|_| protection_fault(addr))?;
-        self.arena.get(a..a + n).ok_or(protection_fault(addr))
     }
 
     /// Port of `Memory::mmap_allocate`: bump-allocate page-rounded memory.
@@ -321,6 +315,14 @@ impl Memory {
     }
     pub const fn memory_arena_size(&self) -> u64 {
         self.arena_size
+    }
+    /// True when there is a flat arena (C++ `uses_flat_memory_arena`).
+    pub const fn uses_flat_memory_arena(&self) -> bool {
+        self.arena_pages > 0
+    }
+    /// The largest execute segment built from executable pages, in pages.
+    pub(crate) const fn max_exec_pages(&self) -> u64 {
+        self.max_exec_pages
     }
     pub const fn memory_arena_read_boundary(&self) -> u64 {
         self.read_boundary
@@ -513,51 +515,194 @@ mod tests {
         Memory::new(Arc::from(Vec::new()), &options).unwrap().0
     }
 
+    const MIB: u64 = 1 << 20;
+
     #[test]
-    fn zero_page_traps_and_arena_is_bounded() {
-        let mut mem = empty_memory(1 << 20);
+    fn zero_page_traps_and_outside_reads_zero() {
+        let mut mem = empty_memory(MIB);
         assert_eq!(
             mem.read_u8(0).unwrap_err().kind,
             ExceptionKind::ProtectionFault
         );
-        assert_eq!(mem.read_u64(0xFFF).unwrap_err().data, 0xFFF);
+        // The guard page faults with its page address, as in C++.
+        assert_eq!(mem.read_u64(0xFFF).unwrap_err().data, 0);
         mem.write_u32(0x1000, 0xDEAD_BEEF).unwrap();
         assert_eq!(mem.read_u32(0x1000).unwrap(), 0xDEAD_BEEF);
         assert_eq!(mem.read_u16(0x1002).unwrap(), 0xDEAD);
-        // The last byte of the arena is readable, the next one is not.
-        assert!(mem.read_u8((1 << 20) - 1).is_ok());
-        assert!(mem.read_u8(1 << 20).is_err());
+        // The last byte of the arena is in the fast path, the next one is
+        // an untouched page outside the arena: the zero page.
+        assert!(mem.read_u8(MIB - 1).is_ok());
+        assert_eq!(mem.read_u8(MIB).unwrap(), 0);
+        assert_eq!(mem.pages_active(), 1); // just the guard page
         // A wide access at the last address lands in the padding page.
-        assert!(mem.read_u64((1 << 20) - 1).is_ok());
-        assert!(mem.write_u64(u64::MAX, 0).is_err());
-        assert!(mem.read_u64(u64::MAX - 3).is_err());
+        assert!(mem.read_u64(MIB - 1).is_ok());
+        assert_eq!(mem.read_u64(u64::MAX - 3).unwrap(), 0);
+    }
+
+    #[test]
+    fn pages_outside_the_arena() {
+        let mut mem = empty_memory(MIB);
+        let far = 0x7000_0000_0000;
+        mem.write_u64(far + 8, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(mem.read_u64(far + 8).unwrap(), 0x1122_3344_5566_7788);
+        assert_eq!(mem.owned_pages_active(), 1);
+        // Accesses crossing a page boundary outside the arena.
+        mem.write_u64(far + 0xFFC, u64::MAX).unwrap();
+        assert_eq!(mem.read_u64(far + 0xFFC).unwrap(), u64::MAX);
+        assert_eq!(mem.read_u32(far + 0x1000).unwrap(), u32::MAX);
+        assert_eq!(mem.owned_pages_active(), 2);
+        // Strings crossing pages.
+        mem.memcpy(far + 0x1FFE, b"hello\0").unwrap();
+        assert_eq!(mem.memstring(far + 0x1FFE).unwrap(), "hello");
+        // Gathering: one buffer per page outside the arena.
+        assert_eq!(mem.gather_buffers(far + 0x1FFE, 4, 2).unwrap().len(), 2);
+        assert_eq!(
+            mem.gather_buffers(far + 0x1FFE, 4, 1).unwrap_err().kind,
+            ExceptionKind::OutOfMemory
+        );
+        assert_eq!(
+            mem.memview(far + 0x1FFE, 4).unwrap_err().kind,
+            ExceptionKind::OutOfMemory
+        );
+        assert_eq!(mem.memview(far + 0x1FFE, 2).unwrap(), b"he");
+        // Arena pages share one buffer.
+        assert_eq!(mem.gather_buffers(0x1000, 0x8000, 1).unwrap().len(), 1);
+        {
+            let mut bufs = mem.gather_writable_buffers(far + 0x1FFE, 4, 2).unwrap();
+            bufs.iter_mut().for_each(|b| b.fill(b'x'));
+        }
+        assert_eq!(mem.memstring(far + 0x1FFE).unwrap(), "xxxxo");
+        // Read-modify-write across the page boundary (atomics).
+        #[cfg(feature = "ext-a")]
+        {
+            mem.write_u32(far + 0xFFE, 41).unwrap();
+            assert_eq!(mem.rmw_u32(far + 0xFFE, |v| v + 1).unwrap(), 41);
+            assert_eq!(mem.read_u32(far + 0xFFE).unwrap(), 42);
+            mem.set_page_attr(far + 0x1000, 1, PageAttributes::rwx(true, false, false))
+                .unwrap();
+            assert_eq!(
+                mem.rmw_u32(far + 0xFFE, |v| v + 1).unwrap_err().data,
+                far + 0x1000
+            );
+            mem.set_page_attr(far + 0x1000, 1, PageAttributes::default())
+                .unwrap();
+            mem.write_u32(far + 0xFFE, u32::MAX).unwrap();
+        }
+        // Discarding zeroes, freeing removes the pages.
+        mem.memdiscard(far, 0x2000, true).unwrap();
+        assert_eq!(mem.read_u64(far + 8).unwrap(), 0);
+        mem.free_pages(far, 0x3000);
+        assert_eq!(mem.owned_pages_active(), 0);
+        assert_eq!(mem.read_u64(far + 0x1FFE).unwrap(), 0);
+    }
+
+    #[test]
+    fn page_attributes() {
+        let mut mem = empty_memory(MIB);
+        let far = 0x10_0000_0000;
+        // Inaccessible pages outside the arena.
+        mem.set_page_attr(far, 0x2000, PageAttributes::NONE)
+            .unwrap();
+        assert_eq!(mem.pages_active(), 3);
+        assert_eq!(mem.read_u8(far + 0x1234).unwrap_err().data, far + 0x1000);
+        assert_eq!(mem.write_u8(far + 5, 1).unwrap_err().data, far);
+        // Read-only: the zero page.
+        mem.set_page_attr(far, 0x1000, PageAttributes::rwx(true, false, false))
+            .unwrap();
+        assert_eq!(mem.read_u8(far + 5).unwrap(), 0);
+        assert!(mem.write_u8(far + 5, 1).is_err());
+        // Writable again: copy-on-write, so the first write copies it.
+        mem.set_page_attr(far, 0x1000, PageAttributes::default())
+            .unwrap();
+        assert!(mem.page_attributes(far).unwrap().is_cow);
+        assert_eq!(mem.owned_pages_active(), 0);
+        mem.write_u8(far + 5, 1).unwrap();
+        assert_eq!(mem.read_u8(far + 5).unwrap(), 1);
+        assert_eq!(mem.owned_pages_active(), 1);
+        // Default attributes on untouched pages create nothing.
+        mem.set_page_attr(far + 0x10_0000, 0x1000_0000, PageAttributes::default())
+            .unwrap();
+        assert_eq!(mem.pages_active(), 3);
+
+        // Arena pages: guest stores in the arena's write window ignore
+        // page attributes (as in C++), host-side accesses respect them.
+        mem.set_page_attr(0x4000, 0x1000, PageAttributes::rwx(true, false, false))
+            .unwrap();
+        mem.write_u32(0x4000, 1).unwrap();
+        assert_eq!(
+            mem.memcpy(0x4ff0, b"0123456789abcdefg").unwrap_err().data,
+            0x4000
+        );
+        assert_eq!(
+            mem.gather_writable_buffers(0x3ff0, 0x20, 4)
+                .unwrap_err()
+                .data,
+            0x4000
+        );
+        mem.set_page_attr(0x4000, 0x1000, PageAttributes::NONE)
+            .unwrap();
+        let mut out = [0u8; 4];
+        assert_eq!(mem.memcpy_out(&mut out, 0x4000).unwrap_err().data, 0x4000);
+        mem.write_u8(0x3fff, b'a').unwrap();
+        assert_eq!(mem.memstring(0x3fff).unwrap_err().data, 0x4000);
+        assert!(mem.memview(0x4000, 4).is_ok());
+        mem.free_pages(0x4000, 1);
+        assert!(mem.memcpy_out(&mut out, 0x4000).is_ok());
+        assert_eq!(u32::from_le_bytes(out), 1);
+        assert!(mem.get_page_info(0x4000).contains("Writable: [x]"));
+    }
+
+    #[test]
+    fn page_fault_limit() {
+        // 256 pages: room for 128 owned pages outside the arena.
+        let mut mem = empty_memory(MIB);
+        let far = 0x1_0000_0000;
+        for i in 0..128 {
+            mem.write_u8(far + i * PAGE_SIZE, 1).unwrap();
+        }
+        let err = mem.write_u8(far + 128 * PAGE_SIZE, 1).unwrap_err();
+        assert_eq!(err.kind, ExceptionKind::OutOfMemory);
+        assert_eq!(err.data, 128 * 3);
+        // Attribute-only pages are bounded by the page table limit.
+        let err = mem
+            .set_page_attr(far * 2, u64::MAX / 2, PageAttributes::NONE)
+            .unwrap_err();
+        assert_eq!(err.kind, ExceptionKind::OutOfMemory);
+        assert_eq!(mem.pages_active(), 256 * 64);
     }
 
     #[test]
     fn memcpy_and_memview_bounds() {
-        let mut mem = empty_memory(1 << 20);
+        let mut mem = empty_memory(MIB);
         mem.memcpy(0x2000, b"hello").unwrap();
         assert_eq!(mem.memview(0x2000, 5).unwrap(), b"hello");
         assert!(mem.memview(0x2000, u64::MAX).is_err());
         assert!(mem.memview(0x10, 1).is_err());
-        assert!(mem.memcpy(u64::MAX - 1, b"ab").is_err());
+        // Wraps around the address space into new pages, like C++.
+        mem.memcpy(u64::MAX - 1, b"ab").unwrap();
+        assert_eq!(mem.read_u16(u64::MAX - 1).unwrap(), 0x6261);
         let mut out = [0u8; 5];
         mem.memcpy_out(&mut out, 0x2000).unwrap();
         assert_eq!(&out, b"hello");
     }
 
     #[test]
-    fn zero_memory_is_rejected() {
+    fn memory_limits() {
         let options = MachineOptions {
             memory_max: 0,
             ..Default::default()
         };
         let err = Memory::new(Arc::from(Vec::new()), &options).unwrap_err();
         assert_eq!(err.kind, ExceptionKind::OutOfMemory);
+        // Too large for an arena: paging alone, as when C++'s mmap fails.
         let options = MachineOptions {
             memory_max: u64::MAX,
             ..Default::default()
         };
-        assert!(Memory::new(Arc::from(Vec::new()), &options).is_err());
+        let mut mem = Memory::new(Arc::from(Vec::new()), &options).unwrap().0;
+        assert!(!mem.uses_flat_memory_arena());
+        mem.write_u32(0x1000, 5).unwrap();
+        assert_eq!(mem.read_u32(0x1000).unwrap(), 5);
+        assert_eq!(mem.owned_pages_active(), 1);
     }
 }

@@ -3,9 +3,10 @@
 //! C++ reference emulator.
 //!
 //! Freestanding guests run for every ISA variant in [`MARCHES`]. Linux
-//! guests are static glibc executables (C and C++, with threads) and the
-//! prebuilt Rust, Go, Zig and newlib fixtures of C++ libriscv. Dynamic
-//! executables need virtual paging (Phase 5).
+//! guests are static and dynamic glibc executables (C and C++, with
+//! threads; dynamic ones run under `ld.so`), programs generating code at
+//! runtime, and the prebuilt Rust, Go, Zig and newlib fixtures of C++
+//! libriscv.
 
 #![allow(
     clippy::panic,
@@ -24,7 +25,10 @@ fn rvlinux() -> &'static Path {
 
 /// Run both emulators and compare everything that must match. With the
 /// `jit` feature, the Rust emulator also runs with `--jit` (compiling in the
-/// background and up front), against the same reference.
+/// background and up front), against the same reference. Dynamic
+/// executables skip compiling up front: that compiles all of `libc.so`'s
+/// executable mapping (1.5 MB) when it's first entered, which takes minutes
+/// in a debug build.
 fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     let reference =
         testutil::run_reference_with(elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
@@ -37,8 +41,17 @@ fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     );
     compare(&reference, elf, flags, args);
     if cfg!(feature = "jit") {
+        let dynamic = std::fs::read(elf)
+            .ok()
+            .and_then(|b| libriscv::elf_interpreter(&b))
+            .is_some();
         // Background compilation (the default) and compiling up front.
-        for extra in [&["--jit"][..], &["--jit", "--no-background"]] {
+        let modes: &[&[&str]] = if dynamic {
+            &[&["--jit"]]
+        } else {
+            &[&["--jit"], &["--jit", "--no-background"]]
+        };
+        for &extra in modes {
             let mut jit_flags = flags.to_vec();
             jit_flags.extend_from_slice(extra);
             compare(&reference, elf, &jit_flags, args);
@@ -1385,32 +1398,32 @@ fn glibc_condvars() {
 }
 
 /// A C++ program: iostreams, exceptions, containers.
+const GLIBC_CXX_PROGRAM: &str = r#"
+#include <iostream>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <vector>
+int main(int argc, char** argv) {
+    std::map<std::string, int> m;
+    std::vector<std::string> words = {"one", "two", "three", "two", "one", "one"};
+    for (auto& w : words) m[w]++;
+    for (auto& [k, v] : m) std::cout << k << "=" << v << "\n";
+    try {
+        throw std::runtime_error("caught it");
+    } catch (const std::exception& e) {
+        std::cout << e.what() << std::endl;
+    }
+    return m["one"];
+}
+"#;
+
 #[test]
 fn glibc_cxx() {
     if !have_tools() {
         return;
     }
-    let elf = build_glibc(
-        r#"
-        #include <iostream>
-        #include <map>
-        #include <stdexcept>
-        #include <string>
-        #include <vector>
-        int main(int argc, char** argv) {
-            std::map<std::string, int> m;
-            std::vector<std::string> words = {"one", "two", "three", "two", "one", "one"};
-            for (auto& w : words) m[w]++;
-            for (auto& [k, v] : m) std::cout << k << "=" << v << "\n";
-            try {
-                throw std::runtime_error("caught it");
-            } catch (const std::exception& e) {
-                std::cout << e.what() << std::endl;
-            }
-            return m["one"];
-        }"#,
-        testutil::Lang::Cxx,
-    );
+    let elf = build_glibc(GLIBC_CXX_PROGRAM, testutil::Lang::Cxx);
     let out = diff(&elf);
     assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
 }
@@ -1454,4 +1467,177 @@ fn glibc_segfault_handler() {
         testutil::Lang::C,
     );
     diff(&elf);
+}
+
+/// Dynamic executables: `rvlinux` runs `ld.so`, which maps the program and
+/// its libraries with mmap/mprotect, and their code becomes execute
+/// segments when first jumped to.
+fn build_dynamic(code: &str, lang: testutil::Lang, libs: &str) -> PathBuf {
+    testutil::build(code, &format!("-O2 -pthread {libs}"), lang).unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn dynamic_glibc_program() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_dynamic(GLIBC_PROGRAM, testutil::Lang::C, "-lm");
+    let out = diff_with(&elf, &[], &["first"]);
+    assert!(out.stdout.contains("sorted sum="), "{}", out.stdout);
+    // Timeouts in the dynamic linker, in libc and in the program.
+    for fuel in [1, 2000, 50_000, 150_000, 400_000] {
+        diff_with(&elf, &["--fuel", &fuel.to_string()], &["first"]);
+    }
+}
+
+#[test]
+fn dynamic_glibc_cxx() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_dynamic(GLIBC_CXX_PROGRAM, testutil::Lang::Cxx, "");
+    let out = diff(&elf);
+    assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
+}
+
+#[test]
+fn dynamic_glibc_threads() {
+    if !have_tools() {
+        return;
+    }
+    let source = testutil::cpp_source_dir().join("tests/unit/threads/test_threads.cpp");
+    let code =
+        std::fs::read_to_string(&source).unwrap_or_else(|e| panic!("{}: {e}", source.display()));
+    let elf = build_dynamic(&code, testutil::Lang::Cxx, "");
+    let out = diff(&elf);
+    assert_eq!(out.exit_code, Some(123_666_123), "{}", out.stdout);
+}
+
+/// Code generated at runtime: written to an anonymous mapping, made
+/// executable with mprotect, rewritten (FENCE.I rebuilds the stale
+/// segment), and mapped far outside the arena. With `ARGC > 1` it jumps to a
+/// data page, an execute fault. The dynamic variant also uses `dlopen`.
+const RUNTIME_CODE_PROGRAM: &str = r#"
+#include <dlfcn.h>
+#include <stdio.h>
+#include <sys/mman.h>
+typedef long (*fn_t)(long);
+static void emit_addi(unsigned* p, int imm) {
+    p[0] = ((unsigned)(imm & 0xFFF) << 20) | (10 << 15) | (10 << 7) | 0x13; /* addi a0, a0, imm */
+    p[1] = 0x00008067; /* ret */
+}
+int main(int argc, char** argv) {
+    unsigned* code = mmap(0, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    emit_addi(code, 42);
+    mprotect(code, 8192, PROT_READ | PROT_EXEC);
+    fn_t f = (fn_t)code;
+    printf("first: %ld\n", f(100));
+    mprotect(code, 8192, PROT_READ | PROT_WRITE | PROT_EXEC);
+    emit_addi(code, -7);
+    __asm__ volatile("fence.i" ::: "memory");
+    printf("second: %ld\n", f(100));
+    unsigned* code2 = mmap((void*)0x200000000ul, 4096, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    emit_addi(code2, 1000);
+    mprotect(code2, 4096, PROT_READ | PROT_EXEC);
+    printf("far: %p %ld\n", (void*)code2, ((fn_t)code2)(1));
+    long* far = mmap((void*)0x300000000ul, 1 << 16, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    for (int i = 0; i < 8192; i++) far[i] = i * 3;
+    long s = 0;
+    for (int i = 0; i < 8192; i++) s += far[i];
+    printf("far sum: %ld\n", s);
+#ifdef USE_DL
+    void* h = dlopen("libm.so.6", RTLD_NOW);
+    double (*c)(double) = h ? (double (*)(double))dlsym(h, "cos") : 0;
+    printf("dlopen: %d cos(0.5)=%.9f\n", h != 0, c ? c(0.5) : -1.0);
+#endif
+    if (argc > 1) {
+        fn_t bad = (fn_t)far;
+        printf("bad: %ld\n", bad(1));
+    }
+    return 0;
+}
+"#;
+
+#[test]
+fn runtime_code() {
+    if !have_tools() {
+        return;
+    }
+    let static_elf = build_glibc(RUNTIME_CODE_PROGRAM, testutil::Lang::C);
+    let code = format!("#define USE_DL 1\n{RUNTIME_CODE_PROGRAM}");
+    let dynamic_elf = build_dynamic(&code, testutil::Lang::C, "-ldl -lm");
+    for elf in [&static_elf, &dynamic_elf] {
+        let out = diff(elf);
+        assert!(out.stdout.contains("second: 93"), "{}", out.stdout);
+        assert!(
+            out.stdout.contains("far: 0x200000000 1001"),
+            "{}",
+            out.stdout
+        );
+        let out = diff_with(elf, &[], &["fault"]);
+        assert!(
+            out.stdout
+                .contains("Execution space protection fault (data: 0x300000000)"),
+            "{}",
+            out.stdout
+        );
+    }
+    let out = diff(&dynamic_elf);
+    assert!(
+        out.stdout.contains("cos(0.5)=0.877582562"),
+        "{}",
+        out.stdout
+    );
+}
+
+/// `getrusage`'s `ru_maxrss` counts the pages in the page table, which
+/// mmap, madvise, mprotect, munmap and file I/O change: the port must track
+/// them exactly like C++.
+const PAGE_ACCOUNTING_PROGRAM: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+static long rss(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_maxrss; }
+int main() {
+    printf("start %ld\n", rss());
+    char* a = malloc(100000);
+    memset(a, 1, 100000);
+    printf("malloc %ld\n", rss());
+    char* b = mmap(0, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    printf("mmap %ld\n", rss());
+    b[5000] = 1;
+    madvise(b, 1 << 20, MADV_DONTNEED);
+    printf("madvise %ld %d\n", rss(), b[5000]);
+    madvise(b + 100, 3 * 4096, MADV_DONTNEED);
+    printf("madvise partial %ld\n", rss());
+    mprotect(b, 8192, PROT_READ);
+    printf("mprotect %ld\n", rss());
+    munmap(b, 1 << 20);
+    printf("munmap %ld\n", rss());
+    char* c = mmap((void*)0x500000000ul, 1 << 16, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    for (int i = 0; i < (1 << 16); i += 4096) c[i] = 1;
+    printf("far %ld\n", rss());
+    madvise(c, 1 << 16, MADV_DONTNEED);
+    printf("far discarded %ld %d\n", rss(), c[4096]);
+    return 0;
+}
+"#;
+
+#[test]
+fn page_accounting() {
+    if !have_tools() {
+        return;
+    }
+    for elf in [
+        build_glibc(PAGE_ACCOUNTING_PROGRAM, testutil::Lang::C),
+        build_dynamic(PAGE_ACCOUNTING_PROGRAM, testutil::Lang::C, ""),
+    ] {
+        let out = diff(&elf);
+        assert!(out.stdout.contains("far discarded"), "{}", out.stdout);
+    }
 }

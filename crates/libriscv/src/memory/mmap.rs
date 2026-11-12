@@ -1,10 +1,10 @@
 //! Port of `memory_mmap.cpp` and `mmap_cache.hpp`: the bump allocator for
-//! the mmap area and its free list, plus the flat-arena parts of
-//! `memory_rw.cpp` that the Linux memory system calls use (`memdiscard`,
-//! `free_pages`, `set_page_attr`) and `Memory::flush_execute_segments`
-//! (`decoder_cache.cpp`).
+//! the mmap area and its free list, `Memory::memstring` and
+//! `Memory::flush_execute_segments` (`decoder_cache.cpp`). The paging parts
+//! of `memory_rw.cpp` (`memdiscard`, `free_pages`, `set_page_attr`) are in
+//! `paging.rs`.
 
-use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault};
+use super::{Memory, PAGE_SIZE};
 use crate::error::Result;
 
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
@@ -178,57 +178,6 @@ impl Memory {
         relaxed
     }
 
-    /// Port of `Memory::memdiscard` without paging: zero
-    /// `[dst, dst + len)`, never touching read-only memory. Faults if the
-    /// range leaves the arena.
-    ///
-    /// C++ uses `madvise(MADV_DONTNEED)`, which drops the pages instead of
-    /// writing to them. Here pages that are already zero are skipped, so a
-    /// guest discarding (or mapping) a huge range doesn't make the host
-    /// commit memory for it: reading a never-touched page maps the shared
-    /// zero page.
-    pub fn memdiscard(&mut self, dst: u64, len: u64) -> Result<()> {
-        let end = dst.checked_add(len);
-        if end.is_none_or(|e| e > self.arena_size) {
-            return Err(protection_fault(dst));
-        }
-        // Never discard read-only memory. Rounded up, as the page at the
-        // boundary still holds rodata.
-        let roend = page_round_up(self.initial_rodata_end);
-        let (mut dst, mut len) = (dst, len);
-        if dst < roend {
-            let skip = len.min(roend - dst);
-            dst += skip;
-            len -= skip;
-            if len == 0 {
-                return Ok(());
-            }
-        }
-        let (Ok(d), Ok(n)) = (usize::try_from(dst), usize::try_from(len)) else {
-            return Err(protection_fault(dst));
-        };
-        let range = self
-            .arena
-            .get_mut(d..d.saturating_add(n))
-            .ok_or(protection_fault(dst))?;
-        // Chunks aligned to host pages.
-        let head = (PAGE_SIZE - (dst & PAGE_MASK)) as usize & PAGE_MASK as usize;
-        let (first, rest) = range.split_at_mut(head.min(range.len()));
-        first.fill(0);
-        for chunk in rest.chunks_mut(PAGE_SIZE as usize) {
-            if chunk.iter().any(|&b| b != 0) {
-                chunk.fill(0);
-            }
-        }
-        Ok(())
-    }
-
-    /// Port of `Memory::free_pages`: a no-op without paging.
-    pub const fn free_pages(&mut self, _dst: u64, _len: u64) {}
-
-    /// Port of `Memory::set_page_attr`: a no-op without paging, as in C++.
-    pub const fn set_page_attr(&mut self, _dst: u64, _len: u64, _attr: PageAttributes) {}
-
     /// Port of `Memory::flush_execute_segments`: mark the execute segments
     /// whose code in `[begin, end)` differs from memory as stale. Returns
     /// the instructions to charge (C++ penalizes `(hi - lo) / 4` per
@@ -246,10 +195,9 @@ impl Memory {
             let lo = begin.max(segment.exec_begin());
             let hi = end.min(segment.exec_end());
             penalty = penalty.wrapping_add((hi - lo) / 4);
-            let same = match (segment.exec_bytes(lo, hi), self.memview(lo, hi - lo)) {
-                (Some(code), Ok(mem)) => code == mem,
-                _ => false,
-            };
+            let same = segment
+                .exec_bytes(lo, hi)
+                .is_some_and(|code| self.memcmp(code, lo).unwrap_or(false));
             if !same {
                 segment.set_stale(true);
             }
@@ -257,76 +205,15 @@ impl Memory {
         penalty
     }
 
-    /// Port of `Memory::memstring` without paging: the NUL-terminated
-    /// string at `addr`, at most `max_len` bytes (C++ default 16384). The
-    /// string may end at the end of the arena without a terminator.
-    pub fn memstring_bytes(&self, addr: u64, max_len: usize) -> Result<&[u8]> {
-        if addr < RWREAD_BEGIN || addr >= self.arena_size {
-            return Err(protection_fault(addr));
-        }
-        let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
-        let limit = max_len.min(usize::try_from(self.arena_size - addr).unwrap_or(usize::MAX));
-        let s = self
-            .arena
-            .get(a..a.saturating_add(limit))
-            .ok_or(protection_fault(addr))?;
-        let len = s.iter().position(|&b| b == 0).unwrap_or(s.len());
-        Ok(s.get(..len).unwrap_or_default())
-    }
-
     /// [`memstring_bytes`](Self::memstring_bytes) with the C++ default
     /// limit, as a (lossy) UTF-8 string.
     pub fn memstring(&self, addr: u64) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.memstring_bytes(addr, MEMSTRING_MAX)?).into_owned())
-    }
-
-    /// Writable zero-copy view of `[addr, addr + len)` (flat-arena
-    /// `gather_writable_buffers_from_range`). Faults unless the whole
-    /// range is writable.
-    pub fn memview_mut(&mut self, addr: u64, len: u64) -> Result<&mut [u8]> {
-        if len == 0 {
-            return Ok(&mut []);
-        }
-        let end = addr.checked_add(len);
-        if addr < self.initial_rodata_end || end.is_none_or(|e| e > self.arena_size) {
-            return Err(protection_fault(addr));
-        }
-        let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
-        let n = usize::try_from(len).map_err(|_| protection_fault(addr))?;
-        self.arena
-            .get_mut(a..a.saturating_add(n))
-            .ok_or(protection_fault(addr))
-    }
-
-    /// Compare guest memory with `data` (C++ `Memory::memcmp`); faults if
-    /// the range isn't readable.
-    pub fn memcmp(&self, data: &[u8], addr: u64) -> Result<bool> {
-        Ok(self.memview(addr, data.len() as u64)? == data)
+        Ok(String::from_utf8_lossy(&self.memstring_bytes(addr, MEMSTRING_MAX)?).into_owned())
     }
 }
 
 /// C++ `memstring`'s default `maxlen`.
 pub const MEMSTRING_MAX: usize = 16384;
-
-/// Page protections (C++ `PageAttributes`). Only recorded with paging,
-/// which the port doesn't have yet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PageAttributes {
-    pub read: bool,
-    pub write: bool,
-    pub exec: bool,
-}
-
-impl PageAttributes {
-    /// From Linux `PROT_*` bits.
-    pub const fn from_prot(prot: i32) -> Self {
-        Self {
-            read: prot & 1 != 0,
-            write: prot & 2 != 0,
-            exec: prot & 4 != 0,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

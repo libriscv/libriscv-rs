@@ -106,13 +106,34 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let binary = match std::fs::read(&args.program) {
+    let mut binary = match std::fs::read(&args.program) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Could not read {}: {e}", args.program.display());
             return ExitCode::FAILURE;
         }
     };
+    // The guest's argv: the program and its arguments.
+    let mut guest_args = vec![args.program.to_string_lossy().into_owned()];
+    guest_args.extend(args.guest_args.iter().cloned());
+    let mut is_dynamic = false;
+    if let Some(interp) = libriscv::elf_interpreter(&binary) {
+        // A dynamic executable: run its dynamic linker instead, which maps
+        // the program and its libraries at runtime, with the program as
+        // its first argument (C++ `main`).
+        let interp_path = interp.trim_end_matches('\0');
+        binary = match std::fs::read(interp_path).or_else(|_| std::fs::read(DYNAMIC_LINKER)) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Could not read the dynamic linker {interp_path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // C++ keeps the NUL terminator of PT_INTERP in argv[0], so its
+        // string takes one byte more on the initial stack.
+        guest_args.insert(0, interp);
+        is_dynamic = true;
+    }
     let options = libriscv::MachineOptions {
         memory_max: args.memory_mib.map_or(DEFAULT_MEMORY, |m| m << 20),
         verbose_loader: args.verbose,
@@ -121,16 +142,6 @@ fn main() -> ExitCode {
         jit_background: !args.no_background,
         ..Default::default()
     };
-    if let Some(interp) = libriscv::elf_interpreter(&binary) {
-        // C++ runs the dynamic linker instead, which maps the program and
-        // its libraries at runtime: that needs virtual paging (Phase 5).
-        eprintln!(
-            "{}: dynamically linked executables are not supported yet \
-             (interpreter {interp}); link with -static",
-            args.program.display()
-        );
-        return ExitCode::FAILURE;
-    }
     let mut machine = match libriscv::Machine::new(&binary, options) {
         Ok(m) => m,
         Err(e) => {
@@ -138,7 +149,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = setup_linux(&mut machine, &args) {
+    if let Err(e) = setup_linux(&mut machine, &args, &guest_args, is_dynamic) {
         eprintln!("Exception: {e}");
         return ExitCode::FAILURE;
     }
@@ -209,8 +220,12 @@ fn main() -> ExitCode {
 /// The guest environment (as in C++).
 const GUEST_ENV: [&str; 3] = ["LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full"];
 
+/// The dynamic linker used when the interpreter named by a dynamic
+/// executable can't be read (C++ `DYNAMIC_LINKER`).
+const DYNAMIC_LINKER: &str = "/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1";
+
 /// Libraries the guest may open, from `/lib/riscv64-linux-gnu/` (C++
-/// `filter_open`; used by dynamic executables, which need paging first).
+/// `filter_open`, for dynamic executables).
 const GUEST_LIBS: [&str; 9] = [
     "libdl.so.2",
     "libm.so.6",
@@ -228,13 +243,18 @@ const REAL_LIBDIR: &str = "/usr/riscv64-linux-gnu/lib/";
 /// The Linux environment of the C++ emulator (`full_linux_guest`): initial
 /// stack with argv/env/auxv, Linux system calls with a sandboxed file
 /// system, and POSIX threads.
-fn setup_linux(machine: &mut libriscv::Machine, args: &CliArgs) -> libriscv::Result<()> {
-    let mut guest_args = vec![args.program.to_string_lossy().into_owned()];
-    guest_args.extend(args.guest_args.iter().cloned());
-    machine.setup_linux(&guest_args, &GUEST_ENV)?;
+fn setup_linux(
+    machine: &mut libriscv::Machine,
+    args: &CliArgs,
+    guest_args: &[String],
+    is_dynamic: bool,
+) -> libriscv::Result<()> {
+    machine.setup_linux(guest_args, &GUEST_ENV)?;
     machine.setup_linux_syscalls(true, true);
 
     let program = guest_args.first().cloned().unwrap_or_default();
+    // The dynamic linker may open the program it runs.
+    let dynamic_program = guest_args.get(1).filter(|_| is_dynamic).cloned();
     let verbose = args.verbose;
     let proxy = args.proxy;
     let allowed = args.allowed_files.clone();
@@ -293,6 +313,9 @@ fn setup_linux(machine: &mut libriscv::Machine, args: &CliArgs) -> libriscv::Res
                     eprintln!("Guest wanted to open: {path} (allowed)");
                 }
                 *path = format!("{REAL_LIBDIR}{lib}");
+                return true;
+            }
+            if dynamic_program.as_deref() == Some(path.as_str()) {
                 return true;
             }
             if proxy || allowed.iter().any(|a| a == path) {

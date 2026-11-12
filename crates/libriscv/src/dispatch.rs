@@ -619,6 +619,24 @@ pub(crate) fn jit_enter(
                 max: c.max,
             }
         ),
+        JitExit::Slow { pc, counter } => {
+            // Continue the chain at that instruction with the interpreter's
+            // own handler (the block is counted already).
+            let si = exec.index(pc);
+            let e = entry!(exec, si, m, pc);
+            let handler = jit.original_handler(si).unwrap_or(e.handler);
+            let block_pc = pc.wrapping_add(e.block_bytes());
+            become handler(
+                exec,
+                si,
+                m,
+                block_pc,
+                Counter {
+                    value: counter,
+                    max: c.max,
+                },
+            )
+        }
         JitExit::Fault(err) => fault(m, err),
         JitExit::Unavailable => match jit.original_handler(i) {
             Some(handler) => become handler(exec, i, m, pc, c),

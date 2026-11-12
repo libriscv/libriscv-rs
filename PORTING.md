@@ -32,8 +32,8 @@ together.
 ## Scope
 
 In scope: the interpreter, **RV64 only**, extensions I M A C F D Zba Zbb Zbc
-Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V; ELF loading; flat arena memory and
-(later) virtual paging; Linux, newlib and minimal syscall sets; vmcall/preempt;
+Zbs Zicond Zbkb Zfh(min) Zcb Zimop/Zcmop and V; ELF loading; flat arena memory
+with virtual paging; dynamic executables (through `ld.so`); Linux, newlib and minimal syscall sets; vmcall/preempt;
 fork/CoW; serialization; threads; native heap/libc; debugger, disassembler and
 GDB stub.
 
@@ -73,14 +73,21 @@ Decided (implemented in Phase 0):
 
 Decided in Phase 1:
 
-- **Memory representation.** The C++ flat read-write arena without paging
-  (`Vec<u8>`, zero-allocated so the OS commits it lazily, plus one page of
-  padding so a wide access at the last address needs no size check).
-  Protection is the two compares of `memory_inline.hpp`: reads in
-  `[0x1000, arena_size)`, writes in `[initial_rodata_end, arena_size)`. There
-  is no page attribute table: C++ without `RISCV_VIRTUAL_PAGING` has none
-  either (`set_page_attr` is a no-op). Virtual paging comes later as a second
-  backend behind an enum, not as a type parameter on everything.
+- **Memory representation.** The C++ flat read-write arena (`Vec<u8>`,
+  zero-allocated so the OS commits it lazily, plus one page of padding so a
+  wide access at the last address needs no size check). Guest loads and
+  stores check it first with the two compares of `memory_inline.hpp`: reads
+  in `[0x1000, arena_size)`, writes in `[initial_rodata_end, arena_size)`.
+  (Phase 1 had only this; see "Virtual paging" for what replaced the
+  "protection fault otherwise".)
+
+Decided in Phase 5 (moved up, for dynamic executables):
+
+- **Virtual paging: always on, behind the arena.** The oracle is built with
+  `RISCV_FLAT_RW_ARENA` *and* `RISCV_VIRTUAL_PAGING`, so that is the only
+  configuration (no feature, no enum of backends). The arena fast path is
+  unchanged; what used to be a protection fault is now a `#[cold]` call
+  into the page table. See "Virtual paging".
 - **Machine shape.** `Machine { cpu, memory, .. }` is not generic. System
   call handlers are `fn(&mut Machine) -> Result<()>` in a per-machine table
   (C++'s is per process). Userdata is still open (Phase 3).
@@ -266,6 +273,9 @@ contract the code generator must keep.
   grow.
 - Guest registers live in SSA variables, loaded on function entry and stored
   on exit; arena loads/stores are inlined with `Memory`'s exact range checks.
+  An access outside them leaves native code at that instruction
+  (`EXIT_SLOW`): the interpreter runs it through the page table and
+  finishes the (already counted) block.
 - Decoder entries at block starts that native code can be entered at get the
   `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
   Native code exits to the interpreter on anything it doesn't compile
@@ -336,13 +346,78 @@ Baseline for current numbers) saves ~5-10 ms on CoreMark, the same as
 asmjit's: during the compile, the interpreter only gets through ~1/7 of
 what native code would have.
 
+## Virtual paging
+
+`memory/paging.rs` and `memory/page.rs` port the paging half of
+`memory.cpp`, `memory_rw.cpp`, `memory_helpers_paging.hpp`,
+`memory_inline_pages.hpp` and `page.hpp`.
+
+- **Page table:** `BTreeMap<page number, Page>`. A `Page` is attributes
+  (`PageAttributes`: read/write/exec, copy-on-write, `dont_fork`, a user
+  byte) plus where its bytes are: `Arena` (C++: a non-owning page loaned
+  from the arena), `Owned(Box<[u8; 4096]>)`, or one of the shared static
+  pages, `Zero` (C++ `cow_page`/`guard_page`) and `Host` (C++
+  `host_page`: the exit function and signal trampoline). Pages never alias
+  each other, so there is no `unsafe` and no lifetime juggling; range
+  operations (`free_pages`, attribute changes and discards of huge ranges)
+  are `BTreeMap::range` walks.
+- **Arena pages:** C++ creates an arena page table entry whenever a slow
+  path first touches the page. Here only arena pages with non-default
+  attributes get an entry; a bitmap (one bit per arena page) records which
+  ones C++ would have, so `pages_active()` (and `getrusage`'s `ru_maxrss`,
+  and `memdiscard`'s choice between its bulk and page-by-page paths) are
+  exactly C++'s.
+- **Semantics:** guest loads/stores in the arena windows ignore page
+  attributes, as in C++; everything else goes through the page table. Host
+  accessors (`memcpy`, `memset`, `memcpy_out`, `memstring_bytes`,
+  `memcmp`, `gather_buffers`, `gather_writable_buffers`) always do, so
+  system calls respect page attributes inside the arena too. `memview`
+  and `memview_mut` take the arena window, else a single gathered buffer
+  (`OUT_OF_MEMORY` if the range isn't contiguous on the host).
+- **Page faults:** a missing page outside the arena reads as the zero page
+  and is created by the first write, until the owned pages reach half the
+  memory limit with an arena (C++ `anywhere_pages`), the whole limit
+  without one; then `OUT_OF_MEMORY`. Attribute-only pages (from
+  `mmap`/`mprotect`) are bounded by 64 × the memory limit in pages. A
+  writable attribute-only page is the zero page, copy-on-write.
+- **Execute segments from pages** (`CPU::next_execute_segment`): jumping
+  outside every known segment looks at the page; if it's executable, all
+  adjacent executable pages are copied out and decoded as a new segment
+  (at most `memory_max` bytes, see the differences). FENCE.I and
+  `riscv_flush_icache` mark segments stale, which then get rebuilt the
+  same way. The host code page is an execute-only page, not a segment
+  made at load time.
+- **ELF loading:** segments are copied in through the page table (so they
+  can be anywhere, e.g. `-Ttext-segment` above the arena) and get their
+  program header's attributes (`protect_segments`), or RWX.
+- **JIT:** native code inlines the arena window checks only. Anything else
+  exits to the interpreter at that instruction (`EXIT_SLOW`), which runs
+  it through the page table and finishes the block with the interpreter's
+  handlers (the block is already counted), so results and counts don't
+  depend on the JIT.
+
+Dynamic executables: `rvlinux` loads the program's `PT_INTERP` (falling
+back to `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1`) as the
+machine's binary, with argv `[interpreter, program, args...]`, and lets the
+guest open the program and the allow-listed libraries in
+`/lib/riscv64-linux-gnu/` (mapped to `/usr/riscv64-linux-gnu/lib/`), as C++
+`rvlinux` does. `ld.so` maps the program and libraries with
+`mmap`/`mprotect`, and their code becomes execute segments when first
+jumped to. Instruction counts match the oracle exactly, also for `dlopen`.
+
+Not ported yet: custom page fault/read/write handlers and execute fault
+handlers (embedding API, Phase 3), memory traps (`RISCV_MEMORY_TRAPS`,
+Phase 5), CoW pages for `fork` (Phase 3), `insert_non_owned_memory`, and
+the read/write page caches (a C++ performance detail; the page table is
+consulted directly, and only on the slow path).
+
 ## Testing
 
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts), the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE) |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
@@ -375,7 +450,7 @@ guests difftest clean against the C++ oracle, including instruction counts at
 timeouts.
 
 - [x] ELF parsing and segment loading (`elf.hpp`, `memory_elf.cpp`), incl. `.text` narrowing and relocations
-- [x] Flat arena memory (`memory.cpp`, `memory_inline.hpp`). Page attributes come with paging (Phase 5)
+- [x] Flat arena memory (`memory.cpp`, `memory_inline.hpp`). Page attributes came with paging (Phase 5)
 - [x] Registers, CPU state, PC (`registers.hpp`, `cpu.hpp`, `cpu_inline.hpp`)
 - [x] Decoder cache per execute segment with C++'s block measurement, incl. FUNCBLOCK splitting and forced-invalid segment ends (`decoder_cache.cpp`, `decoded_exec_segment.hpp`)
 - [x] Tail-call dispatcher with block-based instruction counting (`tailcall_dispatch.cpp`, `cpu_dispatch.cpp` semantics, `instruction_counter.hpp`)
@@ -395,17 +470,28 @@ Expected until the listed phase:
   depends on the C++ compiler: clang inlines `std::fmin` as `minnum` (the
   other operand, as here), while a call into glibc returns a quiet NaN. The
   difftests avoid that case.
-- The oracle is built with virtual paging, the port is not yet (Phase 5).
-  Accesses outside the arena fault here, where the oracle creates pages; a
-  store into a read-only segment reports the address here and the page base
-  in the oracle; FENCE.I in a program faults (the stale segment can't be
-  rebuilt without paging, as in C++ without paging). A machine created
-  without a binary has usable memory here, which matches the oracle (C++
-  without paging has none). Freestanding guests have no crt0 to set `gp`,
-  so with linker relaxation their globals land near address 0 or
-  `-2048`: build them with `-mno-relax`.
+- Freestanding guests have no crt0 to set `gp`, so with linker relaxation
+  their globals land near address 0 or `-2048`: build them with
+  `-mno-relax`.
 - Arena allocation failure aborts the process (fallible zeroed allocation
-  needs `unsafe`); C++ throws `OUT_OF_MEMORY`.
+  needs `unsafe`); C++ throws `OUT_OF_MEMORY`. A `memory_max` too large to
+  address at all gets no arena (paging only), like a failed C++ `mmap`.
+
+Deliberate, permanent differences in paging:
+
+- Page 0 is a guard page in every machine; C++ only installs it when
+  loading a binary. A machine without a binary also keeps its arena fast
+  path (C++ leaves the boundaries at 0 and serves the arena through the
+  page table, with the same results except for page 0).
+- An execute segment built from executable pages is at most `memory_max`
+  bytes (`OUT_OF_MEMORY` otherwise): C++ would decode e.g. a guest's
+  `mprotect(PROT_EXEC)` of 64 × `memory_max` of attribute-only pages,
+  exhausting host memory.
+- Slow-path accesses that cross a page boundary use both pages (C++ reads
+  or writes past the end of a heap page; for arena pages, as here, the
+  next arena bytes).
+- Discarding the host code page gives the machine a zeroed private copy;
+  C++ zeroes the shared static page, for every machine in the process.
 
 ### Linux system calls
 
@@ -432,17 +518,17 @@ the guest raw host access, the port is deliberately stricter:
 - `ppoll` answers from the descriptor table (stdin readable, stdout/stderr
   writable, files both, unknown `POLLNVAL`) instead of polling host fds,
   and never waits.
-- `getrusage` is always the deterministic answer; time is `SystemTime` and
-  monotonic clocks count from machine creation (C++: host uptime).
+- `getrusage` is always the deterministic answer (`ru_maxrss` from the
+  pages in use, as C++); time is `SystemTime` and monotonic clocks count
+  from machine creation (C++: host uptime).
 - `getcwd` checks the buffer size (`ERANGE`); `readlinkat` truncates to
   the buffer.
 - Anonymous `mmap` and `madvise(DONTNEED)` zero memory without committing
   never-touched pages (C++ uses `madvise`).
 
-Without paging, a Linux guest needs `memory_max` large enough for the main
-stack (above the 16 MiB of brk space; the C++ tests use 8 MiB with
-paging), `mprotect` is a no-op, `ru_maxrss` is 0, and fixed mappings must
-lie inside the arena (the paging oracle creates pages anywhere).
+System calls reach guest memory through the gather functions with C++'s
+buffer counts (`read`/`pread64` 512, `write` 64, file `mmap` 256), so a
+range of more scattered pages than that is `OUT_OF_MEMORY`, as in C++.
 
 ### Known C++ quirks kept for parity
 
@@ -477,6 +563,15 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - Not reproduced: C++ registers an execute segment before decoding it and
   leaves it registered if decoding throws; here it's registered only when
   complete.
+- `rvlinux` keeps the NUL terminator of `PT_INTERP` in a dynamic
+  executable's `argv[0]` (C++ copies the whole `p_filesz` into a
+  `std::string`), so that string takes one byte more on the stack.
+- Guest stores inside the arena's write window, and loads in its read
+  window, ignore page attributes (`mprotect(PROT_NONE)` doesn't stop them);
+  system calls and other host accesses respect them.
+- `memdiscard` (`MADV_DONTNEED`, anonymous `mmap`) zeroes read-only memory
+  too, and a run of whole untouched arena pages is wiped without looking at
+  the attributes of the pages after the first.
 - `clone` reads `ptid`/`tls`/`ctid` from `a4`-`a6`, where glibc's wrapper
   leaves them (the kernel ABI has them in `a2`-`a4`); `set_tid_address`
   truncates the address to an `int`.
@@ -512,7 +607,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] Signals (`posix/signals.cpp`): sigaction, sigaltstack, tkill/tgkill delivery, rt_sigreturn
 - [x] POSIX threads (`threads.hpp`, `posix/threads.cpp`): clone/clone3, futex, sched_yield, exit; moved up from Phase 5
 - [x] `rvlinux` parity: `setup_linux` + Linux syscalls + threads for every guest, `--sandbox`/`--proxy`/`--allow`, the C++ open/readlink filters, `run_sighandler` after a fault; Linux difftests enabled
-- [ ] Dynamic executables (`rvlinux` loads the interpreter): need virtual paging for code mapped at runtime (Phase 5); `rvlinux` refuses them
+- [x] Dynamic executables: `rvlinux` loads the interpreter (`ld.so`), code mapped at runtime becomes execute segments (virtual paging, moved up from Phase 5); dynamic difftests incl. `dlopen`
 
 ### Phase 3 — Embedding API
 
@@ -536,7 +631,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Bounds-check elimination audit (`cargo asm`)
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMC, Zcb, B (no CLMUL), Zicond
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
-- [ ] JIT: lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`)
+- [ ] JIT: lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features
 
@@ -548,7 +643,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Disassembler (`rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp`)
 - [ ] CLI debugger (`debug.cpp`, `debug.hpp`)
 - [ ] GDB RSP server (`rsp_server.hpp`, `linux/rsp_server.hpp`)
-- [ ] Virtual paging backend (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp`)
+- [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging". Page caches (`cached_address.hpp`) not ported
 - [ ] Memory traps (`RISCV_MEMORY_TRAPS`)
 - [ ] Sockets, epoll, poll, select (`posix/socket_calls.cpp`, `linux/syscalls_{epoll,poll,select}.cpp`)
 - [ ] Fuzzing harness
@@ -564,9 +659,10 @@ phase starts; names below are the intended targets.
 | `common.hpp` (`MachineOptions`) | `options.rs` | 0 | ✅ (interpreter subset) |
 | `rv32i_instr.hpp` | `instruction.rs` | 0 | ✅ |
 | `elf.hpp`, `memory_elf.cpp` | `elf.rs`, `memory/loader.rs` | 1 | ✅ (symbol listing/lookup for backtraces: Phase 3) |
-| `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp`, `page.hpp` | `memory/` | 1 | ✅ flat arena (`page.hpp`: Phase 5) |
+| `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp` | `memory/` | 1, 5 | ✅ arena + paging (fork/serialization: Phase 3) |
+| `page.hpp` | `memory/page.rs` | 5 | ✅ (memory traps: Phase 5) |
 | `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | ✅ (+ flat-arena `memdiscard`, `memstring`, `flush_execute_segments`) |
-| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | |
+| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | ✅ (no page caches) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1 | ✅ |
@@ -604,5 +700,5 @@ phase starts; names below are the intended targets.
 | `util/crc32*.{hpp,cpp}` | `util/crc32.rs` | 3 | |
 | `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
-| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | ✅ static Linux guests (`full_linux_guest`); debugger, GDB, `--call`, dynamic executables: later |
+| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2, 5 | ✅ static and dynamic Linux guests (`full_linux_guest`); debugger, GDB, `--call`: later |
 | `tr_*`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

@@ -30,7 +30,7 @@ use crate::decoder_cache::DecodedSegment;
 use crate::dispatch::Handler;
 use crate::error::{ExceptionKind, MachineError};
 use crate::machine::Machine;
-use crate::memory::{RWREAD_BEGIN, protection_fault};
+use crate::memory::RWREAD_BEGIN;
 
 /// Exit kinds written by generated code (`JitState::exit_kind`).
 /// The instruction limit was reached before jumping to `exit_pc`.
@@ -42,8 +42,10 @@ pub(crate) const EXIT_JUMP: u64 = 1;
 /// Continue at `exit_pc` after an indirect jump (C++ `UNCHECKED_JUMP`: may
 /// leave the segment).
 pub(crate) const EXIT_INDIRECT: u64 = 4;
-/// A protection fault at address `exit_pc`.
-pub(crate) const EXIT_FAULT: u64 = 2;
+/// A load or store at `exit_pc` (mid-block, block already counted) is
+/// outside the arena windows: the interpreter executes it through the page
+/// table, then finishes the block.
+pub(crate) const EXIT_SLOW: u64 = 2;
 /// A jump to the misaligned address `exit_pc` (without the C extension).
 pub(crate) const EXIT_MISALIGNED: u64 = 3;
 
@@ -148,6 +150,12 @@ pub(crate) enum JitExit {
         pc: u64,
         counter: u64,
     },
+    /// Interpret from the load or store at `pc` to the end of its block
+    /// (already counted): it needs the page table.
+    Slow {
+        pc: u64,
+        counter: u64,
+    },
     Fault(MachineError),
     /// The JIT can't run with the current memory layout; interpret instead.
     Unavailable,
@@ -227,7 +235,7 @@ impl JitSegment {
             EXIT_HALT => JitExit::Halt { pc, counter },
             EXIT_JUMP => JitExit::Jump { pc, counter },
             EXIT_INDIRECT => JitExit::Indirect { pc, counter },
-            EXIT_FAULT => JitExit::Fault(protection_fault(pc)),
+            EXIT_SLOW => JitExit::Slow { pc, counter },
             EXIT_MISALIGNED => JitExit::Fault(MachineError::trigger(
                 ExceptionKind::MisalignedInstruction,
                 pc,

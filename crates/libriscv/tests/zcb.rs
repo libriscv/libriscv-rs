@@ -1,10 +1,9 @@
 //! Port of `tests/unit/zcb.cpp`.
 //!
 //! The guest is freestanding, so instead of `setup_linux` it runs with the
-//! minimal system calls; it exits with the address of its results. C++ runs
-//! it with an 8 MB `memory_max`, which only works with virtual paging (the
-//! stack sits above the 16 MB brk area); without paging (Phase 5) the arena
-//! has to cover it, so this uses the default size.
+//! minimal system calls; it exits with the address of its results. Like
+//! C++, it runs with an 8 MB `memory_max` (the stack, above the 16 MB brk
+//! area, is in pages outside the arena).
 
 // Compressed instructions only decode with the C extension.
 #![cfg(feature = "ext-c")]
@@ -144,6 +143,7 @@ void _start(void)
 fn machine(binary: &[u8]) -> Machine {
     // The freestanding toolchain links a single RWX segment.
     let options = MachineOptions {
+        memory_max: 8 << 20,
         allow_write_exec_segment: true,
         ..Default::default()
     };

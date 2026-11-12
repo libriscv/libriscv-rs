@@ -3,10 +3,9 @@
 //!
 //! Ports of `tests/unit/security.cpp` (C1-C3, C5-C7), the Linux cases of
 //! `tests/unit/protections.cpp` and `tests/unit/threads/test_threads.cpp`.
-//! C4 (the arena tail guard) is covered by the memory unit tests. The C++
-//! tests use 8 MiB of memory with virtual paging; without paging the main
-//! stack (above 16 MiB of brk space) must be inside the arena, so these use
-//! the default size.
+//! C4 (the arena tail guard) is covered by the memory unit tests. Like the
+//! C++ tests, the machines have 8 MiB of memory, so the main stack (above
+//! 16 MiB of brk space) lives in pages outside the arena.
 
 #![allow(
     clippy::panic,
@@ -31,14 +30,21 @@ fn build(code: &str) -> Vec<u8> {
 
 /// A machine with the Linux system calls and initial stack.
 fn linux_machine(binary: &[u8], filesystem: bool) -> Machine {
-    let mut machine = Machine::new(binary, MachineOptions::default()).unwrap();
+    let options = MachineOptions {
+        memory_max: 8 << 20,
+        ..Default::default()
+    };
+    let mut machine = Machine::new(binary, options).unwrap();
     machine.setup_linux_syscalls(filesystem, false);
     machine.setup_linux(&["linux_test"], &ENV).unwrap();
     machine
 }
 
 fn run(code: &str) -> i64 {
-    let mut machine = linux_machine(&build(code), false);
+    run_in(linux_machine(&build(code), false))
+}
+
+fn run_in(mut machine: Machine) -> i64 {
     machine.setup_posix_threads();
     machine.simulate(MAX_INSTRUCTIONS).unwrap();
     machine.return_value() as i64
@@ -273,7 +279,12 @@ fn malloc_free_and_brk() {
         }
         return 666;
     }"#;
-    assert_eq!(run(code), 666);
+    // 8 MiB live in mmap: more than the 4 MiB of pages an 8 MiB machine has
+    // outside its arena (C++ runs out of memory too), so use the default.
+    let mut machine = Machine::new(&build(code), MachineOptions::default()).unwrap();
+    machine.setup_linux_syscalls(false, false);
+    machine.setup_linux(&["linux_test"], &ENV).unwrap();
+    assert_eq!(run_in(machine), 666);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Port of `linux/syscalls_mman.cpp`: munmap, mmap, mremap, mprotect and
-//! madvise on the flat arena.
+//! madvise, with virtual paging (mappings can be anywhere in the address
+//! space, as in the reference emulator).
 
 use std::os::unix::fs::FileExt;
 
@@ -34,8 +35,8 @@ pub(super) fn syscall_munmap(m: &mut Machine) -> Result<()> {
 }
 
 /// Read file `vfd` from `offset` into `[dst, dst + length)`: the file
-/// mapping of C++ (`lseek` + `readv`). A short file leaves the rest as it
-/// was. Returns false on failure.
+/// mapping of C++ (`lseek` + `readv` into at most 256 gathered buffers). A
+/// short file leaves the rest as it was. Returns false on failure.
 fn map_file(m: &mut Machine, vfd: i32, offset: u64, dst: u64, length: u64) -> Result<bool> {
     let Some(fds) = m.fds.as_deref_mut() else {
         return Ok(false);
@@ -44,20 +45,22 @@ fn map_file(m: &mut Machine, vfd: i32, offset: u64, dst: u64, length: u64) -> Re
         return Ok(false);
     };
     let file = &f.file;
-    let buf = m.memory.memview_mut(dst, length)?;
-    let mut done = 0usize;
-    while let Some(rest) = buf.get_mut(done..) {
-        if rest.is_empty() {
-            break;
-        }
-        let Some(pos) = offset.checked_add(done as u64) else {
-            return Ok(false);
-        };
-        match file.read_at(rest, pos) {
-            Ok(0) => break,
-            Ok(n) => done += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => return Ok(false),
+    let mut pos = offset;
+    for buf in m.memory.gather_writable_buffers(dst, length, 256)? {
+        let mut done = 0usize;
+        while let Some(rest) = buf.get_mut(done..) {
+            if rest.is_empty() {
+                break;
+            }
+            match file.read_at(rest, pos) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    done += n;
+                    pos = pos.wrapping_add(n as u64);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Ok(false),
+            }
         }
     }
     Ok(true)
@@ -89,7 +92,6 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
     if length == 0 {
         return failed(m);
     }
-    let arena_size = m.memory.memory_arena_size();
 
     if vfd != -1 {
         if m.fds.is_none() {
@@ -108,10 +110,14 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
             }
             addr_g
         };
+        // Make the area read-write, read the file into it, then apply the
+        // protections.
+        m.memory
+            .set_page_attr(dst, length, PageAttributes::default())?;
         if !map_file(m, vfd, voff, dst, length)? {
             return failed(m);
         }
-        m.memory.set_page_attr(dst, length, attr);
+        m.memory.set_page_attr(dst, length, attr)?;
         m.set_result(dst);
         return Ok(());
     }
@@ -123,7 +129,7 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
         let Some(end) = addr_g.checked_add(length) else {
             return taken(m);
         };
-        if addr_g < m.memory.mmap_start() || end > arena_size {
+        if addr_g < m.memory.mmap_start() {
             return taken(m);
         }
         if addr_g >= nextfree {
@@ -144,20 +150,16 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
         // Without MAP_FIXED the address is only a hint, which is ignored.
         let range = m.memory.mmap_cache_mut().find(length);
         if range.size == 0 {
-            match nextfree.checked_add(length) {
-                Some(end) if end <= arena_size => {
-                    result = nextfree;
-                    nextfree = end;
-                }
-                _ => return failed(m),
-            }
+            let Some(end) = nextfree.checked_add(length) else {
+                return failed(m);
+            };
+            result = nextfree;
+            nextfree = end;
         } else {
             result = range.addr;
         }
     } else {
-        let end = addr_g.checked_add(length);
-        match end {
-            Some(e) if e > arena_size => return failed(m),
+        match addr_g.checked_add(length) {
             None => return failed(m),
             Some(_) if addr_g < m.memory.mmap_start() => {
                 // A fixed range below the mmap area: just return it
@@ -190,11 +192,11 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
     let untouched = result >= prev_nextfree;
     // Anonymous pages need to be zeroed
     if flags & MAP_ANONYMOUS != 0 {
-        m.memory.memdiscard(result, length)?;
+        m.memory.memdiscard(result, length, true)?;
     }
     // Avoid creating pages for MAP_NORESERVE and untouched PROT_NONE
     if flags & MAP_NORESERVE == 0 && !(prot == 0 && untouched) {
-        m.memory.set_page_attr(result, length, attr);
+        m.memory.set_page_attr(result, length, attr)?;
     }
     m.set_result(result);
     Ok(())
@@ -233,7 +235,7 @@ pub(super) fn syscall_mprotect(m: &mut Machine) -> Result<()> {
         return Ok(());
     }
     m.memory
-        .set_page_attr(addr, len, PageAttributes::from_prot(prot));
+        .set_page_attr(addr, len, PageAttributes::from_prot(prot))?;
     m.set_result(0);
     Ok(())
 }
@@ -248,7 +250,7 @@ pub(super) fn syscall_madvise(m: &mut Machine) -> Result<()> {
         0..=3 | 10 | 11 | 12 | 15 | 18 => m.set_result(0),
         4 => {
             // MADV_DONTNEED
-            m.memory.memdiscard(addr, len)?;
+            m.memory.memdiscard(addr, len, true)?;
             m.set_result(0);
         }
         8 | 9 => {

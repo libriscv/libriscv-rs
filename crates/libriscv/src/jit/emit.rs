@@ -50,7 +50,7 @@ use libriscv_jit_rt::{CodeMemory, JitState};
 
 use super::classify::{AluI, AluR, Cond, JOp, Unary};
 use super::region::{Analysis, Insn, RegionId, block_icount};
-use super::{EXIT_FAULT, EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED};
+use super::{EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
 
 /// Functions are placed at this alignment in the code image.
@@ -616,8 +616,9 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     }
 
     /// Bounds-check `addr` against `[base, base + len)` and return the host
-    /// address. A failed check is a protection fault, like `Memory`.
-    fn guest_addr(&mut self, addr: Value, write: bool) -> Value {
+    /// address. Like `Memory`'s fast path, anything else goes to the page
+    /// table: the interpreter takes over at the instruction at `pc`.
+    fn guest_addr(&mut self, addr: Value, write: bool, pc: u64) -> Value {
         let (base, len) = if write {
             (self.write_base, self.write_len)
         } else {
@@ -626,11 +627,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let off = self.b.ins().isub(addr, base);
         let ok = self.b.ins().icmp(IntCC::UnsignedLessThan, off, len);
         let cont = self.b.create_block();
-        let kind = self.b.ins().iconst(I64, EXIT_FAULT as i64);
+        let kind = self.b.ins().iconst(I64, EXIT_SLOW as i64);
+        let pc = self.b.ins().iconst(I64, pc as i64);
         let c = self.count();
         self.b
             .ins()
-            .brif(ok, cont, &[], self.exit, &args(&[kind, addr, c]));
+            .brif(ok, cont, &[], self.exit, &args(&[kind, pc, c]));
         self.b.switch_to_block(cont);
         self.b.ins().iadd(self.arena, addr)
     }
@@ -672,7 +674,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             } => {
                 let base = self.reg(rs1);
                 let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, false);
+                let host = self.guest_addr(addr, false, ins.pc);
                 if let Some(rd) = rd {
                     let v = self.load(width, signed, host);
                     self.set_reg(rd, v);
@@ -687,7 +689,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 let base = self.reg(rs1);
                 let value = self.reg(rs2);
                 let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, true);
+                let host = self.guest_addr(addr, true, ins.pc);
                 self.store(width, value, host);
             }
             JOp::Branch {

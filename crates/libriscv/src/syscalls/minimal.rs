@@ -48,9 +48,11 @@ fn syscall_write(m: &mut Machine) -> Result<()> {
     let len = m.sysarg(2);
     // Only the standard output pipes are accepted.
     if vfd == 1 || vfd == 2 {
+        // Zero-copy, in at most 16 buffers (C++ gather_buffers_from_range).
         let machine: &Machine = m;
-        let data = machine.memory.memview(address, len)?;
-        machine.print(data);
+        for data in machine.memory.gather_buffers(address, len, 16)? {
+            machine.print(data);
+        }
         m.set_result(len);
         return Ok(());
     }

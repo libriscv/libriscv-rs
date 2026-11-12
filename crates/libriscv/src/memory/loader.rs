@@ -1,12 +1,15 @@
 //! Port of the ELF loading parts of `memory.cpp` (`binary_loader`,
 //! `binary_load_ph`, `serialize_execute_segment`) and `memory_elf.cpp`
-//! (`elf_base_address`, relocations), for the flat arena without paging.
+//! (`elf_base_address`, relocations), with virtual paging: segments are
+//! copied in through the page table (so they can be anywhere) and get the
+//! page attributes of their program header.
 //!
 //! Not ported: shared read-only images (`prepare_shared_rodata`,
 //! `publish_shared_rodata`) and `default_exit_function`.
 
 use std::sync::Arc;
 
+use super::page::{PageAttributes, PageData};
 use super::{BRK_MAX, DYLINK_BASE, Memory, PAGE_SIZE, RWREAD_BEGIN, SIGRETURN_OFFSET};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
 use crate::elf::{self, ProgramHeader};
@@ -15,17 +18,6 @@ use crate::options::MachineOptions;
 
 const ELFHDR_FLAGS_RVC: u32 = 0x1;
 const ELFHDR_FLAGS_RVE: u32 = 0x8;
-
-/// The exit function placed in its own execute segment when the program
-/// doesn't provide one: STOP, then a jump back to it, followed by the signal
-/// return trampoline at `SIGRETURN_OFFSET`.
-const EXIT_CODE: [u8; 20] = [
-    0x73, 0x00, 0xf0, 0x7f, // STOP: 0x7ff00073
-    0x6f, 0xf0, 0xdf, 0xff, // JMP -4: 0xffdff06f
-    0x93, 0x08, 0xb0, 0x08, // LI a7, 139 (rt_sigreturn)
-    0x73, 0x00, 0x00, 0x00, // ECALL
-    0x6f, 0xf0, 0xdf, 0xff, // JMP -4: 0xffdff06f
-];
 
 const fn invalid(message: &'static str) -> MachineError {
     MachineError::invalid_program(message, 0)
@@ -151,7 +143,7 @@ impl Memory {
         self.stack_address = self.mmap_allocate(stack_size).wrapping_add(stack_size);
 
         // The arena boundaries are final once every PT_LOAD is in place.
-        if self.arena_size >= self.initial_rodata_end {
+        if self.uses_flat_memory_arena() && self.arena_size >= self.initial_rodata_end {
             self.read_boundary = self
                 .arena_size
                 .min(self.arena_size.wrapping_sub(RWREAD_BEGIN));
@@ -164,21 +156,18 @@ impl Memory {
             self.write_boundary = 0;
         }
 
-        // Install our own exit function as a separate execute segment.
+        // Install the host code page with the exit function, enabling VM
+        // calls and signal returns. It's executable only, and becomes an
+        // execute segment the first time something jumps there.
         if self.exit_address == 0 {
             let host_page = self.mmap_allocate(PAGE_SIZE);
             self.exit_address = host_page;
             self.sigreturn_address = host_page.wrapping_add(SIGRETURN_OFFSET);
-            if host_page.wrapping_add(EXIT_CODE.len() as u64) <= self.arena_size {
-                // Fits, as checked above.
-                if let Some(dst) = usize::try_from(host_page)
-                    .ok()
-                    .and_then(|a| self.arena.get_mut(a..a + EXIT_CODE.len()))
-                {
-                    dst.copy_from_slice(&EXIT_CODE);
-                }
-            }
-            self.create_execute_segment(&EXIT_CODE, host_page, false)?;
+            self.install_shared_page(
+                host_page / PAGE_SIZE,
+                PageData::Host,
+                PageAttributes::rwx(false, false, true),
+            )?;
         }
 
         // Now that the program's boundaries are known, generate the execute
@@ -201,7 +190,7 @@ impl Memory {
         Ok(first_segment)
     }
 
-    /// Port of `Memory::binary_load_ph` (flat arena, no paging).
+    /// Port of `Memory::binary_load_ph` with virtual paging.
     fn binary_load_ph(
         &mut self,
         options: &MachineOptions,
@@ -254,28 +243,25 @@ impl Memory {
             return Err(invalid("Execute segment must be execute-only"));
         }
 
-        // Write directly to the arena (the rodata boundary is set afterwards).
-        if vaddr + len > self.arena_size {
-            return Err(invalid("ELF segment exceeds arena size"));
-        }
+        // Load into virtual memory (the rodata boundary is set afterwards).
+        let binary = Arc::clone(&self.binary);
         let src = usize::try_from(ph.p_offset)
             .ok()
-            .and_then(|o| {
-                self.binary
-                    .get(o..o.checked_add(usize::try_from(len).ok()?)?)
-            })
+            .and_then(|o| binary.get(o..o.checked_add(usize::try_from(len).ok()?)?))
             .ok_or(invalid("Not enough room for ELF program segment"))?;
-        let dst = usize::try_from(vaddr)
-            .ok()
-            .and_then(|a| self.arena.get_mut(a..a + src.len()))
-            .ok_or(invalid("ELF segment exceeds arena size"))?;
-        dst.copy_from_slice(src);
+        self.memcpy(vaddr, src)?;
 
-        // Track the read-only boundary.
-        if read && !write {
+        // Track the read-only boundary (after the copy, so that the arena
+        // writes succeed).
+        if read && !write && self.uses_flat_memory_arena() {
             self.initial_rodata_end = self.initial_rodata_end.max(vaddr + len);
         }
-        // set_page_attr() is a no-op without paging.
+        if options.protect_segments {
+            self.set_page_attr(vaddr, len, PageAttributes::rwx(read, write, exec))?;
+        } else {
+            // This might help execute simplistic barebones programs.
+            self.set_page_attr(vaddr, len, PageAttributes::rwx(true, true, true))?;
+        }
         Ok(())
     }
 

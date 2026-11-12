@@ -1,0 +1,1230 @@
+//! Port of the virtual paging parts of `memory.hpp`, `memory.cpp`,
+//! `memory_rw.cpp`, `memory_inline.hpp` and `memory_helpers_paging.hpp` /
+//! `memory_inline_pages.hpp` (`RISCV_VIRTUAL_PAGING` together with
+//! `RISCV_FLAT_RW_ARENA`, the configuration of the reference emulator).
+//!
+//! Guest memory is the flat arena *plus* a page table:
+//!
+//! * Guest loads and stores try the arena first, with the two range checks
+//!   of `memory_inline.hpp` and nothing else, so page attributes don't apply
+//!   there (as in C++). Everything else takes the slow path through the page
+//!   table: page 0 (the guard page), stores below `initial_rodata_end`
+//!   (read-only program segments) and anything outside the arena.
+//! * Host-side accessors (`memcpy`, `memcpy_out`, `memstring`, the gather
+//!   functions used by system calls) always go through the page table, so
+//!   they respect page attributes inside the arena too, like C++.
+//! * Pages inside the arena keep their bytes in the arena. C++ inserts an
+//!   arena page into its page table the first time a slow path touches it.
+//!   Here only arena pages with other than default attributes get a page
+//!   table entry; a bitmap records which arena pages C++ would have, so
+//!   that `pages_active` (and with it `getrusage`'s `ru_maxrss` and the
+//!   choices `memdiscard` makes) matches C++ exactly.
+//! * A missing page outside the arena reads as the shared zero page and is
+//!   created by the first write (the default page fault handler), up to
+//!   half the memory limit in owned pages when there is an arena (C++
+//!   `anywhere_pages`), the whole memory limit otherwise.
+//!
+//! Not ported: the read/write page caches (a performance detail; the
+//! page table is consulted directly), memory traps (`RISCV_MEMORY_TRAPS`)
+//! and custom page fault handlers (Phase 3).
+
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::page::{HOST_PAGE, Page, PageAttributes, PageBytes, PageData, ZERO_PAGE};
+use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault};
+use crate::error::{ExceptionKind, MachineError, Result};
+
+const PAGE: usize = PAGE_SIZE as usize;
+const PAGE_MASK: u64 = PAGE_SIZE - 1;
+
+/// C++ `PAGE_TABLE_OVERCOMMIT`: the page table holds at most this many
+/// entries per page of the memory limit, which bounds attribute-only pages
+/// (from `mmap` and `mprotect`).
+pub(super) const PAGE_TABLE_OVERCOMMIT: usize = 64;
+
+/// The arena pages C++ has in its page table (one bit per arena page).
+/// Updated through `&self` too, as C++'s read fault handler creates them.
+#[derive(Debug, Default)]
+struct ArenaSet {
+    bits: Vec<Cell<u64>>,
+    count: Cell<usize>,
+}
+
+impl ArenaSet {
+    fn new(pages: u64) -> Self {
+        let words = usize::try_from(pages.div_ceil(64)).unwrap_or(0);
+        Self {
+            bits: vec![Cell::new(0); words],
+            count: Cell::new(0),
+        }
+    }
+
+    fn word(&self, pageno: u64) -> Option<(&Cell<u64>, u64)> {
+        let w = self.bits.get(usize::try_from(pageno / 64).ok()?)?;
+        Some((w, 1 << (pageno % 64)))
+    }
+
+    fn contains(&self, pageno: u64) -> bool {
+        self.word(pageno).is_some_and(|(w, bit)| w.get() & bit != 0)
+    }
+
+    fn insert(&self, pageno: u64) {
+        if let Some((w, bit)) = self.word(pageno)
+            && w.get() & bit == 0
+        {
+            w.set(w.get() | bit);
+            self.count.set(self.count.get() + 1);
+        }
+    }
+
+    fn remove(&self, pageno: u64) {
+        if let Some((w, bit)) = self.word(pageno)
+            && w.get() & bit != 0
+        {
+            w.set(w.get() & !bit);
+            self.count.set(self.count.get() - 1);
+        }
+    }
+
+    /// Insert (or remove) pages `[first, end)`, a word at a time. Returns
+    /// whether any page was missing.
+    fn set_range(&self, first: u64, end: u64, present: bool) -> bool {
+        let mut any = false;
+        let mut p = first;
+        while p < end {
+            let n = (64 - p % 64).min(end - p);
+            let mask = if n == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << n) - 1) << (p % 64)
+            };
+            if let Some(w) = usize::try_from(p / 64).ok().and_then(|i| self.bits.get(i)) {
+                let old = w.get();
+                let changed = if present { mask & !old } else { mask & old };
+                any |= present && changed != 0;
+                w.set(if present { old | mask } else { old & !mask });
+                let c = changed.count_ones() as usize;
+                self.count.set(if present {
+                    self.count.get() + c
+                } else {
+                    self.count.get() - c
+                });
+            }
+            p += n;
+        }
+        any
+    }
+
+    /// True if any page of `[first, end)` is missing.
+    fn any_missing(&self, first: u64, end: u64) -> bool {
+        let mut p = first;
+        while p < end {
+            let n = (64 - p % 64).min(end - p);
+            let mask = if n == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << n) - 1) << (p % 64)
+            };
+            let word = usize::try_from(p / 64)
+                .ok()
+                .and_then(|i| self.bits.get(i))
+                .map_or(0, Cell::get);
+            if mask & !word != 0 {
+                return true;
+            }
+            p += n;
+        }
+        false
+    }
+}
+
+/// The page table and the limits of the default page fault handler.
+#[derive(Debug)]
+pub(super) struct PageTable {
+    pages: BTreeMap<u64, Page>,
+    /// Arena pages in C++'s page table, a superset of the arena pages in
+    /// `pages`.
+    arena: ArenaSet,
+    arena_pages: u64,
+    /// Entries of `pages` that are arena pages.
+    arena_entries: usize,
+    /// Pages with their own data (C++ `owned_pages_active`).
+    owned: usize,
+    /// Maximum number of page table entries (C++ `m_pages_max`).
+    pages_max: usize,
+    /// Owned pages the page fault handler may create.
+    fault_limit: usize,
+    /// Exception data of its out-of-memory error.
+    fault_oom_data: u64,
+}
+
+impl PageTable {
+    pub(super) fn new(
+        arena_pages: u64,
+        pages_max: usize,
+        fault_limit: usize,
+        fault_oom_data: u64,
+    ) -> Self {
+        Self {
+            pages: BTreeMap::new(),
+            arena: ArenaSet::new(arena_pages),
+            arena_pages,
+            arena_entries: 0,
+            owned: 0,
+            pages_max,
+            fault_limit,
+            fault_oom_data,
+        }
+    }
+
+    fn insert(&mut self, pageno: u64, page: Page) {
+        if page.is_owned() {
+            self.owned += 1;
+        }
+        match self.pages.insert(pageno, page) {
+            Some(old) => {
+                if old.is_owned() {
+                    self.owned -= 1;
+                }
+            }
+            None if pageno < self.arena_pages => {
+                self.arena_entries += 1;
+                self.arena.insert(pageno);
+            }
+            None => {}
+        }
+    }
+
+    /// Erase a page (C++ `m_pages.erase`), also a default arena page.
+    fn remove(&mut self, pageno: u64) -> bool {
+        let was_arena = pageno < self.arena_pages && self.arena.contains(pageno);
+        self.arena.remove(pageno);
+        match self.pages.remove(&pageno) {
+            Some(old) => {
+                if old.is_owned() {
+                    self.owned -= 1;
+                }
+                if pageno < self.arena_pages {
+                    self.arena_entries -= 1;
+                }
+                true
+            }
+            None => was_arena,
+        }
+    }
+
+    /// Number of pages in C++'s page table.
+    fn active(&self) -> usize {
+        self.pages.len() - self.arena_entries + self.arena.count.get()
+    }
+
+    /// C++ `default_page_write` (`Page::make_writable`): give a
+    /// copy-on-write page its own data and make it writable. Arena pages
+    /// keep their data in the arena.
+    fn make_writable(&mut self, pageno: u64) {
+        let Some(page) = self.pages.get_mut(&pageno) else {
+            return;
+        };
+        let copy = match page.data {
+            PageData::Zero => Some(Box::new(ZERO_PAGE)),
+            PageData::Host => Some(Box::new(HOST_PAGE)),
+            PageData::Arena | PageData::Owned(_) => None,
+        };
+        if let Some(copy) = copy {
+            page.data = PageData::Owned(copy);
+            self.owned += 1;
+        }
+        page.attr.write = true;
+        page.attr.is_cow = false;
+    }
+}
+
+/// Attributes of a page that isn't in the page table and is outside the
+/// arena: the copy-on-write zero page (C++ `Page::cow_page()`).
+const COW_ATTR: PageAttributes = PageAttributes {
+    read: true,
+    write: false,
+    is_cow: true,
+    ..PageAttributes::NONE
+};
+
+/// One piece of a gathered range, before it becomes a slice.
+#[derive(Debug, Clone, Copy)]
+enum Piece {
+    /// `len` bytes of the arena at `start`.
+    Arena { start: usize, len: usize },
+    /// Bytes `off..off + len` of page `pageno`.
+    Page { pageno: u64, off: usize, len: usize },
+}
+
+impl Piece {
+    /// Extend an arena piece by an adjacent arena range, like C++ merges
+    /// buffers that continue each other.
+    const fn extend(&mut self, start: usize, len: usize) -> bool {
+        if let Self::Arena { start: s, len: l } = self
+            && *s + *l == start
+        {
+            *l += len;
+            return true;
+        }
+        false
+    }
+}
+
+/// Split `[addr, addr + len)` into per-page chunks: `(pageno, offset, size)`.
+fn page_chunks(addr: u64, len: u64) -> impl Iterator<Item = (u64, usize, usize)> {
+    let mut addr = addr;
+    let mut len = len;
+    std::iter::from_fn(move || {
+        if len == 0 {
+            return None;
+        }
+        let off = addr & PAGE_MASK;
+        let size = (PAGE_SIZE - off).min(len);
+        let chunk = (addr / PAGE_SIZE, off as usize, size as usize);
+        addr = addr.wrapping_add(size);
+        len -= size;
+        Some(chunk)
+    })
+}
+
+impl Memory {
+    /// C++ `Memory::page_number`.
+    pub const fn page_number(address: u64) -> u64 {
+        address / PAGE_SIZE
+    }
+
+    /// The arena's bytes of page `pageno`, if it is an arena page.
+    fn arena_page(&self, pageno: u64) -> Option<&PageBytes> {
+        if pageno >= self.arena_pages {
+            return None;
+        }
+        let start = usize::try_from(pageno).ok()?.checked_mul(PAGE)?;
+        self.arena.get(start..)?.first_chunk::<PAGE>()
+    }
+
+    fn arena_page_mut(&mut self, pageno: u64) -> Option<&mut PageBytes> {
+        if pageno >= self.arena_pages {
+            return None;
+        }
+        let start = usize::try_from(pageno).ok()?.checked_mul(PAGE)?;
+        self.arena.get_mut(start..)?.first_chunk_mut::<PAGE>()
+    }
+
+    /// True if page `pageno`'s bytes live in the arena.
+    fn is_arena_backed(&self, pageno: u64) -> bool {
+        match self.paging.pages.get(&pageno) {
+            Some(p) => matches!(p.data, PageData::Arena),
+            None => pageno < self.arena_pages,
+        }
+    }
+
+    fn page_bytes<'a>(&'a self, pageno: u64, data: &'a PageData) -> &'a PageBytes {
+        match data {
+            // Arena pages are always below `arena_pages`.
+            PageData::Arena => self.arena_page(pageno).unwrap_or(&ZERO_PAGE),
+            PageData::Owned(b) => b,
+            PageData::Zero => &ZERO_PAGE,
+            PageData::Host => &HOST_PAGE,
+        }
+    }
+
+    /// The default page fault handler's limit: C++ creates pages while the
+    /// owned pages are below it and throws `OUT_OF_MEMORY` otherwise.
+    fn page_fault_check(&self) -> Result<()> {
+        if self.paging.owned < self.paging.fault_limit {
+            Ok(())
+        } else {
+            Err(MachineError::new(
+                ExceptionKind::OutOfMemory,
+                "Out of memory",
+                self.paging.fault_oom_data,
+            ))
+        }
+    }
+
+    /// A default arena page comes into existence (C++: the page fault
+    /// handler creates it, so its limit applies).
+    fn materialize_arena_page(&self, pageno: u64) -> Result<()> {
+        if !self.paging.arena.contains(pageno) {
+            self.page_fault_check()?;
+            self.paging.arena.insert(pageno);
+        }
+        Ok(())
+    }
+
+    /// Port of `Memory::get_pageno` with the default read fault handler: a
+    /// missing page is a default arena page inside the arena, and the
+    /// copy-on-write zero page elsewhere.
+    pub(crate) fn get_pageno(&self, pageno: u64) -> Result<(PageAttributes, &PageBytes)> {
+        if let Some(page) = self.paging.pages.get(&pageno) {
+            return Ok((page.attr, self.page_bytes(pageno, &page.data)));
+        }
+        if let Some(data) = self.arena_page(pageno) {
+            self.materialize_arena_page(pageno)?;
+            return Ok((PageAttributes::default(), data));
+        }
+        Ok((COW_ATTR, &ZERO_PAGE))
+    }
+
+    /// Port of `Memory::get_readable_pageno`.
+    fn get_readable_pageno(&self, pageno: u64) -> Result<&PageBytes> {
+        match self.get_pageno(pageno)? {
+            (attr, data) if attr.read => Ok(data),
+            _ => Err(protection_fault(pageno.wrapping_mul(PAGE_SIZE))),
+        }
+    }
+
+    /// Port of `Memory::get_exec_pageno`: the page must exist already.
+    pub(crate) fn get_exec_pageno(&self, pageno: u64) -> Result<(PageAttributes, &PageBytes)> {
+        if let Some(page) = self.paging.pages.get(&pageno) {
+            return Ok((page.attr, self.page_bytes(pageno, &page.data)));
+        }
+        match self.arena_page(pageno) {
+            Some(data) if self.paging.arena.contains(pageno) => {
+                Ok((PageAttributes::default(), data))
+            }
+            _ => Err(MachineError::trigger(
+                ExceptionKind::ExecutionSpaceProtectionFault,
+                pageno.wrapping_mul(PAGE_SIZE),
+            )),
+        }
+    }
+
+    /// Port of `Memory::create_writable_pageno`: make page `pageno`
+    /// writable, resolving copy-on-write and creating it if missing.
+    fn create_writable_pageno(&mut self, pageno: u64) -> Result<()> {
+        match self.paging.pages.get(&pageno) {
+            Some(page) if page.attr.write => Ok(()),
+            Some(page) if page.attr.is_cow => {
+                self.paging.make_writable(pageno);
+                Ok(())
+            }
+            Some(_) => Err(protection_fault(pageno.wrapping_mul(PAGE_SIZE))),
+            None if pageno < self.arena_pages => self.materialize_arena_page(pageno),
+            None => {
+                self.page_fault_check()?;
+                {
+                    // Create the page on demand.
+                    self.paging.insert(
+                        pageno,
+                        Page {
+                            attr: PageAttributes::default(),
+                            data: PageData::Owned(Box::new(ZERO_PAGE)),
+                        },
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The bytes of a page made writable by `create_writable_pageno`.
+    fn writable_bytes(&mut self, pageno: u64) -> Result<&mut PageBytes> {
+        if self.is_arena_backed(pageno) {
+            if let Some(data) = self.arena_page_mut(pageno) {
+                return Ok(data);
+            }
+        } else if let Some(Page {
+            data: PageData::Owned(b),
+            ..
+        }) = self.paging.pages.get_mut(&pageno)
+        {
+            return Ok(b);
+        }
+        Err(protection_fault(pageno.wrapping_mul(PAGE_SIZE)))
+    }
+
+    /// `create_writable_pageno` and its bytes.
+    fn writable_page(&mut self, pageno: u64) -> Result<&mut PageBytes> {
+        self.create_writable_pageno(pageno)?;
+        self.writable_bytes(pageno)
+    }
+
+    /// Guest load outside the arena's read window (C++ `read<T>` with
+    /// `cached_readable_page`).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn read_slow<const N: usize>(&self, addr: u64) -> Result<[u8; N]> {
+        let pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        let data = self.get_readable_pageno(pageno)?;
+        let mut out = [0u8; N];
+        if let Some(src) = data.get(off..off + N) {
+            out.copy_from_slice(src);
+            return Ok(out);
+        }
+        // Crossing into the next page. C++ reads on from the page's data,
+        // which for an arena page is the arena (padding included).
+        if self.is_arena_backed(pageno)
+            && let Some(src) = usize::try_from(addr)
+                .ok()
+                .and_then(|a| self.arena.get(a..a.checked_add(N)?))
+        {
+            out.copy_from_slice(src);
+            return Ok(out);
+        }
+        let first = PAGE - off;
+        let next = self.get_readable_pageno(pageno.wrapping_add(1))?;
+        let (a, b) = out.split_at_mut(first);
+        a.copy_from_slice(data.get(off..).unwrap_or_default());
+        b.copy_from_slice(next.get(..N - first).unwrap_or_default());
+        Ok(out)
+    }
+
+    /// Guest store outside the arena's write window (C++ `write<T>`).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn write_slow<const N: usize>(&mut self, addr: u64, value: [u8; N]) -> Result<()> {
+        let pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        let data = self.writable_page(pageno)?;
+        if let Some(dst) = data.get_mut(off..off + N) {
+            dst.copy_from_slice(&value);
+            return Ok(());
+        }
+        if self.is_arena_backed(pageno)
+            && let Some(dst) = usize::try_from(addr)
+                .ok()
+                .and_then(|a| self.arena.get_mut(a..a.checked_add(N)?))
+        {
+            dst.copy_from_slice(&value);
+            return Ok(());
+        }
+        let first = PAGE - off;
+        self.create_writable_pageno(pageno.wrapping_add(1))?;
+        let (a, b) = value.split_at(first);
+        if let Some(dst) = self.writable_bytes(pageno)?.get_mut(off..) {
+            dst.copy_from_slice(a);
+        }
+        if let Some(dst) = self
+            .writable_bytes(pageno.wrapping_add(1))?
+            .get_mut(..b.len())
+        {
+            dst.copy_from_slice(b);
+        }
+        Ok(())
+    }
+
+    /// Read-modify-write outside the arena's write window (C++
+    /// `writable_read<T>`): the page must be writable.
+    #[cfg(feature = "ext-a")]
+    #[cold]
+    #[inline(never)]
+    pub(super) fn rmw_slow<const N: usize>(
+        &mut self,
+        addr: u64,
+        f: impl FnOnce([u8; N]) -> [u8; N],
+    ) -> Result<[u8; N]> {
+        let pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        self.create_writable_pageno(pageno)?;
+        let arena = self.is_arena_backed(pageno);
+        let crosses = off + N > PAGE;
+        if crosses && !arena {
+            self.create_writable_pageno(pageno.wrapping_add(1))?;
+        }
+        // Read the bytes the way `write_slow` writes them: from the arena
+        // for arena pages (also past the page end), else page by page.
+        let mut old = [0u8; N];
+        if arena {
+            if let Some(src) = usize::try_from(addr)
+                .ok()
+                .and_then(|a| self.arena.get(a..a.checked_add(N)?))
+            {
+                old.copy_from_slice(src);
+            }
+        } else {
+            let first = N.min(PAGE - off);
+            let (a, b) = old.split_at_mut(first);
+            a.copy_from_slice(
+                self.get_pageno(pageno)?
+                    .1
+                    .get(off..off + first)
+                    .unwrap_or_default(),
+            );
+            if crosses {
+                let next = self.get_pageno(pageno.wrapping_add(1))?.1;
+                b.copy_from_slice(next.get(..b.len()).unwrap_or_default());
+            }
+        }
+        self.write_slow(addr, f(old))?;
+        Ok(old)
+    }
+
+    /// Port of `Memory::memcpy` with paging: copy host data into the
+    /// guest, page by page, making each page writable.
+    pub fn memcpy(&mut self, dst: u64, src: &[u8]) -> Result<()> {
+        let mut src = src;
+        for (pageno, off, size) in page_chunks(dst, src.len() as u64) {
+            let (head, tail) = src.split_at(size.min(src.len()));
+            if let Some(d) = self.writable_page(pageno)?.get_mut(off..off + size) {
+                d.copy_from_slice(head);
+            }
+            src = tail;
+        }
+        Ok(())
+    }
+
+    /// Port of `Memory::memset` with paging.
+    pub fn memset(&mut self, dst: u64, value: u8, len: u64) -> Result<()> {
+        for (pageno, off, size) in page_chunks(dst, len) {
+            if let Some(d) = self.writable_page(pageno)?.get_mut(off..off + size) {
+                d.fill(value);
+            }
+        }
+        Ok(())
+    }
+
+    /// Port of `Memory::memcpy_out` with paging: copy guest memory out.
+    /// Faults at the first unreadable address.
+    pub fn memcpy_out(&self, dst: &mut [u8], src: u64) -> Result<()> {
+        let mut dst = dst;
+        let mut addr = src;
+        for (pageno, off, size) in page_chunks(src, dst.len() as u64) {
+            let (attr, data) = self.get_pageno(pageno)?;
+            if !attr.read {
+                return Err(protection_fault(addr));
+            }
+            let (head, tail) = std::mem::take(&mut dst).split_at_mut(size);
+            head.copy_from_slice(data.get(off..off + size).unwrap_or_default());
+            dst = tail;
+            addr = addr.wrapping_add(size as u64);
+        }
+        Ok(())
+    }
+
+    /// Zero-copy view of readable `[addr, addr + len)` (C++ `memview`): the
+    /// arena's read window, or a single gathered buffer (an
+    /// `OUT_OF_MEMORY` error when the range isn't contiguous on the host).
+    pub fn memview(&self, addr: u64, len: u64) -> Result<&[u8]> {
+        if len == 0 {
+            return Ok(&[]);
+        }
+        let offset = addr.wrapping_sub(RWREAD_BEGIN);
+        let window = self.read_boundary;
+        if offset < window && len <= window - offset {
+            let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
+            let n = usize::try_from(len).map_err(|_| protection_fault(addr))?;
+            return self
+                .arena
+                .get(a..a.saturating_add(n))
+                .ok_or(protection_fault(addr));
+        }
+        let mut bufs = self.gather_buffers(addr, len, 1)?;
+        Ok(bufs.pop().unwrap_or_default())
+    }
+
+    /// Writable zero-copy view of `[addr, addr + len)` (C++
+    /// `writable_memview`): the arena's write window, or a single gathered
+    /// buffer.
+    pub fn memview_mut(&mut self, addr: u64, len: u64) -> Result<&mut [u8]> {
+        if len == 0 {
+            return Ok(&mut []);
+        }
+        let offset = addr.wrapping_sub(self.initial_rodata_end);
+        let window = self.write_boundary;
+        if offset < window && len <= window - offset {
+            let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
+            let n = usize::try_from(len).map_err(|_| protection_fault(addr))?;
+            return self
+                .arena
+                .get_mut(a..a.saturating_add(n))
+                .ok_or(protection_fault(addr));
+        }
+        let mut bufs = self.gather_writable_buffers(addr, len, 1)?;
+        Ok(bufs.pop().unwrap_or_default())
+    }
+
+    /// Port of `Memory::gather_buffers_from_range`: zero-copy views of
+    /// readable `[addr, addr + len)`, at most `cnt` of them. Adjacent arena
+    /// pages share a buffer. Faults at the first unreadable page; more
+    /// buffers than `cnt` is an `OUT_OF_MEMORY` error (data: the bytes
+    /// left).
+    pub fn gather_buffers(&self, addr: u64, len: u64, cnt: usize) -> Result<Vec<&[u8]>> {
+        let mut pieces: Vec<Piece> = Vec::new();
+        let mut left = len;
+        for (pageno, off, size) in page_chunks(addr, len) {
+            self.get_readable_pageno(pageno)?;
+            if !self.push_piece(&mut pieces, pageno, off, size, cnt) {
+                break;
+            }
+            left -= size as u64;
+        }
+        if left != 0 {
+            return Err(MachineError::trigger(ExceptionKind::OutOfMemory, left));
+        }
+        Ok(pieces
+            .iter()
+            .map(|p| match *p {
+                Piece::Arena { start, len } => {
+                    self.arena.get(start..start + len).unwrap_or_default()
+                }
+                Piece::Page { pageno, off, len } => self
+                    .get_pageno(pageno)
+                    .ok()
+                    .and_then(|(_, d)| d.get(off..off + len))
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// Port of `Memory::gather_writable_buffers_from_range`: like
+    /// [`gather_buffers`](Self::gather_buffers), but every page is made
+    /// writable first (faulting on read-only pages). More buffers than
+    /// `cnt` is an `OUT_OF_MEMORY` error (data: the buffers filled).
+    pub fn gather_writable_buffers(
+        &mut self,
+        addr: u64,
+        len: u64,
+        cnt: usize,
+    ) -> Result<Vec<&mut [u8]>> {
+        let mut pieces: Vec<Piece> = Vec::new();
+        let mut left = len;
+        for (pageno, off, size) in page_chunks(addr, len) {
+            self.create_writable_pageno(pageno)?;
+            if !self.push_piece(&mut pieces, pageno, off, size, cnt) {
+                break;
+            }
+            left -= size as u64;
+        }
+        if left != 0 {
+            return Err(MachineError::trigger(
+                ExceptionKind::OutOfMemory,
+                pieces.len() as u64,
+            ));
+        }
+        // Hand out disjoint mutable slices: the arena pieces in address
+        // order, and the pages' own data.
+        let mut slots: Vec<Option<&mut [u8]>> = Vec::new();
+        slots.resize_with(pieces.len(), || None);
+        let mut arena_pieces: Vec<(usize, usize, usize)> = Vec::new();
+        let mut page_pieces: BTreeMap<u64, (usize, usize, usize)> = BTreeMap::new();
+        for (i, p) in pieces.iter().enumerate() {
+            match *p {
+                Piece::Arena { start, len } => arena_pieces.push((start, len, i)),
+                Piece::Page { pageno, off, len } => {
+                    page_pieces.insert(pageno, (off, len, i));
+                }
+            }
+        }
+        arena_pieces.sort_unstable();
+        let mut rest: &mut [u8] = &mut self.arena;
+        let mut consumed = 0;
+        for (start, len, i) in arena_pieces {
+            let (_, tail) = std::mem::take(&mut rest)
+                .split_at_mut_checked(start - consumed)
+                .ok_or(protection_fault(addr))?;
+            let (piece, tail) = tail
+                .split_at_mut_checked(len)
+                .ok_or(protection_fault(addr))?;
+            if let Some(slot) = slots.get_mut(i) {
+                *slot = Some(piece);
+            }
+            rest = tail;
+            consumed = start + len;
+        }
+        if !page_pieces.is_empty() {
+            let wanted: BTreeSet<u64> = page_pieces.keys().copied().collect();
+            for (pageno, page) in self.paging.pages.iter_mut() {
+                if !wanted.contains(pageno) {
+                    continue;
+                }
+                let (Some(&(off, len, i)), PageData::Owned(data)) =
+                    (page_pieces.get(pageno), &mut page.data)
+                else {
+                    continue;
+                };
+                if let (Some(slot), Some(d)) = (slots.get_mut(i), data.get_mut(off..off + len)) {
+                    *slot = Some(d);
+                }
+            }
+        }
+        slots
+            .into_iter()
+            .map(|s| s.ok_or(protection_fault(addr)))
+            .collect()
+    }
+
+    /// Add a chunk of page `pageno` to `pieces`, merging adjacent arena
+    /// pieces. Returns false if that would need more than `cnt` pieces.
+    fn push_piece(
+        &self,
+        pieces: &mut Vec<Piece>,
+        pageno: u64,
+        off: usize,
+        size: usize,
+        cnt: usize,
+    ) -> bool {
+        let piece = if self.is_arena_backed(pageno) {
+            let start = (pageno as usize) * PAGE + off;
+            if pieces.last_mut().is_some_and(|l| l.extend(start, size)) {
+                return true;
+            }
+            Piece::Arena { start, len: size }
+        } else {
+            Piece::Page {
+                pageno,
+                off,
+                len: size,
+            }
+        };
+        if pieces.len() == cnt {
+            return false;
+        }
+        pieces.push(piece);
+        true
+    }
+
+    /// Port of `Memory::memstring` with paging: the NUL-terminated string
+    /// at `addr`, at most `max_len` bytes (C++ default 16384), read page by
+    /// page with read permission checks.
+    pub fn memstring_bytes(&self, addr: u64, max_len: usize) -> Result<Vec<u8>> {
+        let mut pageno = addr / PAGE_SIZE;
+        let off = (addr & PAGE_MASK) as usize;
+        let data = self.get_readable_pageno(pageno)?;
+        let end = PAGE.min(off.saturating_add(max_len));
+        let chunk = data.get(off..end).unwrap_or_default();
+        let mut result = Vec::new();
+        if let Some(n) = chunk.iter().position(|&b| b == 0) {
+            result.extend_from_slice(chunk.get(..n).unwrap_or_default());
+            return Ok(result);
+        }
+        result.extend_from_slice(chunk);
+        // Cross the page boundary.
+        while result.len() < max_len {
+            let max_bytes = PAGE.min(max_len - result.len());
+            pageno = pageno.wrapping_add(1);
+            let data = self.get_readable_pageno(pageno)?;
+            let chunk = data.get(..max_bytes).unwrap_or_default();
+            if let Some(n) = chunk.iter().position(|&b| b == 0) {
+                result.extend_from_slice(chunk.get(..n).unwrap_or_default());
+                return Ok(result);
+            }
+            result.extend_from_slice(chunk);
+        }
+        Ok(result)
+    }
+
+    /// Port of `Memory::memcmp(const void*, address_t, size_t)`: true if
+    /// guest memory at `addr` equals `data`. Faults if it isn't readable.
+    pub fn memcmp(&self, data: &[u8], addr: u64) -> Result<bool> {
+        let len = data.len() as u64;
+        let end = addr.wrapping_add(len);
+        if end < addr {
+            return Err(protection_fault(addr));
+        }
+        if end.wrapping_sub(RWREAD_BEGIN) < self.read_boundary {
+            let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
+            return Ok(self.arena.get(a..a + data.len()) == Some(data));
+        }
+        let mut data = data;
+        for (pageno, off, size) in page_chunks(addr, len) {
+            let page = self.get_readable_pageno(pageno)?;
+            let (head, tail) = data.split_at(size);
+            if page.get(off..off + size) != Some(head) {
+                return Ok(false);
+            }
+            data = tail;
+        }
+        Ok(true)
+    }
+
+    /// Port of `Memory::set_pageno_attr`.
+    fn set_pageno_attr(&mut self, pageno: u64, attr: PageAttributes) -> Result<()> {
+        if let Some(page) = self.paging.pages.get_mut(&pageno) {
+            // Keep the copy-on-write state.
+            let is_cow = page.attr.is_cow;
+            page.attr = attr;
+            // A writable page showing the zero page is copy-on-write.
+            if is_cow || (attr.write && page.is_zero_page()) {
+                page.attr.is_cow = true;
+                page.attr.write = false;
+            }
+            return Ok(());
+        }
+        // An arena page (C++ creates it through the page fault handler).
+        if pageno < self.arena_pages {
+            self.materialize_arena_page(pageno)?;
+            if attr != PageAttributes::default() {
+                self.paging.insert(
+                    pageno,
+                    Page {
+                        attr,
+                        data: PageData::Arena,
+                    },
+                );
+            }
+            return Ok(());
+        }
+        // Don't create pages if the defaults apply.
+        if attr.is_default() {
+            return Ok(());
+        }
+        // These pages don't come from the page fault handler, so bound them
+        // here: otherwise mmap() or mprotect() of a huge range would
+        // exhaust host memory.
+        if self.paging.pages.len() >= self.paging.pages_max {
+            return Err(MachineError::new(
+                ExceptionKind::OutOfMemory,
+                "Out of memory (page attributes)",
+                self.paging.pages_max as u64,
+            ));
+        }
+        // Writable: a copy-on-write zero page. Read-only or inaccessible:
+        // the zero page, which can become copy-on-write later.
+        let attr = PageAttributes {
+            is_cow: attr.write,
+            write: false,
+            ..attr
+        };
+        self.paging.insert(
+            pageno,
+            Page {
+                attr,
+                data: PageData::Zero,
+            },
+        );
+        Ok(())
+    }
+
+    /// Port of `Memory::set_page_attr`: set the protections of every page
+    /// overlapping `[dst, dst + len)`. Can fail with `OUT_OF_MEMORY` when a
+    /// huge range would create too many pages.
+    pub fn set_page_attr(&mut self, dst: u64, len: u64, attr: PageAttributes) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        // A range that wraps around is two ranges.
+        let last = dst.wrapping_add(len - 1);
+        if last < dst {
+            let head = 0u64.wrapping_sub(dst);
+            self.set_page_attr(dst, head, attr)?;
+            return self.set_page_attr(0, len - head, attr);
+        }
+        let first = dst / PAGE_SIZE;
+        let end = last / PAGE_SIZE + 1;
+        if attr.is_default() {
+            // Only existing pages change, besides the arena pages, which C++
+            // creates. (C++ takes this path for ranges larger than the page
+            // table, with the same result.)
+            let existing: Vec<u64> = self
+                .paging
+                .pages
+                .range(first..end)
+                .map(|(&p, _)| p)
+                .collect();
+            for pageno in existing {
+                self.set_pageno_attr(pageno, attr)?;
+            }
+            let arena_end = end.min(self.arena_pages);
+            if first < arena_end {
+                if self.paging.arena.any_missing(first, arena_end) {
+                    self.page_fault_check()?;
+                }
+                self.paging.arena.set_range(first, arena_end, true);
+            }
+            return Ok(());
+        }
+        for pageno in first..end {
+            self.set_pageno_attr(pageno, attr)?;
+        }
+        Ok(())
+    }
+
+    /// The attributes of the page at `addr` (C++ `get_page(addr).attr`).
+    pub fn page_attributes(&self, addr: u64) -> Result<PageAttributes> {
+        Ok(self.get_pageno(addr / PAGE_SIZE)?.0)
+    }
+
+    /// Port of `Memory::get_page_info`.
+    pub fn get_page_info(&self, addr: u64) -> String {
+        let attr = self
+            .get_pageno(addr / PAGE_SIZE)
+            .map_or(PageAttributes::NONE, |(a, _)| a);
+        format!("[0x{addr:016X}] {}", Page::describe(attr))
+    }
+
+    /// Port of `Memory::free_pages`: remove the pages overlapping
+    /// `[dst, dst + len)` from the page table. Arena pages go back to their
+    /// default attributes (their bytes stay), other pages read as zeroes
+    /// again.
+    pub fn free_pages(&mut self, dst: u64, len: u64) {
+        let first = dst / PAGE_SIZE;
+        let end = first.wrapping_add(super::page_round_up(len) / PAGE_SIZE);
+        if end <= first {
+            return;
+        }
+        let doomed: Vec<u64> = self
+            .paging
+            .pages
+            .range(first..end)
+            .map(|(&p, _)| p)
+            .collect();
+        for pageno in doomed {
+            self.paging.remove(pageno);
+        }
+        let arena_end = end.min(self.arena_pages);
+        if first < arena_end {
+            self.paging.arena.set_range(first, arena_end, false);
+        }
+    }
+
+    /// Port of `Memory::free_pageno`.
+    pub fn free_pageno(&mut self, pageno: u64) -> bool {
+        self.paging.remove(pageno)
+    }
+
+    /// Port of `Memory::discard_page`: zero `size` bytes at `off` of a page
+    /// C++ has in its page table.
+    fn discard_page(
+        &mut self,
+        pageno: u64,
+        off: usize,
+        size: usize,
+        ignore_protections: bool,
+    ) -> Result<()> {
+        let Some(page) = self.paging.pages.get(&pageno) else {
+            // A default arena page: writable.
+            if self.paging.arena.contains(pageno)
+                && let Some(d) = self
+                    .arena_page_mut(pageno)
+                    .and_then(|p| p.get_mut(off..off + size))
+            {
+                zero_lazily(d);
+            }
+            return Ok(());
+        };
+        if page.is_zero_page() {
+            return Ok(());
+        }
+        if page.attr.is_cow {
+            self.paging.make_writable(pageno);
+        }
+        let (attr, data) = match self.paging.pages.get(&pageno) {
+            Some(p) => (p.attr, &p.data),
+            None => return Ok(()),
+        };
+        if !attr.write && !ignore_protections {
+            return Err(protection_fault(
+                pageno.wrapping_mul(PAGE_SIZE).wrapping_add(off as u64),
+            ));
+        }
+        // C++ zeroes the shared host code page here (for every machine);
+        // this machine gets a private copy instead.
+        if matches!(data, PageData::Host)
+            && let Some(page) = self.paging.pages.get_mut(&pageno)
+        {
+            page.data = PageData::Owned(Box::new(HOST_PAGE));
+            self.paging.owned += 1;
+        }
+        let bytes = if self.is_arena_backed(pageno) {
+            self.arena_page_mut(pageno)
+        } else {
+            match self.paging.pages.get_mut(&pageno).map(|p| &mut p.data) {
+                Some(PageData::Owned(b)) => Some(&mut **b),
+                _ => None,
+            }
+        };
+        if let Some(d) = bytes.and_then(|b| b.get_mut(off..off + size)) {
+            zero_lazily(d);
+        }
+        Ok(())
+    }
+
+    /// Zero arena bytes `[begin, end)` (C++ `madvise(MADV_DONTNEED)`).
+    fn zero_arena(&mut self, begin: u64, end: u64) {
+        let end = end.min(self.arena_size);
+        if begin >= end {
+            return;
+        }
+        let (Ok(b), Ok(e)) = (usize::try_from(begin), usize::try_from(end)) else {
+            return;
+        };
+        if let Some(range) = self.arena.get_mut(b..e) {
+            // Chunks aligned to host pages.
+            let head = (PAGE - b % PAGE) % PAGE;
+            let (first, rest) = range.split_at_mut(head.min(range.len()));
+            first.fill(0);
+            zero_lazily(rest);
+        }
+    }
+
+    /// Port of `Memory::memdiscard` with paging (`MADV_DONTNEED`): zero
+    /// `[dst, dst + len)`. Missing pages outside the arena already read as
+    /// zeroes and stay missing; pages that can't be written fault unless
+    /// `ignore_protections`.
+    ///
+    /// C++ uses `madvise(MADV_DONTNEED)` for the arena, which drops the
+    /// pages instead of writing to them. Here host pages that are already
+    /// zero are skipped, so a guest discarding (or mapping) a huge range
+    /// doesn't make the host commit memory for it.
+    pub fn memdiscard(&mut self, dst: u64, len: u64, ignore_protections: bool) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let first = dst / PAGE_SIZE;
+        let end_page = dst.wrapping_add(len - 1) / PAGE_SIZE + 1;
+        if end_page.wrapping_sub(first) > self.pages_active() as u64 {
+            // A range larger than the page table: wipe the arena part, then
+            // visit only the pages that exist.
+            let end = dst.wrapping_add(len);
+            if dst < end.min(self.arena_size) {
+                self.zero_arena(dst, end);
+            }
+            if first < end_page {
+                let existing: Vec<u64> = self
+                    .paging
+                    .pages
+                    .range(first..end_page)
+                    .map(|(&p, _)| p)
+                    .collect();
+                for pageno in existing {
+                    let pbegin = dst.max(pageno * PAGE_SIZE);
+                    let pend = end.min((pageno + 1).saturating_mul(PAGE_SIZE));
+                    self.discard_page(
+                        pageno,
+                        (pbegin & PAGE_MASK) as usize,
+                        pend.wrapping_sub(pbegin) as usize,
+                        ignore_protections,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        let (mut dst, mut len) = (dst, len);
+        while len > 0 {
+            let off = (dst & PAGE_MASK) as usize;
+            let size = (PAGE_SIZE - off as u64).min(len);
+            let pageno = dst / PAGE_SIZE;
+            if self.paging.pages.contains_key(&pageno) || self.paging.arena.contains(pageno) {
+                self.discard_page(pageno, off, size as usize, ignore_protections)?;
+            } else if pageno < self.arena_pages {
+                if size == PAGE_SIZE {
+                    // Whole missing arena pages: madvise the rest of the
+                    // whole pages in one go.
+                    let new_dst = dst.wrapping_add(len & !PAGE_MASK).min(self.arena_size);
+                    self.zero_arena(dst, new_dst);
+                    let new_size = new_dst - dst;
+                    dst = new_dst;
+                    len -= new_size;
+                    continue;
+                }
+                self.create_writable_pageno(pageno)?;
+                if let Some(d) = self
+                    .arena_page_mut(pageno)
+                    .and_then(|p| p.get_mut(off..off + size as usize))
+                {
+                    zero_lazily(d);
+                }
+            }
+            // Otherwise a lazily created (zero) page.
+            dst = dst.wrapping_add(size);
+            len -= size;
+        }
+        Ok(())
+    }
+
+    /// Port of `Memory::install_shared_page` for the guard page and the
+    /// host code page.
+    pub(super) fn install_shared_page(
+        &mut self,
+        pageno: u64,
+        data: PageData,
+        attr: PageAttributes,
+    ) -> Result<()> {
+        if let Some(page) = self.paging.pages.get(&pageno)
+            && page.is_owned()
+        {
+            return Err(MachineError::new(
+                ExceptionKind::IllegalOperation,
+                "There was a page at the specified location already",
+                pageno,
+            ));
+        }
+        self.paging.insert(pageno, Page { attr, data });
+        Ok(())
+    }
+
+    /// Install an inaccessible guard page at page `pageno` (C++
+    /// `install_shared_page(pageno, Page::guard_page())`). Fails if an owned
+    /// page is there already.
+    pub fn install_guard_page(&mut self, pageno: u64) -> Result<()> {
+        self.install_shared_page(pageno, PageData::Zero, PageAttributes::NONE)
+    }
+
+    /// Number of pages in the page table (C++ `pages_active`), counting
+    /// the arena pages C++ would have created.
+    pub fn pages_active(&self) -> usize {
+        self.paging.active()
+    }
+
+    /// Pages with their own data (C++ `owned_pages_active`).
+    pub const fn owned_pages_active(&self) -> usize {
+        self.paging.owned
+    }
+
+    /// Upper bound on page table entries (C++ `pages_max`).
+    pub const fn pages_max(&self) -> usize {
+        self.paging.pages_max
+    }
+
+    /// The executable pages around `pageno` and their bytes (the page scan
+    /// of C++ `CPU::next_execute_segment`): `(first page, code)`, or `None`
+    /// if `pageno` isn't executable. At most `max_pages` pages.
+    pub(crate) fn executable_area(
+        &self,
+        pageno: u64,
+        max_pages: u64,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
+        if !self.get_pageno(pageno)?.0.exec {
+            return Ok(None);
+        }
+        let too_large = || {
+            MachineError::new(
+                ExceptionKind::OutOfMemory,
+                "Execute segment too large",
+                max_pages.saturating_mul(PAGE_SIZE),
+            )
+        };
+        // The earliest executable page.
+        let mut base = pageno;
+        while base > 0 && self.get_pageno(base - 1)?.0.exec {
+            base -= 1;
+            if pageno - base >= max_pages {
+                return Err(too_large());
+            }
+        }
+        // The page after the last executable one.
+        let mut end = pageno.wrapping_add(1);
+        while end != 0 && self.get_pageno(end)?.0.exec {
+            end = end.wrapping_add(1);
+            if end.wrapping_sub(base) > max_pages {
+                return Err(too_large());
+            }
+        }
+        if end <= base {
+            return Err(MachineError::invalid_program(
+                "Failed to create execute segment",
+                0,
+            ));
+        }
+        let n = usize::try_from(end - base).map_err(|_| too_large())?;
+        let mut code = Vec::with_capacity(n * PAGE);
+        for p in base..end {
+            code.extend_from_slice(self.get_pageno(p)?.1);
+        }
+        Ok(Some((base, code)))
+    }
+}
+
+/// Zero `d`, skipping 4 KiB chunks that are already zero so that untouched
+/// host pages are never committed.
+pub(super) fn zero_lazily(d: &mut [u8]) {
+    for chunk in d.chunks_mut(PAGE) {
+        if chunk.iter().any(|&b| b != 0) {
+            chunk.fill(0);
+        }
+    }
+}

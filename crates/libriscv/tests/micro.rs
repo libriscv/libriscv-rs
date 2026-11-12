@@ -1,7 +1,7 @@
 //! Port of `tests/unit/micro.cpp` (RV64 I/M cases).
 //!
-//! Not ported: "Run exactly X instructions" and "Crashing payload #4"
-//! (need the paging backend and the debugger, Phase 5); the Zba/Zbb/Zbc/Zbkb
+//! "Run exactly X instructions" steps with `step_one` instead of the C++
+//! debugger (Phase 5). Not ported: the Zba/Zbb/Zbc/Zbkb
 //! cases (Phase 2; FCLASS is in `rvfd.rs`); the RV32-only Zbkb case (RV32 is
 //! out of scope). Payloads #5 and #6 are ELF32 files, which an RV64 machine must
 //! reject; they are kept as "never panics" checks.
@@ -15,6 +15,7 @@
 
 mod payloads;
 
+use libriscv::memory::{PAGE_SIZE, PageAttributes};
 use libriscv::registers::*;
 use libriscv::{ExceptionKind, Machine, MachineOptions};
 
@@ -216,10 +217,86 @@ fn run_code_payload(code: &[u8]) -> libriscv::MachineError {
 
 #[test]
 fn crashing_payload_1() {
-    // The C++ test only requires that this doesn't crash. Without paging, a
-    // machine without a memory arena can't be created at all.
+    // The C++ test only requires that this doesn't crash.
     let _ = run_elf_payload(payloads::PAYLOAD_1_ELF64, false);
     let _ = run_elf_payload(payloads::PAYLOAD_1_ELF64, true);
+}
+
+#[test]
+fn run_exactly_x_instructions() {
+    const DST: u64 = 0x1000;
+    let program = [
+        0x29a0_0513u32, // li a0, 666
+        0x05d0_0893,    // li a7, 93
+        0xffdf_f06f,    // j -4
+    ];
+    let code: Vec<u8> = program.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut machine = empty_machine(MachineOptions::default());
+    machine.copy_to_guest(DST, &code).unwrap();
+    machine
+        .memory
+        .set_page_attr(DST, PAGE_SIZE, PageAttributes::rwx(false, false, true))
+        .unwrap();
+    machine.cpu.jump(DST).unwrap();
+
+    // Step instruction by instruction, fetching from the execute-only page.
+    for _ in 0..3 {
+        machine.step_one(true).unwrap();
+    }
+    assert_eq!(machine.cpu.reg(REG_ARG0), 666);
+    assert_eq!(machine.cpu.reg(REG_ARG7), 93);
+    assert_eq!(machine.instruction_counter(), 3);
+    machine.cpu.set_reg(REG_ARG7, 0);
+    for _ in 0..2 {
+        machine.step_one(true).unwrap();
+    }
+    assert_eq!(machine.instruction_counter(), 5);
+    assert_eq!(machine.cpu.reg(REG_ARG7), 93);
+
+    // Normal simulation: the page becomes an execute segment, and whole
+    // blocks are counted.
+    machine.cpu.registers_mut().clone_from(&Default::default());
+    machine.cpu.jump(DST).unwrap();
+    assert!(!machine.try_simulate(2, 0).unwrap());
+    assert_eq!(machine.instruction_counter(), 3);
+    assert_eq!(machine.cpu.reg(REG_ARG7), 93);
+    machine.cpu.set_reg(REG_ARG7, 0);
+    let counter = machine.instruction_counter();
+    assert!(!machine.try_simulate(2, counter).unwrap());
+    assert_eq!(machine.instruction_counter(), 5);
+    assert_eq!(machine.cpu.reg(REG_ARG7), 93);
+}
+
+#[test]
+fn crashing_payload_4() {
+    // An end of block due to the instruction limit in the middle of SC.W
+    // sequences; it must end in an exception.
+    const S: u64 = 0x1000;
+    const V: u64 = 0x2000;
+    let mut machine = empty_machine(MachineOptions {
+        use_memory_arena: false,
+        ..Default::default()
+    });
+    machine.set_on_unhandled_syscall(ignore_syscall);
+    let result = machine
+        .memory
+        .set_page_attr(S, 0x1000, PageAttributes::rwx(true, true, false))
+        .and_then(|()| {
+            machine
+                .memory
+                .set_page_attr(V, 0x1000, PageAttributes::rwx(true, false, true))
+        })
+        .and_then(|()| {
+            machine
+                .init_execute_area(payloads::PAYLOAD_4_CODE, V)
+                .map(|_| ())
+        })
+        .and_then(|()| {
+            machine.cpu.jump(V)?;
+            machine.simulate(MAX_CYCLES)
+        });
+    let err = result.unwrap_err();
+    eprintln!(">>> Exception: {err}");
 }
 
 #[test]

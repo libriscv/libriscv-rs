@@ -234,6 +234,40 @@ fn faults_and_syscalls_leave_the_jit_precisely() {
     compare(&words(&program), &regs, &fuels(), "write fault");
 }
 
+/// Loads and stores outside the arena windows go through the page table:
+/// native code hands the instruction (and the rest of its block) to the
+/// interpreter, including at the start of a block and across pages.
+#[test]
+fn accesses_outside_the_arena_use_the_page_table() {
+    const FAR: u32 = 6;
+    let program = [
+        itype(0x13, 0, 10, 0, 0),       // 0x00: li a0, 0
+        itype(0x13, 0, 11, 0, 50),      // 0x04: li a1, 50
+        itype(0x03, 3, 12, FAR, 0),     // 0x08: loop: ld a2, 0(t1)
+        itype(0x13, 0, 12, 12, 3),      // 0x0C: addi a2, a2, 3
+        stype(3, FAR, 12, 0),           // 0x10: sd a2, 0(t1)
+        stype(3, BASE, 12, 8),          // 0x14: sd a2, 8(t0)
+        itype(0x03, 2, 13, FAR, 0xFFE), // 0x18: lw a3, 0xFFE(t1): crosses pages
+        stype(1, FAR, 12, 0x7FE),       // 0x1C: sh a2, 0x7FE(t1)
+        rtype(0x33, 0, 0, 10, 10, 12),  // 0x20: add a0, a0, a2
+        itype(0x13, 0, 11, 11, -1),     // 0x24: addi a1, a1, -1
+        btype(1, 11, 0, -32),           // 0x28: bnez a1, loop
+        jtype(0, 0),                    // 0x2C: j .
+    ];
+    let mut regs = [0u64; 32];
+    regs[BASE as usize] = SCRATCH;
+    regs[FAR as usize] = 0x7000_0000_0802;
+    let entries = compare(&words(&program), &regs, &fuels(), "outside the arena");
+    assert!(entries > 0, "nothing was compiled");
+    let mut m = machine(&words(&program), true);
+    let out = run(&mut m, &regs, 10_000);
+    assert_eq!(out.result, Ok(false)); // timed out in `j .`
+    assert_eq!(m.cpu.reg(10), 3 * (50 * 51 / 2));
+    assert_eq!(m.memory.read_u64(0x7000_0000_0802).unwrap(), 150);
+    // The page of t1 and the next one, written by the SH.
+    assert_eq!(m.memory.owned_pages_active(), 2);
+}
+
 #[test]
 fn x0_writes_are_discarded() {
     // OP-32 fast paths with rd = x0 are no-ops in the dispatcher (C++

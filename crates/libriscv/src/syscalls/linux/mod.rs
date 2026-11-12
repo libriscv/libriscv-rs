@@ -31,7 +31,8 @@
 mod mman;
 mod poll;
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use crate::memory::PAGE_SIZE;
+use std::io::{IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -79,7 +80,7 @@ fn guest_path(m: &Machine, addr: u64) -> Result<Option<String>> {
     let bytes = m
         .memory
         .memstring_bytes(addr, crate::memory::MEMSTRING_MAX)?;
-    Ok(String::from_utf8(bytes.to_vec()).ok())
+    Ok(String::from_utf8(bytes).ok())
 }
 
 // --- Files and standard streams -------------------------------------------
@@ -111,8 +112,13 @@ fn syscall_read(m: &mut Machine) -> Result<()> {
         m.set_result(neg(EBADF));
         return Ok(());
     };
-    let buf = m.memory.memview_mut(address, len)?;
-    let res = f.file.read(buf);
+    let mut bufs: Vec<IoSliceMut<'_>> = m
+        .memory
+        .gather_writable_buffers(address, len, 512)?
+        .into_iter()
+        .map(IoSliceMut::new)
+        .collect();
+    let res = f.file.read_vectored(&mut bufs);
     m.set_result(match res {
         Ok(n) => n as u64,
         Err(e) => io_error(&e),
@@ -137,12 +143,26 @@ fn syscall_pread64(m: &mut Machine) -> Result<()> {
         m.set_result(neg(EINVAL));
         return Ok(());
     }
-    let buf = m.memory.memview_mut(address, len)?;
-    let res = f.file.read_at(buf, offset);
-    m.set_result(match res {
-        Ok(n) => n as u64,
-        Err(e) => io_error(&e),
-    });
+    // preadv into the gathered buffers.
+    let mut total = 0u64;
+    let mut result = None;
+    for buf in m.memory.gather_writable_buffers(address, len, 512)? {
+        match f.file.read_at(buf, offset.wrapping_add(total)) {
+            Ok(n) => {
+                total += n as u64;
+                if n < buf.len() {
+                    break;
+                }
+            }
+            Err(e) => {
+                if total == 0 {
+                    result = Some(io_error(&e));
+                }
+                break;
+            }
+        }
+    }
+    m.set_result(result.unwrap_or(total));
     Ok(())
 }
 
@@ -150,9 +170,12 @@ fn syscall_write(m: &mut Machine) -> Result<()> {
     let vfd = m.sysarg(0) as i32;
     let address = m.sysarg(1);
     let len = m.sysarg(2);
+    // Zero-copy, in at most 64 buffers.
     if vfd == 1 || vfd == 2 {
-        let data = m.memory.memview(address, len)?;
-        m.print(data);
+        let machine: &Machine = m;
+        for data in machine.memory.gather_buffers(address, len, 64)? {
+            machine.print(data);
+        }
         m.set_result(len);
         return Ok(());
     }
@@ -164,8 +187,13 @@ fn syscall_write(m: &mut Machine) -> Result<()> {
         m.set_result(neg(EBADF));
         return Ok(());
     };
-    let data = m.memory.memview(address, len)?;
-    let result = match f.file.write(data) {
+    let bufs: Vec<IoSlice<'_>> = m
+        .memory
+        .gather_buffers(address, len, 64)?
+        .into_iter()
+        .map(IoSlice::new)
+        .collect();
+    let result = match f.file.write_vectored(&bufs) {
         Ok(n) => n as u64,
         Err(e) => io_error(&e),
     };
@@ -232,11 +260,16 @@ fn syscall_readv(m: &mut Machine) -> Result<()> {
     let vecs = read_iovecs(m, iov_g, count as usize)?;
     let mut total = 0u64;
     for (base, len) in vecs {
-        let buf = m.memory.memview_mut(base, len)?;
         let Some(Target::File(f)) = m.fds.as_deref_mut().and_then(|f| f.translate(vfd)) else {
             break;
         };
-        match f.file.read(buf) {
+        let mut bufs: Vec<IoSliceMut<'_>> = m
+            .memory
+            .gather_writable_buffers(base, len, 64)?
+            .into_iter()
+            .map(IoSliceMut::new)
+            .collect();
+        match f.file.read_vectored(&mut bufs) {
             Ok(n) => {
                 total += n as u64;
                 if (n as u64) < len {
@@ -279,16 +312,24 @@ fn syscall_writev(m: &mut Machine) -> Result<()> {
     let vecs = read_iovecs(m, iov_g, count as usize)?;
     let mut total = 0u64;
     for (base, len) in vecs {
-        let data = m.memory.memview(base, len)?;
         if stdio {
-            m.print(data);
+            let machine: &Machine = m;
+            for data in machine.memory.gather_buffers(base, len, 256)? {
+                machine.print(data);
+            }
             total += len;
             continue;
         }
         let Some(Target::File(f)) = m.fds.as_deref_mut().and_then(|f| f.translate(vfd)) else {
             break;
         };
-        match f.file.write(data) {
+        let bufs: Vec<IoSlice<'_>> = m
+            .memory
+            .gather_buffers(base, len, 256)?
+            .into_iter()
+            .map(IoSlice::new)
+            .collect();
+        match f.file.write_vectored(&bufs) {
             Ok(n) => {
                 total += n as u64;
                 if (n as u64) < len {
@@ -906,8 +947,11 @@ fn syscall_getrusage(m: &mut Machine) -> Result<()> {
     };
     put(0, micros / 1_000_000);
     put(1, micros % 1_000_000);
-    // ru_maxrss: no paging, no pages in use.
-    put(4, 0);
+    // ru_maxrss: the pages in use, in KiB.
+    put(
+        4,
+        (m.memory.pages_active() as u64).wrapping_mul(PAGE_SIZE) / 1024,
+    );
     if g_usage != 0 {
         m.copy_to_guest(g_usage, &usage)?;
     }

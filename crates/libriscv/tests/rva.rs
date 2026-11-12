@@ -271,11 +271,21 @@ fn atomic_faults() {
     r.unwrap();
     assert_eq!(m.return_value(), 0b10);
 
-    // An AMO outside writable memory is a protection fault.
-    let (_, r) = run_asm("li t0, 0x7ff0000000\n amoor.w a0, a1, (t0)");
+    // An AMO on read-only memory (the code) is a protection fault at the
+    // page, as with virtual paging in C++.
+    let (m, r) = run_asm("auipc t0, 0\n amoor.w a0, a1, (t0)");
     let e = r.unwrap_err();
     assert_eq!(e.kind, ExceptionKind::ProtectionFault);
-    assert_eq!(e.data, 0x7f_f000_0000);
+    assert_eq!(e.data, m.cpu.reg(5) & !0xFFF);
+
+    // Outside the arena, the first AMO creates the page.
+    let (m, r) = run_asm(
+        "li t0, 0x7ff0000000\n li a1, 5\n amoor.w a0, a1, (t0)\n amoadd.w a0, a1, (t0)\n\
+         li a7, 93\n ecall",
+    );
+    r.unwrap();
+    assert_eq!(m.return_value(), 5);
+    assert_eq!(m.memory.read_u32(0x7f_f000_0000).unwrap(), 10);
 
     // LR with rs2 != 0 is illegal; an unknown funct5 is unimplemented.
     let (_, r) = run_asm("addi t0, sp, -16\n .insn r 0x2f, 3, 0x08, a0, t0, a1");
