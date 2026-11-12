@@ -188,6 +188,34 @@ impl Machine {
         Ok(())
     }
 
+    /// Install background JIT compilations that have finished (with `wait`,
+    /// block until all of them have), switching the current execute segment
+    /// to its compiled copy.
+    #[cfg(feature = "jit")]
+    pub(crate) fn install_background_jit(&mut self, wait: bool) {
+        for (old, new) in self.memory.install_background_jit(wait) {
+            if Arc::ptr_eq(&self.cpu.exec, &old) {
+                self.cpu.exec = new;
+            }
+        }
+    }
+
+    /// Block until background JIT compilations (`MachineOptions::jit_background`)
+    /// have finished, and switch to their native code. Does nothing without
+    /// pending compilations.
+    pub fn wait_for_jit(&mut self) {
+        #[cfg(feature = "jit")]
+        self.install_background_jit(true);
+    }
+
+    /// True while background JIT compilations haven't been installed yet.
+    pub fn jit_pending(&self) -> bool {
+        #[cfg(feature = "jit")]
+        return self.memory.jit_pending();
+        #[cfg(not(feature = "jit"))]
+        false
+    }
+
     /// Stop the machine: the dispatcher returns at the next block end.
     pub const fn stop(&mut self) {
         self.max_counter = 0;

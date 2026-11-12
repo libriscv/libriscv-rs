@@ -66,6 +66,9 @@ pub use memory::{Memory, PAGE_SIZE};
 pub use options::MachineOptions;
 pub use registers::Registers;
 
+/// The default [`MachineOptions::jit_background_slice`].
+pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;
+
 /// Size of the system call handler table, matching C++ `RISCV_SYSCALLS_MAX`.
 pub const SYSCALLS_MAX: usize = 512;
 

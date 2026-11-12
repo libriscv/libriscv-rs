@@ -15,6 +15,7 @@ struct CliArgs {
     accurate: bool,
     silent: bool,
     jit: bool,
+    no_background: bool,
     fuel: Option<u64>,
     memory_mib: Option<u64>,
     program: PathBuf,
@@ -33,6 +34,8 @@ fn usage(name: &str) {
     println!("  -n, --no-translate Accepted for compatibility (always interpreted)");
     if cfg!(feature = "jit") {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
+        println!("  -B, --background   Compile in the background while interpreting (default)");
+        println!("      --no-background Compile each segment before running it");
     }
 }
 
@@ -57,6 +60,8 @@ fn parse_args() -> Result<CliArgs, String> {
             "-s" | "--silent" => args.silent = true,
             "-n" | "--no-translate" => {}
             "-j" | "--jit" if cfg!(feature = "jit") => args.jit = true,
+            "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
+            "--no-background" if cfg!(feature = "jit") => args.no_background = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
@@ -98,6 +103,8 @@ fn main() -> ExitCode {
         memory_max: args.memory_mib.map_or(DEFAULT_MEMORY, |m| m << 20),
         verbose_loader: args.verbose,
         jit: args.jit,
+        // C++ rvlinux compiles in the background by default too.
+        jit_background: !args.no_background,
         ..Default::default()
     };
     let mut machine = match libriscv::Machine::new(&binary, options) {

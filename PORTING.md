@@ -214,8 +214,10 @@ contract the code generator must keep.
 
 **Design** (mirrors `aj_translate.cpp`/`aj_emit.cpp`):
 
-- Execute segments are compiled synchronously when created. Compilable
-  instructions are grouped into regions that grow along fall-through and
+- Execute segments are compiled when created, or with
+  `MachineOptions::jit_background` (`rvlinux`'s default, as in C++) on a
+  background thread while the interpreter runs them (see "Background
+  compilation" below). Compilable instructions are grouped into regions that grow along fall-through and
   direct branches (loops stay inside), stopping at calls, indirect jumps,
   uncompiled instructions and other regions. One Cranelift function per
   region, `tail` calling convention, signature `(state, pc, counter)`.
@@ -241,13 +243,40 @@ contract the code generator must keep.
 - x86-64 only for now: AArch64 needs an instruction-cache flush in the rt
   crate. Cranelift's x64 tail calls need `preserve_frame_pointers`.
 
+**Background compilation** (C++ `asmjit_background_callback` +
+`livepatch.hpp`). C++ compiles on an embedder thread, patches a *copy* of
+the decoder cache and then live-patches the running one so that threads
+executing it switch over at their next block. Patching decoder entries
+that another thread may be executing needs shared mutable handlers, which
+safe Rust can't do without slowing every dispatch. Instead:
+
+- A `std::thread` compiles from an `Arc` of the segment (compilation only
+  reads it) and sends the result over a channel.
+- While anything is pending, `dispatch_simulate` runs in slices of
+  `jit_background_slice` instructions (default 2^20). Between slices it
+  installs finished code: a patched copy of the segment replaces the
+  original in `Memory` and as the current segment.
+- Slices end at the dispatcher's own instruction-limit checks, and the next
+  slice begins the block there, exactly what the uninterrupted run does, so
+  results and counts are the same whenever the code arrives. System calls
+  see the real limit (the slice end is translated in and out), a `stop()`
+  or a new limit from a handler ends slicing, and the PC is only published
+  where an uninterrupted run would publish it (it's observable after a
+  fault). `jit::tests` checks all of this with a compilation that never
+  finishes.
+- Results for segments that went stale or were evicted meanwhile are
+  dropped. `Machine::wait_for_jit` blocks until everything is installed.
+
 **Testing.** The difftests run every guest a second time with `--jit` when
 `rvlinux` is built with the feature (`cargo test --workspace --features
 libriscv/jit,rvlinux/jit`). `crates/libriscv/tests/jit.rs` compares complete
 machine state (registers, PC, counter, memory, error) between JIT and
 interpreter for hand-written and random programs at ~50 instruction limits
-each; `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer sessions (400k
-programs clean on 2026-11-12).
+each, and the same with background compilation (where the code arrives at
+an arbitrary point); `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer
+sessions (400k programs clean on 2026-11-12). With the feature, the
+difftests run `--jit` both with background compilation and with
+`--no-background`.
 
 **Performance** (2026-11-12, freestanding CoreMark built from
 `../coremark/barebones`, 4000 iterations, `--accurate`, best of 3):
@@ -263,7 +292,10 @@ Execution is within ~5% of asmjit, and the JIT's instruction counts are
 exact (asmjit's are off by a few). Cranelift compiles more slowly: compiling
 the segment up front takes ~60 ms of CoreMark's 0.34 s wall time (asmjit:
 0.26 s total). Next steps: background or lazy compilation, register passing
-across tail calls, F/D, AArch64.
+across tail calls, F/D, AArch64. Background compilation (added later, see
+Baseline for current numbers) saves ~5-10 ms on CoreMark, the same as
+asmjit's: during the compile, the interpreter only gets through ~1/7 of
+what native code would have.
 
 ## Testing
 
@@ -405,7 +437,8 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Shared execute segments across machines (`decoded_exec_segment.hpp`, `shared_rodata.cpp`)
 - [ ] Bounds-check elimination audit (`cargo asm`)
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMC, Zcb, B (no CLMUL), Zicond
-- [ ] JIT: background/lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`)
+- [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
+- [ ] JIT: lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`)
 
 ### Phase 5 — Remaining features
 

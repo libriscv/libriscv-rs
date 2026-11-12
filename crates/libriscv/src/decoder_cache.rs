@@ -103,6 +103,34 @@ impl DecodedSegment {
         }
     }
 
+    /// A copy of this segment without native code, for installing a
+    /// background compilation into.
+    #[cfg(feature = "jit")]
+    pub(crate) fn duplicate(&self) -> Self {
+        let cache = match &self.jit {
+            // Undo patches from an earlier compilation.
+            Some(jit) => self
+                .cache
+                .iter()
+                .enumerate()
+                .map(|(i, e)| DecoderEntry {
+                    handler: jit.original_handler(i).unwrap_or(e.handler),
+                    ..*e
+                })
+                .collect(),
+            None => self.cache.clone(),
+        };
+        Self {
+            begin: self.begin,
+            end: self.end,
+            data: self.data.clone(),
+            cache,
+            stale: AtomicBool::new(self.is_stale()),
+            execute_only: self.execute_only,
+            jit: None,
+        }
+    }
+
     /// True if `[addr, addr + len)` is inside the segment (C++ default `len = 2`).
     #[inline]
     pub fn is_within(&self, addr: u64, len: u64) -> bool {

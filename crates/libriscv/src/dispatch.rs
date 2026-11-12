@@ -69,6 +69,42 @@ pub(crate) struct DispatchState {
     pc: u64,
     counter: Counter,
     error: Option<MachineError>,
+    /// The slice being run while a background compilation is pending.
+    slice: Option<Slice>,
+}
+
+/// A dispatcher run that stops early, at `end`, on the way to the real limit
+/// `max` (see `Machine::dispatch_simulate`).
+#[derive(Debug, Clone, Copy)]
+struct Slice {
+    end: u64,
+    max: u64,
+}
+
+impl DispatchState {
+    /// The limit host code (system calls) sees for the chain's limit `max`:
+    /// the real one while running a slice, so slicing isn't observable.
+    #[inline]
+    fn visible_max(&self, max: u64) -> u64 {
+        match self.slice {
+            Some(s) if max == s.end => s.max,
+            _ => max,
+        }
+    }
+
+    /// Back to the chain's limit after host code ran. If the host changed
+    /// the limit (`stop()` or a new one), that one counts and the slice ends.
+    #[inline]
+    fn chain_max(&mut self, visible: u64) -> u64 {
+        match self.slice {
+            Some(s) if visible == s.max => s.end,
+            Some(_) => {
+                self.slice = None;
+                visible
+            }
+            None => visible,
+        }
+    }
 }
 
 /// Decoder entries per 4-byte instruction (C++ `NEXT_INSTR`).
@@ -422,14 +458,14 @@ pub(crate) fn syscall(
     // Make the current PC and the counters visible to the handler.
     m.cpu.regs.pc = pc;
     m.counter = c.value;
-    m.max_counter = c.max;
+    m.max_counter = m.dispatch.visible_max(c.max);
     let number = m.cpu.regs.get(REG_ECALL);
     if let Err(err) = m.system_call(number) {
         return fault(m, err);
     }
     let c = Counter {
         value: m.counter,
-        max: m.max_counter,
+        max: m.dispatch.chain_max(m.max_counter),
     };
     // Stopped, or a clone-like system call changed PC. System calls are
     // always full-length instructions, so execution resumes after PC.
@@ -470,13 +506,13 @@ pub(crate) fn system(
     let instr = Instr(entry!(exec, i, m, pc).instr);
     m.cpu.regs.pc = pc;
     m.counter = c.value;
-    m.max_counter = c.max;
+    m.max_counter = m.dispatch.visible_max(c.max);
     if let Err(err) = m.system(instr) {
         return fault(m, err);
     }
     let c = Counter {
         value: m.counter,
-        max: m.max_counter,
+        max: m.dispatch.chain_max(m.max_counter),
     };
     // Stopped, or PC changed: continue *at* PC (so a stopped machine
     // resumes at this instruction).
@@ -501,14 +537,14 @@ pub(crate) fn execute_invalid(
     let e = entry!(exec, i, m, pc);
     if e.instr == 0 && exec.is_within(pc, 2) {
         m.counter = c.value;
-        m.max_counter = c.max;
+        m.max_counter = m.dispatch.visible_max(c.max);
         let pc = match simulate_undecoded(m, exec, pc) {
             Ok(pc) => pc,
             Err(err) => return fault(m, err),
         };
         let c = Counter {
             value: m.counter,
-            max: m.max_counter,
+            max: m.dispatch.chain_max(m.max_counter),
         };
         if c.overflowed() {
             return halt(m, pc, c);
@@ -645,6 +681,65 @@ impl Machine {
     /// stopped (C++: "stopped normally"). Sets PC, but like C++ leaves
     /// recording the counter to the caller.
     pub(crate) fn dispatch_simulate(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
+        #[cfg(feature = "jit")]
+        if self.memory.jit_pending() {
+            return self.dispatch_sliced(pc, counter, max);
+        }
+        self.dispatch_run(pc, counter, max)
+    }
+
+    /// `dispatch_simulate` while background compilations are pending: run in
+    /// slices of `jit_background_slice` instructions, installing finished
+    /// native code in between. A slice ends at an instruction-limit check,
+    /// exactly where a run with that limit would halt, and the next one
+    /// begins the block there, as the uninterrupted run would have: results
+    /// and counts don't depend on where the slices fall.
+    #[cfg(feature = "jit")]
+    fn dispatch_sliced(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
+        let (mut pc, mut counter) = (pc, counter);
+        let slice = self.options().jit_background_slice.max(1);
+        loop {
+            self.install_background_jit(false);
+            let end = counter.saturating_add(slice);
+            if !self.memory.jit_pending() || end >= max {
+                return self.dispatch_run(pc, counter, max);
+            }
+            self.dispatch.slice = Some(Slice { end, max });
+            let result = self.dispatch_chain(pc, counter, end);
+            let slice = self.dispatch.slice.take();
+            let (c, halt_pc) = result?;
+            // The slice ran out: nothing stopped the machine or changed the
+            // limit.
+            if slice.is_some() && c.max == end {
+                // At this check, the real limit is reached too: an
+                // uninterrupted run would halt here as well.
+                if c.value >= max {
+                    self.cpu.regs.pc = halt_pc;
+                    return Ok(Counter {
+                        value: c.value,
+                        max,
+                    });
+                }
+                // Continue without publishing the PC: an uninterrupted run
+                // wouldn't have stored it (it's observable after a fault).
+                pc = halt_pc;
+                counter = c.value;
+                continue;
+            }
+            self.cpu.regs.pc = halt_pc;
+            return Ok(c);
+        }
+    }
+
+    fn dispatch_run(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
+        let (c, halt_pc) = self.dispatch_chain(pc, counter, max)?;
+        self.cpu.regs.pc = halt_pc;
+        Ok(c)
+    }
+
+    /// The dispatcher loop. Returns the final counters and the PC it halted
+    /// at, which the caller stores.
+    fn dispatch_chain(&mut self, pc: u64, counter: u64, max: u64) -> Result<(Counter, u64)> {
         let mut c = Counter {
             value: counter,
             max,
@@ -667,10 +762,7 @@ impl Machine {
             let block_pc = pc.wrapping_add(e.block_bytes());
             c.value = c.value.wrapping_add(e.instruction_count());
             match (e.handler)(&exec, i, self, block_pc, c) {
-                Exit::Halt => {
-                    self.cpu.regs.pc = self.dispatch.pc;
-                    return Ok(self.dispatch.counter);
-                }
+                Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {
                     c = self.dispatch.counter;
                     pc = self.next_execute_segment(self.dispatch.pc)?;

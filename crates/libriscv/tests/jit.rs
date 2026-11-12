@@ -24,12 +24,35 @@ const SCRATCH_LEN: u64 = 0x2000;
 const BASE: u32 = 5;
 
 fn machine(code: &[u8], jit: bool) -> Machine {
+    machine_with(
+        code,
+        MachineOptions {
+            jit,
+            ..Default::default()
+        },
+    )
+}
+
+/// A machine compiling in the background, checking for finished code every
+/// `slice` instructions.
+fn background_machine(code: &[u8], slice: u64) -> Machine {
+    machine_with(
+        code,
+        MachineOptions {
+            jit: true,
+            jit_background: true,
+            jit_background_slice: slice,
+            ..Default::default()
+        },
+    )
+}
+
+fn machine_with(code: &[u8], options: MachineOptions) -> Machine {
     let mut m = Machine::new(
         &[],
         MachineOptions {
             memory_max: 1 << 20,
-            jit,
-            ..Default::default()
+            ..options
         },
     )
     .unwrap();
@@ -69,8 +92,19 @@ fn run(m: &mut Machine, regs: &[u64; 32], fuel: u64) -> Outcome {
 
 /// Run `code` with and without the JIT at every limit in `fuels`.
 fn compare(code: &[u8], regs: &[u64; 32], fuels: &[u64], what: &str) -> usize {
+    compare_machines(machine(code, true), code, regs, fuels, what)
+}
+
+/// Run `code` in the interpreter and on `jit` at every limit in `fuels`.
+/// Returns the number of decoder entries `jit` enters native code at.
+fn compare_machines(
+    mut jit: Machine,
+    code: &[u8],
+    regs: &[u64; 32],
+    fuels: &[u64],
+    what: &str,
+) -> usize {
     let mut interp = machine(code, false);
-    let mut jit = machine(code, true);
     let entries = jit.cpu.current_execute_segment().jit_entry_count();
     for &fuel in fuels {
         let expected = run(&mut interp, regs, fuel);
@@ -425,6 +459,60 @@ fn encode(items: &[Item]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[test]
+fn background_compilation_switches_to_native_code() {
+    let program = [
+        itype(0x13, 0, 10, 0, 0),      // li a0, 0
+        itype(0x13, 0, 11, 0, 100),    // li a1, 100
+        rtype(0x33, 0, 0, 10, 10, 11), // add a0, a0, a1
+        itype(0x13, 0, 11, 11, -1),    // addi a1, a1, -1
+        btype(1, 11, 0, -8),           // bnez a1, -8
+        jtype(0, 0),                   // j .
+    ];
+    let code = words(&program);
+    let mut m = background_machine(&code, 3);
+    // The segment starts out interpreted.
+    assert_eq!(m.cpu.current_execute_segment().jit_entry_count(), 0);
+    // Results don't depend on when the code arrives...
+    let early = run(&mut m, &[0; 32], 150);
+    m.wait_for_jit();
+    assert!(!m.jit_pending());
+    assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
+    // ...and from here on everything runs natively.
+    let late = run(&mut m, &[0; 32], 150);
+    assert_eq!(early, late);
+    let expected = run(&mut machine(&code, false), &[0; 32], 150);
+    assert_eq!(late, expected);
+    // Waiting again is a no-op.
+    m.wait_for_jit();
+}
+
+#[test]
+fn background_compilation_matches_the_interpreter() {
+    // Wherever the compiled code happens to land (between which slices, at
+    // which fuel), every run must match the interpreter.
+    let mut rng = Rng(0x0123_4567_89AB_CDEF);
+    let fuels: Vec<u64> = (0..=48).chain([64, 100, 333, 1000, 20_000]).collect();
+    for program in 0..60 {
+        let n = 8 + rng.below(56) as usize;
+        let items: Vec<Item> = (0..n).map(|_| random_item(&mut rng, n)).collect();
+        let code = encode(&items);
+        let mut regs = [0u64; 32];
+        for r in regs.iter_mut().skip(1) {
+            *r = rng.below(64);
+        }
+        regs[BASE as usize] = SCRATCH + 64;
+        let slice = 1 + rng.below(9);
+        compare_machines(
+            background_machine(&code, slice),
+            &code,
+            &regs,
+            &fuels,
+            &format!("program {program} (background, slice {slice}): {code:02x?}"),
+        );
+    }
 }
 
 /// `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs a longer fuzzing session.

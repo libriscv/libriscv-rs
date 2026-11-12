@@ -35,6 +35,17 @@ pub struct MachineOptions {
     /// `FEATURE_DISABLED`. On hosts the JIT doesn't support yet, segments
     /// are silently interpreted.
     pub jit: bool,
+    /// With `jit`, compile execute segments on background threads instead of
+    /// when they are created (C++ `asmjit_background_callback`). The
+    /// interpreter runs the segment meanwhile, and switches to native code
+    /// once it's ready; results and instruction counts are the same either
+    /// way. While a compilation is pending, `simulate` runs in slices of
+    /// `jit_background_slice` instructions, checking for finished code in
+    /// between. Short-lived programs are better off without the JIT.
+    pub jit_background: bool,
+    /// Instructions between checks for finished background compilations
+    /// (at least 1). Smaller slices switch to native code sooner.
+    pub jit_background_slice: u64,
 }
 
 impl Default for MachineOptions {
@@ -52,6 +63,8 @@ impl Default for MachineOptions {
             use_memory_arena: true,
             preserve_vector_registers: true,
             jit: false,
+            jit_background: false,
+            jit_background_slice: crate::JIT_BACKGROUND_SLICE,
         }
     }
 }

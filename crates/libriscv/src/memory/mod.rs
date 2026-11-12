@@ -68,6 +68,12 @@ pub struct Memory {
     /// Compile execute segments with the JIT (`MachineOptions::jit`).
     #[cfg(feature = "jit")]
     jit: bool,
+    /// Compile them on background threads (`MachineOptions::jit_background`).
+    #[cfg(feature = "jit")]
+    jit_background: bool,
+    /// Background compilations not installed yet.
+    #[cfg(feature = "jit")]
+    jit_pending: Vec<crate::jit::BackgroundJit>,
 
     /// The LR/SC reservation (C++ `Memory::m_atomics`).
     #[cfg(feature = "ext-a")]
@@ -197,6 +203,10 @@ impl Memory {
             exec: Vec::new(),
             #[cfg(feature = "jit")]
             jit: options.jit,
+            #[cfg(feature = "jit")]
+            jit_background: options.jit_background,
+            #[cfg(feature = "jit")]
+            jit_pending: Vec::new(),
             #[cfg(feature = "ext-a")]
             atomics: Default::default(),
         };
@@ -360,7 +370,7 @@ impl Memory {
         #[allow(unused_mut)]
         let mut segment = DecodedSegment::new(code, vaddr, execute_only)?;
         #[cfg(feature = "jit")]
-        if self.jit {
+        if self.jit && !self.jit_background {
             crate::jit::JitSegment::attach(&mut segment);
         }
         let segment = Arc::new(segment);
@@ -377,7 +387,76 @@ impl Memory {
                 0,
             ));
         }
+        #[cfg(feature = "jit")]
+        if self.jit && self.jit_background {
+            self.jit_pending
+                .push(crate::jit::BackgroundJit::spawn(&segment));
+        }
         Ok(segment)
+    }
+
+    /// Replace the pending compilations with one that never finishes, so
+    /// that the dispatcher keeps running in slices.
+    #[cfg(all(test, feature = "jit"))]
+    pub(crate) fn hold_jit_pending(&mut self, segment: &Arc<DecodedSegment>) {
+        self.jit_pending = vec![crate::jit::BackgroundJit::never(segment)];
+    }
+
+    /// True while background compilations haven't been installed yet.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_pending(&self) -> bool {
+        !self.jit_pending.is_empty()
+    }
+
+    /// Install finished background compilations (with `wait`, all of them,
+    /// blocking until they finish): each compiled segment is replaced by a
+    /// patched copy. Returns `(old, new)` for every replaced segment.
+    /// Results for segments that went stale or were evicted meanwhile are
+    /// dropped.
+    #[cfg(feature = "jit")]
+    pub(crate) fn install_background_jit(
+        &mut self,
+        wait: bool,
+    ) -> Vec<(Arc<DecodedSegment>, Arc<DecodedSegment>)> {
+        use crate::jit::{BackgroundResult, JitSegment};
+        let mut replaced = Vec::new();
+        let mut still_pending = Vec::new();
+        for job in std::mem::take(&mut self.jit_pending) {
+            let compiled = match job.poll(wait) {
+                BackgroundResult::Pending => {
+                    still_pending.push(job);
+                    continue;
+                }
+                BackgroundResult::Done(compiled) => compiled,
+            };
+            let old = job.segment;
+            let Some(compiled) = compiled else { continue };
+            if old.is_stale() {
+                continue;
+            }
+            let slot = if self
+                .main_exec
+                .as_ref()
+                .is_some_and(|m| Arc::ptr_eq(m, &old))
+            {
+                &mut self.main_exec
+            } else if let Some(slot) = self
+                .exec
+                .iter_mut()
+                .find(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(s, &old)))
+            {
+                slot
+            } else {
+                continue; // evicted
+            };
+            let mut patched = old.duplicate();
+            JitSegment::install(&mut patched, compiled);
+            let new = Arc::new(patched);
+            *slot = Some(Arc::clone(&new));
+            replaced.push((old, new));
+        }
+        self.jit_pending = still_pending;
+        replaced
     }
 
     /// Port of `Memory::evict_execute_segment`.

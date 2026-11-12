@@ -22,8 +22,8 @@ fn rvlinux() -> &'static Path {
 }
 
 /// Run both emulators and compare everything that must match. With the
-/// `jit` feature, the Rust emulator also runs with `--jit`, against the same
-/// reference.
+/// `jit` feature, the Rust emulator also runs with `--jit` (compiling in the
+/// background and up front), against the same reference.
 fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     let reference =
         testutil::run_reference_with(elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
@@ -36,9 +36,12 @@ fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     );
     compare(&reference, elf, flags, args);
     if cfg!(feature = "jit") {
-        let mut jit_flags = flags.to_vec();
-        jit_flags.push("--jit");
-        compare(&reference, elf, &jit_flags, args);
+        // Background compilation (the default) and compiling up front.
+        for extra in [&["--jit"][..], &["--jit", "--no-background"]] {
+            let mut jit_flags = flags.to_vec();
+            jit_flags.extend_from_slice(extra);
+            compare(&reference, elf, &jit_flags, args);
+        }
     }
     reference
 }
