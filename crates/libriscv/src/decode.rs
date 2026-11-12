@@ -1,4 +1,4 @@
-//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64IMAC + B) and the
+//! Port of `instruction_list.hpp`, `instr_decoding.inc` (RV64IMAFDC + B) and the
 //! handler selection of `decode_bytecodes.cpp` + `threaded_rewriter.cpp`.
 //!
 //! Two decoders, mirroring the two in C++:
@@ -20,6 +20,8 @@ use crate::instruction::{CInstr, Instr, ci_code};
 #[cfg(feature = "ext-a")]
 use crate::isa::rva::*;
 use crate::isa::rvc::*;
+#[cfg(feature = "ext-f")]
+use crate::isa::rvfd::*;
 use crate::isa::rvi::*;
 use crate::isa::{InstrFn, Op};
 use crate::registers::REG_SP;
@@ -39,8 +41,21 @@ pub(crate) const OP_IMM32: u32 = 0b001_1011;
 pub(crate) const OP32: u32 = 0b011_1011;
 #[cfg(feature = "ext-a")]
 pub(crate) const ATOMIC: u32 = 0b010_1111;
+pub(crate) const LOAD_FP: u32 = 0b000_0111;
+pub(crate) const STORE_FP: u32 = 0b010_0111;
+#[cfg(feature = "ext-f")]
+pub(crate) const FMADD: u32 = 0b100_0011;
+#[cfg(feature = "ext-f")]
+pub(crate) const FMSUB: u32 = 0b100_0111;
+#[cfg(feature = "ext-f")]
+pub(crate) const FNMSUB: u32 = 0b100_1011;
+#[cfg(feature = "ext-f")]
+pub(crate) const FNMADD: u32 = 0b100_1111;
+pub(crate) const FPFUNC: u32 = 0b101_0011;
 
 const CBO_FUNCT3: u32 = 0b010;
+/// Whether the F/D bytecodes exist (their entry bits are re-encoded).
+const FP_BYTECODES: bool = cfg!(feature = "ext-f");
 
 /// The handlers derived from one precise instruction handler.
 #[derive(Clone, Copy)]
@@ -205,6 +220,12 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
                     return info;
                 }
             }
+            #[cfg(feature = "ext-f")]
+            LOAD_FP | STORE_FP | FMADD | FMSUB | FNMSUB | FNMADD | FPFUNC => {
+                if let Some(info) = decode_float(i) {
+                    return info;
+                }
+            }
             _ => {}
         }
     }
@@ -254,6 +275,57 @@ fn decode_atomic(i: Instr) -> Option<OpInfo> {
         (0b11000, false) => OpInfo::of::<AmoMinuD>(),
         (0b11100, false) => OpInfo::of::<AmoMaxuD>(),
         _ => return None,
+    })
+}
+
+/// The F/D/Zfhmin/Zfa cases of `instr_decoding.inc` (RV64, without the V
+/// extension's unit-stride loads and stores). `None` (an unknown FPFUNC,
+/// including the RV32-only FMVP.D.X) falls through to UNIMPLEMENTED.
+#[cfg(feature = "ext-f")]
+fn decode_float(i: Instr) -> Option<OpInfo> {
+    let fi = FInstr(i.whole());
+    Some(match i.opcode() {
+        LOAD_FP => match fi.funct3() {
+            0x1 => OpInfo::of::<Flh>(),
+            0x2 => OpInfo::of::<Flw>(),
+            0x3 => OpInfo::of::<Fld>(),
+            _ => OpInfo::of::<Illegal>(),
+        },
+        STORE_FP => match fi.funct3() {
+            0x1 => OpInfo::of::<Fsh>(),
+            0x2 => OpInfo::of::<Fsw>(),
+            0x3 => OpInfo::of::<Fsd>(),
+            _ => OpInfo::of::<Illegal>(),
+        },
+        FMADD => OpInfo::of::<FMadd>(),
+        FMSUB => OpInfo::of::<FMsub>(),
+        FNMSUB => OpInfo::of::<FNMsub>(),
+        FNMADD => OpInfo::of::<FNMadd>(),
+        _ => match i.fpfunc() {
+            0b00000 => OpInfo::of::<FAdd>(),
+            0b00001 => OpInfo::of::<FSub>(),
+            0b00010 => OpInfo::of::<FMul>(),
+            0b00011 => OpInfo::of::<FDiv>(),
+            0b00100 => OpInfo::of::<FSgnj>(),
+            0b00101 if matches!(fi.funct3(), 0x2 | 0x3) => OpInfo::of::<FMinMaxM>(),
+            0b00101 => OpInfo::of::<FMinMax>(),
+            0b01011 => OpInfo::of::<FSqrt>(),
+            0b10100 if fi.rd() == 0 => OpInfo::of::<Nop>(),
+            0b10100 if matches!(fi.funct3(), 0x4 | 0x5) => OpInfo::of::<FCompareQ>(),
+            0b10100 => OpInfo::of::<FCompare>(),
+            0b01000 if matches!(fi.rs2(), 0x4 | 0x5) => OpInfo::of::<FRound>(),
+            0b01000 => OpInfo::of::<FCvtFF>(),
+            0b11000 if fi.rd() == 0 => OpInfo::of::<Nop>(),
+            0b11000 if fi.rs2() == 0x8 => OpInfo::of::<FCvtmodWD>(),
+            0b11000 => OpInfo::of::<FCvtIntF>(),
+            0b11010 => OpInfo::of::<FCvtFInt>(),
+            0b11100 if fi.rd() == 0 => OpInfo::of::<Nop>(),
+            0b11100 if fi.funct3() == 0 => OpInfo::of::<FMvXF>(),
+            0b11100 => OpInfo::of::<FClass>(),
+            0b11110 if fi.rs2() == 0x1 && fi.funct3() == 0 => OpInfo::of::<Fli>(),
+            0b11110 => OpInfo::of::<FMvFX>(),
+            _ => return None,
+        },
     })
 }
 
@@ -826,8 +898,32 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
             }
             Some(dispatch::system)
         }
-        // FENCE, F/D, A (always RV32I_BC_FUNCTION in C++), V and unknown
-        // opcodes (custom-handled)
+        #[cfg(feature = "ext-f")]
+        LOAD_FP => match it.funct3() {
+            0x2 => Some(seq::<Flw>),
+            0x3 => Some(seq::<Fld>),
+            // FLH, and the vector loads (illegal here)
+            _ => function(),
+        },
+        #[cfg(feature = "ext-f")]
+        STORE_FP => match it.funct3() {
+            0x2 => Some(seq::<Fsw>),
+            0x3 => Some(seq::<Fsd>),
+            _ => function(),
+        },
+        // C++ picks RV32F_BC_FMADD for every format; it ignores H and Q.
+        #[cfg(feature = "ext-f")]
+        FMADD => Some(seq::<FMaddFast>),
+        #[cfg(feature = "ext-f")]
+        FPFUNC if FInstr(i.whole()).funct2() < 2 => match i.fpfunc() {
+            0b00000 => Some(seq::<FAdd>),
+            0b00001 => Some(seq::<FSub>),
+            0b00010 => Some(seq::<FMul>),
+            0b00011 => Some(seq::<FDiv>),
+            _ => function(),
+        },
+        // FENCE, FMSUB/FNMADD/FNMSUB and the other FP functions, A (always
+        // RV32I_BC_FUNCTION in C++), V and unknown opcodes (custom-handled)
         _ => function(),
     }
 }
@@ -902,6 +998,15 @@ pub(crate) fn cpp_entry_bits(i: Instr, pc: u64, begin: u64, end: u64) -> u32 {
             0x44 if rt.rs2() == 0 => optype(rt.rd(), rt.rs1(), rt.rs2()),
             _ => original,
         },
+        // FLW/FLD: FasterItype with rs1 = rd, rs2 = rs1
+        LOAD_FP if FP_BYTECODES && matches!(it.funct3(), 2 | 3) => itype(rd, rs1, imm),
+        STORE_FP if FP_BYTECODES && matches!(it.funct3(), 2 | 3) => {
+            itype(i.stype().rs1(), i.stype().rs2(), i.stype().signed_imm())
+        }
+        // FADD/FSUB/FMUL/FDIV: FasterFloatType: func | rd << 8 | rs2 << 16 | rs1 << 24
+        FPFUNC if FP_BYTECODES && rt.funct7() >> 2 <= 3 && (rt.funct7() & 3) < 2 => {
+            (rt.funct7() & 3) | (rt.rd() << 8) | (rt.rs2() << 16) | (rt.rs1() << 24)
+        }
         OP_IMM32 if rd != 0 => {
             let shamt_ok = it.imm() & 0x20 == 0;
             match it.funct3() {

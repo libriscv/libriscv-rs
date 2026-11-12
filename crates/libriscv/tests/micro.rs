@@ -2,8 +2,8 @@
 //!
 //! Not ported: "Run exactly X instructions" and "Crashing payload #4"
 //! (need the paging backend and the debugger, Phase 5); the Zba/Zbb/Zbc/Zbkb
-//! and FCLASS cases (Phase 2); the RV32-only Zbkb case (RV32 is out of
-//! scope). Payloads #5 and #6 are ELF32 files, which an RV64 machine must
+//! cases (Phase 2; FCLASS is in `rvfd.rs`); the RV32-only Zbkb case (RV32 is
+//! out of scope). Payloads #5 and #6 are ELF32 files, which an RV64 machine must
 //! reject; they are kept as "never panics" checks.
 
 #![allow(

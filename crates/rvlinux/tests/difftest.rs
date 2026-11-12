@@ -768,6 +768,355 @@ fn freestanding_bitmanip_edge_cases() {
     }
 }
 
+/// The F/D variants: without and with the C extension (C.FLD/C.FSD and
+/// their SP forms), both with Zfhmin and Zfa. `-mabi=lp64d` overrides the
+/// soft-float ABI of [`FREESTANDING`].
+const FP_MARCHES: &[&str] = &[
+    "rv64imfd_zfhmin_zfa_zicsr",
+    "rv64imafdc_zcb_zfhmin_zfa_zicsr",
+];
+const FP_ABI: &str = "-mabi=lp64d -mno-relax -fno-math-errno";
+
+/// Every F/D/Zfhmin/Zfa instruction over sweeps of special values, hashing
+/// the raw result bits (all 64 of an f-register: without NaN-boxing, a
+/// single-precision write keeps the upper half), plus compiler-generated
+/// floating-point code.
+///
+/// Two NaN operands with different payloads are avoided in binary
+/// operations (which one a host FPU propagates depends on the operand order
+/// the compiler picks), and FMIN/FMAX skip signaling NaNs (C++ `std::fmin`
+/// gives the other operand when clang inlines it and a quiet NaN in glibc).
+const FLOAT: &str = r#"
+typedef unsigned long ulong;
+static long sys(long n, long a, long b, long c) {
+    register long a0 asm("a0") = a; register long a1 asm("a1") = b;
+    register long a2 asm("a2") = c; register long a7 asm("a7") = n;
+    asm volatile("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a7) : "memory");
+    return a0;
+}
+static void put(const char* s) { long n = 0; while (s[n]) n++; sys(64, 1, (long)s, n); }
+static void puthex(ulong v) {
+    char b[17]; for (int i = 15; i >= 0; i--) { b[i] = "0123456789abcdef"[v & 15]; v >>= 4; }
+    b[16] = 0; put(b);
+}
+static ulong h[200];
+static int n;
+static void fold(ulong v) { h[n] = (h[n] ^ v) * 0x100000001b3ul; h[n] = (h[n] << 7) | (h[n] >> 57); n++; }
+
+#define LD "fmv.d.x ft0, %1\n\tfmv.d.x ft1, %2\n\tfmv.d.x ft2, %3\n\tfmv.d.x ft3, %4\n\t"
+#define IN : "r"(a), "r"(b), "r"(c), "r"(d) : "ft0", "ft1", "ft2", "ft3"
+#define F3(op) do { ulong r; asm volatile(LD op " ft3, ft0, ft1, ft2\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define F2(op) do { ulong r; asm volatile(LD op " ft3, ft0, ft1\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define F1(op) do { ulong r; asm volatile(LD op " ft3, ft0\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define F1R(op, rm) do { ulong r; asm volatile(LD op " ft3, ft0, " rm "\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define X2(op) do { ulong r; asm volatile(LD op " %0, ft0, ft1" : "=r"(r) IN); fold(r); } while (0)
+#define X1(op) do { ulong r; asm volatile(LD op " %0, ft0" : "=r"(r) IN); fold(r); } while (0)
+#define X1R(op, rm) do { ulong r; asm volatile(LD op " %0, ft0, " rm : "=r"(r) IN); fold(r); } while (0)
+#define I1(op) do { ulong r; asm volatile(LD op " ft3, %1\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define I1R(op, rm) do { ulong r; asm volatile(LD op " ft3, %1, " rm "\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define FLI(f7, i) do { ulong r; asm volatile(LD ".insn r 0x53, 0, " #f7 ", ft3, f" #i ", f1\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+
+static int snan32(ulong v) { return (v & 0x7fc00000) == 0x7f800000 && (v & 0x3fffff); }
+static int snan64(ulong v) { return (v & 0x7ff8000000000000ul) == 0x7ff0000000000000ul && (v & 0x7ffffffffffful); }
+
+/* Binary and fused operations. */
+static void __attribute__((noinline)) bin(ulong a, ulong b, ulong c, ulong d) {
+    n = 0;
+    F2("fadd.s"); F2("fsub.s"); F2("fmul.s"); F2("fdiv.s");
+    F2("fadd.d"); F2("fsub.d"); F2("fmul.d"); F2("fdiv.d");
+    F2("fsgnj.s"); F2("fsgnjn.s"); F2("fsgnjx.s");
+    F2("fsgnj.d"); F2("fsgnjn.d"); F2("fsgnjx.d");
+    if (!snan32(a) && !snan32(b)) { F2("fmin.s"); F2("fmax.s"); } else n += 2;
+    if (!snan64(a) && !snan64(b)) { F2("fmin.d"); F2("fmax.d"); } else n += 2;
+    F2("fminm.s"); F2("fmaxm.s"); F2("fminm.d"); F2("fmaxm.d");
+    X2("feq.s"); X2("flt.s"); X2("fle.s"); X2("feq.d"); X2("flt.d"); X2("fle.d");
+    X2("fleq.s"); X2("fltq.s"); X2("fleq.d"); X2("fltq.d");
+}
+static void __attribute__((noinline)) fused(ulong a, ulong b, ulong c, ulong d) {
+    n = 0;
+    F3("fmadd.s"); F3("fmsub.s"); F3("fnmadd.s"); F3("fnmsub.s");
+    F3("fmadd.d"); F3("fmsub.d"); F3("fnmadd.d"); F3("fnmsub.d");
+}
+/* Single-operand operations, including signaling NaNs. */
+static void __attribute__((noinline)) unary(ulong a, ulong d) {
+    ulong b = 0, c = 0;
+    n = 0;
+    F1("fsqrt.s"); F1("fsqrt.d"); X1("fclass.s"); X1("fclass.d");
+    F1("fcvt.s.d"); F1("fcvt.d.s"); X1("fmv.x.w"); X1("fmv.x.d");
+    X1R("fcvt.w.s", "rne"); X1R("fcvt.w.s", "rtz"); X1R("fcvt.w.s", "rdn"); X1R("fcvt.w.s", "rup");
+    X1R("fcvt.w.s", "rmm"); X1R("fcvt.w.s", "dyn"); X1R("fcvt.wu.s", "rtz"); X1R("fcvt.wu.s", "rne");
+    X1R("fcvt.l.s", "rtz"); X1R("fcvt.l.s", "rmm"); X1R("fcvt.lu.s", "rtz"); X1R("fcvt.lu.s", "rup");
+    X1R("fcvt.w.d", "rne"); X1R("fcvt.w.d", "rtz"); X1R("fcvt.w.d", "rdn"); X1R("fcvt.w.d", "rup");
+    X1R("fcvt.w.d", "rmm"); X1R("fcvt.w.d", "dyn"); X1R("fcvt.wu.d", "rtz"); X1R("fcvt.wu.d", "rne");
+    X1R("fcvt.l.d", "rtz"); X1R("fcvt.l.d", "rmm"); X1R("fcvt.lu.d", "rtz"); X1R("fcvt.lu.d", "rup");
+    X1R("fcvtmod.w.d", "rtz");
+    F1R("fround.s", "rne"); F1R("fround.s", "rtz"); F1R("fround.s", "rdn"); F1R("fround.s", "rup");
+    F1R("fround.s", "rmm"); F1R("froundnx.s", "dyn");
+    F1R("fround.d", "rne"); F1R("fround.d", "rtz"); F1R("fround.d", "rdn"); F1R("fround.d", "rup");
+    F1R("fround.d", "rmm"); F1R("froundnx.d", "dyn");
+    F1("fcvt.s.h"); F1("fcvt.d.h"); F1("fcvt.h.s"); F1("fcvt.h.d");
+    X1("fmv.x.h");
+}
+/* Integer to floating-point. The rounding mode is ignored without FCSR. */
+static void __attribute__((noinline)) fromint(ulong a, ulong d) {
+    ulong b = 0, c = 0;
+    n = 0;
+    I1("fcvt.s.w"); I1("fcvt.s.wu"); I1("fcvt.s.l"); I1R("fcvt.s.lu", "rtz");
+    I1("fcvt.d.w"); I1("fcvt.d.wu"); I1R("fcvt.d.l", "rup"); I1("fcvt.d.lu");
+    I1("fmv.w.x"); I1("fmv.d.x"); I1("fmv.h.x");
+}
+static void __attribute__((noinline)) fli(ulong d) {
+    ulong a = 0, b = 0, c = 0;
+    n = 0;
+    FLI(0x78, 0); FLI(0x78, 1); FLI(0x78, 2); FLI(0x78, 3); FLI(0x78, 4); FLI(0x78, 5);
+    FLI(0x78, 6); FLI(0x78, 7); FLI(0x78, 8); FLI(0x78, 9); FLI(0x78, 10); FLI(0x78, 11);
+    FLI(0x78, 12); FLI(0x78, 13); FLI(0x78, 14); FLI(0x78, 15); FLI(0x78, 16); FLI(0x78, 17);
+    FLI(0x78, 18); FLI(0x78, 19); FLI(0x78, 20); FLI(0x78, 21); FLI(0x78, 22); FLI(0x78, 23);
+    FLI(0x78, 24); FLI(0x78, 25); FLI(0x78, 26); FLI(0x78, 27); FLI(0x78, 28); FLI(0x78, 29);
+    FLI(0x78, 30); FLI(0x78, 31);
+    FLI(0x79, 0); FLI(0x79, 1); FLI(0x79, 7); FLI(0x79, 16); FLI(0x79, 29); FLI(0x79, 30);
+    FLI(0x79, 31);
+}
+
+/* Loads and stores keep or drop the upper half exactly as registers do. */
+static volatile ulong mem[4] = { 0x0123456789abcdeful, 0xfedcba9876543210ul, 0x3ff8000040490fdbul, 0 };
+static void __attribute__((noinline)) memops(ulong d) {
+    ulong r;
+    asm volatile("fmv.d.x ft3, %1\n\tflw ft3, 4(%2)\n\tfmv.x.d %0, ft3" : "=r"(r) : "r"(d), "r"(mem) : "ft3"); fold(r);
+    asm volatile("fmv.d.x ft3, %1\n\tfld ft3, 8(%2)\n\tfmv.x.d %0, ft3" : "=r"(r) : "r"(d), "r"(mem) : "ft3"); fold(r);
+    asm volatile("fmv.d.x ft3, %1\n\tflh ft3, 2(%2)\n\tfmv.x.d %0, ft3" : "=r"(r) : "r"(d), "r"(mem) : "ft3"); fold(r);
+    asm volatile("fmv.d.x ft3, %0\n\tfsw ft3, 24(%1)\n\tfsh ft3, 30(%1)\n\tfsd ft3, 16(%1)" :: "r"(d), "r"(mem) : "ft3", "memory");
+    fold(mem[2]); fold(mem[3]);
+}
+
+/* What the compiler makes of ordinary floating-point code. */
+static volatile double vd[8] = { 1.0, -2.5, 3.141592653589793, 1e-310, 1e300, 0.1, -0.0, 7.0 };
+static volatile float vf[8] = { 1.0f, -2.5f, 3.1415927f, 1e-40f, 1e30f, 0.1f, -0.0f, 7.0f };
+static void __attribute__((noinline)) compiled(void) {
+    double s = 0; float t = 0;
+    for (int i = 1; i < 2000; i++) { s += 1.0 / ((double)i * i); t += 1.0f / ((float)i * i); }
+    fold(*(ulong*)&s); fold(*(unsigned*)&t);
+    double x = 2.0; for (int i = 0; i < 30; i++) x = 0.5 * (x + 2.0 / x);
+    fold(*(ulong*)&x);
+    for (int i = 0; i < 8; i++) {
+        double a = vd[i], b = vd[(i + 3) & 7];
+        float c = vf[i], e = vf[(i + 5) & 7];
+        double m = a * b + vd[(i + 1) & 7];
+        float f = c * e - vf[(i + 2) & 7];
+        long l = (long)(a * 1e10); int w = (int)c; unsigned u = (unsigned)e;
+        fold(*(ulong*)&m); fold(*(unsigned*)&f); fold(l); fold(w); fold(u);
+        fold(a < b); fold(c <= e); fold(a == b);
+        double fa = __builtin_fabs(a); float ff = -c; float fc = (float)a; double fd = (double)e;
+        fold(*(ulong*)&fa); fold(*(unsigned*)&ff); fold(*(unsigned*)&fc); fold(*(ulong*)&fd);
+        double cs = __builtin_copysign(a, b); fold(*(ulong*)&cs);
+        double sq = __builtin_sqrt(a < 0 ? -a : a); fold(*(ulong*)&sq);
+        double fl = (double)(long)i / 3.0; fold(*(ulong*)&fl);
+    }
+}
+
+#define F(x) (0xffffffff00000000ul | (x))
+int main(void) {
+    static const ulong vals[] = {
+        /* doubles */
+        0, 0x8000000000000000ul, 0x3ff0000000000000ul, 0xbff0000000000000ul,
+        0x3ff8000000000000ul, 0xc004000000000000ul, 0x3fb999999999999aul, 0x7e37e43c8800759cul,
+        0x0000000000000001ul, 0x7feffffffffffffful, 0x7ff0000000000000ul,
+        0xfff0000000000000ul, 0x7ff0000000000123ul /* sNaN */,
+        /* boxed floats */
+        F(0), F(0x80000000), F(0x3f800000), F(0xbf800000), F(0x3fc00000), F(0xc0200000),
+        F(0x3dcccccd), F(0x7f7fffff), F(0x00000001), F(0x7f800000), F(0xff800000),
+        F(0x7f800123) /* sNaN */,
+        /* unboxed single-precision values */
+        0x123456783f800000ul, 0x00000000c0200000ul,
+    };
+    static const ulong quiet[] = {
+        0, 0x8000000000000000ul, 0x3ff0000000000000ul, 0xc004000000000000ul, 0x7ff0000000000000ul,
+        0x7ff8000000000123ul, F(0x3f800000), F(0x80000000), F(0xc0200000), F(0x7f800000),
+        F(0x7fc00123), 0x7feffffffffffffful, F(0x00000001),
+    };
+    static const ulong cvt[] = {
+        0x3fe0000000000000ul, 0xbfe0000000000000ul, 0x3ff8000000000000ul, 0xbff8000000000000ul,
+        0x4004000000000000ul, 0xc004000000000000ul, 0x41dfffffffe00000ul, 0xc1e0000000100000ul,
+        0x41e0000000000000ul, 0x41f0000000000000ul, 0x43e0000000000000ul, 0x43f0000000000000ul,
+        0xc3e0000000000000ul, 0x41efffffffff0000ul, 0x4415af1d78b58c40ul, 0x7ff8000000000000ul,
+        0x7ff0000000000001ul, 0xfff0000000000000ul, 0x0000000000000001ul, 0xc1f0000000000001ul,
+        F(0x3f000000), F(0xbf000000), F(0x3fc00000), F(0x40200000), F(0xc0200000),
+        F(0x4effffff), F(0x4f000000), F(0xcf000000), F(0x4f800000), F(0x5f000000),
+        F(0x5f800000), F(0xdf000000), F(0x7fc00000), F(0x7f800001), F(0xff800000),
+        F(0xffff3c00), F(0xffff7bff), F(0xffff0001), F(0xffffbc00), F(0xffff7c00), F(0xffff7e01),
+        F(0xffff7d00), 0x0000000000003c00ul, F(0x33800000), F(0x387fc000), F(0x47800000),
+    };
+    static const ulong ints[] = {
+        0, 1, -1ul, 0x1000001, 0x20000000000001ul, 0x7ffffffffffffffful, 0x8000000000000000ul,
+        0x7fffffff, 0x80000000, 0xffffffff, 0x123456789abcul, 0xfedcba9876543210ul, 0x3c00, 0xffff8001,
+    };
+    const ulong d = 0x5555555555555555ul;
+    const int nv = sizeof(vals) / sizeof(vals[0]), nq = sizeof(quiet) / sizeof(quiet[0]);
+    for (int i = 0; i < nv; i++)
+        for (int j = 0; j < nv; j++) bin(vals[i], vals[j], 0, d);
+    for (int i = 0; i < nq; i++)
+        for (int j = 0; j < nq; j++)
+            for (int k = 0; k < nq; k++) fused(quiet[i], quiet[j], quiet[k], d ^ i);
+    for (int i = 0; i < nv; i++) unary(vals[i], d);
+    for (int i = 0; i < (int)(sizeof(cvt) / sizeof(cvt[0])); i++) unary(cvt[i], d);
+    asm volatile("csrwi frm, 3");
+    for (int i = 0; i < (int)(sizeof(cvt) / sizeof(cvt[0])); i++) unary(cvt[i], ~d);
+    asm volatile("csrwi frm, 0");
+    for (int i = 0; i < (int)(sizeof(ints) / sizeof(ints[0])); i++) fromint(ints[i], d);
+    fli(d); fli(0);
+    n = 0; memops(d); memops(F(0x40490fdb)); compiled();
+    for (int i = 0; i < 60; i++) { puthex(h[i]); put("\n"); }
+    return 0;
+}
+void _start(void) { sys(93, main(), 0, 0); }
+"#;
+
+#[test]
+fn freestanding_float() {
+    if !have_tools() {
+        return;
+    }
+    for march in FP_MARCHES {
+        for opt in ["-O0", "-O2"] {
+            let out = diff(&build_freestanding(
+                FLOAT,
+                march,
+                &format!("{opt} {FP_ABI}"),
+            ));
+            assert_eq!(out.exit_code, Some(0), "{}", out.stdout);
+        }
+        let elf = build_freestanding(FLOAT, march, &format!("-O2 {FP_ABI}"));
+        for fuel in [1, 10, 100, 1000, 4321, 10_000, 54_321, 200_000] {
+            diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+        }
+    }
+}
+
+/// F/D edge cases: formats that don't exist, holes in the encoding space,
+/// `rd = x0`, and the fault data of a force-ended segment end (C++'s
+/// re-encoded bytecode operand for FLW/FLD/FSW/FSD/FADD..FDIV).
+const FLOAT_ASM_CASES: &[(&str, &str)] = &[
+    // FADD.H: the fast path takes the slow path, which has no H format.
+    (
+        "fadd_h_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 7, 0x04, ft0, ft1, ft2\n li a7, 93\n ecall",
+    ),
+    // FMADD.H: C++'s FMADD bytecode silently does nothing for H and Q...
+    (
+        "fmadd_h_is_a_nop",
+        "li a0, 4\n .insn r4 0x43, 7, 2, ft0, ft1, ft2, ft3\n li a7, 93\n ecall",
+    ),
+    // ...while FMSUB.H takes the slow path and faults.
+    (
+        "fmsub_h_illegal_operation",
+        "li a0, 4\n .insn r4 0x47, 7, 2, ft0, ft1, ft2, ft3\n li a7, 93\n ecall",
+    ),
+    (
+        "fnmadd_q_illegal_operation",
+        "li a0, 4\n .insn r4 0x4f, 7, 3, ft0, ft1, ft2, ft3\n li a7, 93\n ecall",
+    ),
+    (
+        "load_fp_funct3_0_illegal",
+        "li a0, 1\n .insn i 0x07, 0, ft0, 0(sp)\n li a7, 93\n ecall",
+    ),
+    (
+        "store_fp_funct3_4_illegal",
+        "li a0, 1\n .insn s 0x27, 4, ft0, 0(sp)\n li a7, 93\n ecall",
+    ),
+    (
+        "fpfunc_hole_unimplemented",
+        "li a0, 1\n .insn r 0x53, 0, 0x30, ft0, ft1, ft2\n li a7, 93\n ecall",
+    ),
+    (
+        "fmvp_d_x_unimplemented",
+        "li a0, 1\n .insn r 0x53, 0, 0x59, ft0, a1, a2\n li a7, 93\n ecall",
+    ),
+    (
+        "fsgnj_funct3_3_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 3, 0x10, ft0, ft1, ft2\n li a7, 93\n ecall",
+    ),
+    (
+        "fmin_funct3_4_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 4, 0x14, ft0, ft1, ft2\n li a7, 93\n ecall",
+    ),
+    (
+        "fcvt_s_d_wrong_source_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 0, 0x20, ft0, ft1, f0\n li a7, 93\n ecall",
+    ),
+    (
+        "fcvt_h_h_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 0, 0x44, ft0, ft1, f2\n li a7, 93\n ecall",
+    ),
+    (
+        "fcvt_w_s_bad_rs2_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 1, 0x60, a0, ft1, f4\n li a7, 93\n ecall",
+    ),
+    (
+        "fmv_x_q_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 0, 0x76, a0, ft1, f0\n li a7, 93\n ecall",
+    ),
+    (
+        "fli_h_illegal_operation",
+        "li a0, 1\n .insn r 0x53, 0, 0x7a, ft0, f3, f1\n li a7, 93\n ecall",
+    ),
+    // rd == x0: compares, conversions and moves to integer registers are
+    // NOPs.
+    (
+        "x0_not_written_by_fp",
+        "li a1, 0x3ff0000000000000\n fmv.d.x ft0, a1\n feq.d x0, ft0, ft0\n\
+         fcvt.l.d x0, ft0\n fmv.x.d x0, ft0\n fclass.d x0, ft0\n fleq.d x0, ft0, ft0\n\
+         fcvtmod.w.d x0, ft0, rtz\n add a0, x0, x0\n li a7, 93\n ecall",
+    ),
+    (
+        "fp_load_fault",
+        "li a0, 1\n li a1, 0\n flw ft0, 0(a1)\n li a7, 93\n ecall",
+    ),
+    (
+        "fp_store_fault",
+        "li a0, 1\n li a1, 0\n fsd ft0, 0(a1)\n li a7, 93\n ecall",
+    ),
+    ("fall_off_end_flw", "li a0, 3\n li a7, 93\n flw ft1, 12(a2)"),
+    ("fall_off_end_fld", "li a0, 3\n li a7, 93\n fld ft1, -8(a2)"),
+    ("fall_off_end_flh", "li a0, 3\n li a7, 93\n flh ft1, 6(a2)"),
+    ("fall_off_end_fsw", "li a0, 3\n li a7, 93\n fsw ft1, 12(a2)"),
+    (
+        "fall_off_end_fsd",
+        "li a0, 3\n li a7, 93\n fsd ft1, -40(a2)",
+    ),
+    (
+        "fall_off_end_fadd_s",
+        "li a0, 3\n li a7, 93\n fadd.s ft1, ft2, ft3",
+    ),
+    (
+        "fall_off_end_fdiv_d",
+        "li a0, 3\n li a7, 93\n fdiv.d ft4, ft2, ft3, rtz",
+    ),
+    (
+        "fall_off_end_fmadd_d",
+        "li a0, 3\n li a7, 93\n fmadd.d ft1, ft2, ft3, ft4",
+    ),
+    (
+        "fall_off_end_fsqrt_d",
+        "li a0, 3\n li a7, 93\n fsqrt.d ft1, ft2",
+    ),
+];
+
+#[test]
+fn freestanding_float_edge_cases() {
+    if !have_tools() {
+        return;
+    }
+    for march in FP_MARCHES {
+        for (name, body) in FLOAT_ASM_CASES {
+            eprintln!("difftest: {name} ({march})");
+            let escaped = body.replace('\n', "\\n");
+            let code = format!(".global _start\\n_start:\\n {escaped}\\n");
+            let src = format!("__asm__(\"{code}\");\n");
+            diff(&build_freestanding(&src, march, FP_ABI));
+        }
+    }
+}
+
 fn build_asm(body: &str, march: &str) -> PathBuf {
     let escaped = body.replace('\n', "\\n");
     let code = format!(".global _start\\n_start:\\n {escaped}\\n");

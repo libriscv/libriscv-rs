@@ -10,6 +10,8 @@
 #[cfg(feature = "ext-a")]
 pub(crate) mod rva;
 pub(crate) mod rvc;
+#[cfg(feature = "ext-f")]
+pub(crate) mod rvfd;
 pub(crate) mod rvi;
 
 use crate::error::Result;

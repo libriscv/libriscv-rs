@@ -13,7 +13,8 @@ ext-a = []
 ext-c = []
 ext-f = []
 ext-v = []
-# Software FCSR rounding-mode/flags emulation (C++: RISCV_FCSR).
+# Software FCSR rounding-mode/flags emulation (C++: RISCV_FCSR). Not ported
+# yet (C++ needs long double for it): enabling it is a compile error.
 fcsr = []
 # Extra runtime checks (C++: RISCV_DEBUG).
 debug-checks = []
