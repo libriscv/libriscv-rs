@@ -17,6 +17,8 @@
 use crate::decoder_cache::COMPRESSED;
 use crate::dispatch::{self, Handler};
 use crate::instruction::{CInstr, Instr, ci_code};
+#[cfg(feature = "ext-a")]
+use crate::isa::rva::*;
 use crate::isa::rvc::*;
 use crate::isa::rvi::*;
 use crate::isa::{InstrFn, Op};
@@ -35,6 +37,8 @@ pub(crate) const AUIPC: u32 = 0b001_0111;
 pub(crate) const FENCE: u32 = 0b000_1111;
 pub(crate) const OP_IMM32: u32 = 0b001_1011;
 pub(crate) const OP32: u32 = 0b011_1011;
+#[cfg(feature = "ext-a")]
+pub(crate) const ATOMIC: u32 = 0b010_1111;
 
 const CBO_FUNCT3: u32 = 0b010;
 
@@ -195,6 +199,12 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
                     _ => OpInfo::of::<Illegal>(),
                 };
             }
+            #[cfg(feature = "ext-a")]
+            ATOMIC => {
+                if let Some(info) = decode_atomic(i) {
+                    return info;
+                }
+            }
             _ => {}
         }
     }
@@ -209,6 +219,42 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
         return OpInfo::of::<Illegal>();
     }
     OpInfo::of::<Unimplemented>()
+}
+
+/// The `RV32A_ATOMIC` case of `instr_decoding.inc` (RV64). `None` (an
+/// unknown width or funct5) falls through to UNIMPLEMENTED.
+#[cfg(feature = "ext-a")]
+fn decode_atomic(i: Instr) -> Option<OpInfo> {
+    let a = i.atype();
+    let is_w = match a.funct3() {
+        AMOSIZE_W => true,
+        AMOSIZE_D => false,
+        _ => return None,
+    };
+    Some(match (a.funct5(), is_w) {
+        (0b00010, _) if a.rs2() == 0 => OpInfo::of::<LoadResv>(),
+        (0b00010, _) => OpInfo::of::<Illegal>(),
+        (0b00011, _) => OpInfo::of::<StoreCond>(),
+        (0b00000, true) => OpInfo::of::<AmoAddW>(),
+        (0b00001, true) => OpInfo::of::<AmoSwapW>(),
+        (0b00100, true) => OpInfo::of::<AmoXorW>(),
+        (0b01000, true) => OpInfo::of::<AmoOrW>(),
+        (0b01100, true) => OpInfo::of::<AmoAndW>(),
+        (0b10000, true) => OpInfo::of::<AmoMinW>(),
+        (0b10100, true) => OpInfo::of::<AmoMaxW>(),
+        (0b11000, true) => OpInfo::of::<AmoMinuW>(),
+        (0b11100, true) => OpInfo::of::<AmoMaxuW>(),
+        (0b00000, false) => OpInfo::of::<AmoAddD>(),
+        (0b00001, false) => OpInfo::of::<AmoSwapD>(),
+        (0b00100, false) => OpInfo::of::<AmoXorD>(),
+        (0b01000, false) => OpInfo::of::<AmoOrD>(),
+        (0b01100, false) => OpInfo::of::<AmoAndD>(),
+        (0b10000, false) => OpInfo::of::<AmoMinD>(),
+        (0b10100, false) => OpInfo::of::<AmoMaxD>(),
+        (0b11000, false) => OpInfo::of::<AmoMinuD>(),
+        (0b11100, false) => OpInfo::of::<AmoMaxuD>(),
+        _ => return None,
+    })
 }
 
 /// The compressed half of `instr_decoding.inc` (RV64). `None` falls through
@@ -761,7 +807,8 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
             }
             Some(dispatch::system)
         }
-        // FENCE, F/D, A, V and unknown opcodes (custom-handled)
+        // FENCE, F/D, A (always RV32I_BC_FUNCTION in C++), V and unknown
+        // opcodes (custom-handled)
         _ => function(),
     }
 }

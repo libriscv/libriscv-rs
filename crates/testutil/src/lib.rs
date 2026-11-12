@@ -26,6 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEFAULT_C_COMPILER: &str = "riscv64-linux-gnu-gcc-14";
 pub const DEFAULT_CXX_COMPILER: &str = "riscv64-linux-gnu-g++-14";
@@ -171,11 +172,18 @@ pub fn build(code: &str, args: &str, lang: Lang) -> Result<PathBuf, BuildError> 
         Lang::C => ("c", "-std=gnu11"),
         Lang::Cxx => ("cpp", "-std=gnu++17"),
     };
-    let src = dir.join(format!("{key}.{ext}"));
+    // Unique names per call: test threads in one process may build the same
+    // guest concurrently, so the source and output can't be shared. The ELF
+    // is renamed into place, so nobody sees a half-written one.
+    static BUILDS: AtomicU64 = AtomicU64::new(0);
+    let unique = format!(
+        "{}.{}",
+        std::process::id(),
+        BUILDS.fetch_add(1, Ordering::Relaxed)
+    );
+    let src = dir.join(format!("{key}.{unique}.{ext}"));
     std::fs::write(&src, code)?;
-    // Write to a temp name and rename, so concurrent test threads never see
-    // a half-written ELF.
-    let tmp = dir.join(format!("{key}.{}.tmp", std::process::id()));
+    let tmp = dir.join(format!("{key}.{unique}.tmp"));
 
     let mut cmd = Command::new(&cc);
     cmd.arg(std)
@@ -195,6 +203,7 @@ pub fn build(code: &str, args: &str, lang: Lang) -> Result<PathBuf, BuildError> 
         });
     }
     std::fs::rename(&tmp, &elf)?;
+    let _ = std::fs::remove_file(&src);
     Ok(elf)
 }
 

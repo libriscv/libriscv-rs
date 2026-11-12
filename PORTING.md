@@ -197,7 +197,7 @@ LCG loop, 206.8M instructions, same machine and date:
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load` |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
@@ -251,7 +251,9 @@ Expected until the listed phase:
   in the oracle; FENCE.I in a program faults (the stale segment can't be
   rebuilt without paging, as in C++ without paging). A machine created
   without a binary has usable memory here, which matches the oracle (C++
-  without paging has none).
+  without paging has none). Freestanding guests have no crt0 to set `gp`,
+  so with linker relaxation their globals land near address 0 or
+  `-2048`: build them with `-mno-relax`.
 - Arena allocation failure aborts the process (fallible zeroed allocation
   needs `unsafe`); C++ throws `OUT_OF_MEMORY`.
 
@@ -284,6 +286,9 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   illegal instruction. C.LD takes the slow path while C.LDSP has a bytecode.
 - The compressed slow path (`RV32C_BC_FUNCTION`) doesn't check for a stale
   segment afterwards, unlike the 4-byte one.
+- A misaligned SC fails (`rd = 1`) without faulting and, unlike an
+  aligned SC, keeps the reservation; a misaligned LR raises
+  `DEADLOCK_REACHED` with data 0.
 - Not reproduced: C++ registers an execute segment before decoding it and
   leaves it registered if decoding throws; here it's registered only when
   complete.
@@ -293,7 +298,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 - [x] C extension (`rvc.hpp`, `rvc_instr.cpp`), Zcb; FP register file (raw bits) for C.FLD/C.FSD
-- [ ] A extension (`rva.hpp`, `rva_instr.cpp`)
+- [x] A extension (`rva.hpp`, `rva_instr.cpp`)
 - [ ] F/D (+Zfh) (`rvfd.hpp`, `rvf_instr.cpp`, `fp16.hpp`)
 - [ ] Zba/Zbb/Zbc/Zbs/Zicond (in `rvi_instr.cpp`)
 - [ ] `setup_linux` stack/auxv/argv/env (`machine.cpp`, `util/auxvec.hpp`)
@@ -361,7 +366,7 @@ phase starts; names below are the intended targets.
 | `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMC + Zcb (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
 | `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1 | ✅ I + M (B-family cases: Phase 2) |
 | `rvc.hpp`, `rvc_instr.cpp` | `instruction.rs` (`CInstr`), `isa/rvc.rs` | 2 | ✅ RV64 C + Zcb |
-| `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | |
+| `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (copying the reservation on fork/deserialize: Phase 3) |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | |
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
 | `rvi_fuse.cpp` | `isa/fuse.rs` | 4 | |
@@ -388,5 +393,5 @@ phase starts; names below are the intended targets.
 | `util/crc32*.{hpp,cpp}` | `util/crc32.rs` | 3 | |
 | `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
-| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | freestanding guests (Linux setup: Phase 2) |
+| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | freestanding guests, incl. the main-thread exit of `setup_posix_threads` (Linux setup: Phase 2) |
 | `tr_*`, `asmjit/`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

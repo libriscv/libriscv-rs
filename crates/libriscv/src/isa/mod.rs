@@ -7,6 +7,8 @@
 //! (`dispatch::seq::<O>` etc.), so both interpreters share one definition of
 //! every instruction.
 
+#[cfg(feature = "ext-a")]
+pub(crate) mod rva;
 pub(crate) mod rvc;
 pub(crate) mod rvi;
 

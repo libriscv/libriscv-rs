@@ -245,6 +245,16 @@ const ASM_CASES: &[(&str, &str)] = &[
         "li a0, 1\n li a1, 2\n ld a0, 0(x0)\n li a7, 93\n ecall",
     ),
     ("ebreak", "li a0, 1\n ebreak\n li a7, 93\n ecall"),
+    // C++ rvlinux's exit (from setup_posix_threads) keeps only the low 32
+    // bits of the status, sign-extended.
+    (
+        "exit_code_truncated",
+        "li a0, 0x1fffffffb\n li a7, 93\n ecall",
+    ),
+    (
+        "exit_group_truncated",
+        "li a0, 0x100000007\n li a7, 94\n ecall",
+    ),
     ("jump_outside_code", "li a0, 1\n li t0, 0x12345678\n jr t0"),
     (
         "unimplemented_opcode",
@@ -400,6 +410,140 @@ const COMPRESSED_ASM_CASES: &[(&str, &str)] = &[
     ("c_fall_off_end_sub", "li a0, 2\n li a7, 93\n c.sub a0, a5"),
     ("c_fall_off_end_zcb", "li a0, 2\n li a7, 93\n .half 0x9d65"),
 ];
+
+/// A extension edge cases, assembled with and without the C extension.
+/// `t0` points at an aligned scratch doubleword on the stack, or at a
+/// global where the address is observable (the emulators' stacks differ).
+const ATOMIC_ASM_CASES: &[(&str, &str)] = &[
+    (
+        "amo_all",
+        "addi t0, sp, -64\n li t1, -5\n sd t1, 0(t0)\n li t2, 3\n li a0, 0\n\
+         amoadd.d a1, t2, (t0)\n xor a0, a0, a1\n amoswap.d a1, t2, (t0)\n add a0, a0, a1\n\
+         amoxor.w a1, t1, (t0)\n add a0, a0, a1\n amoor.d a1, t1, (t0)\n add a0, a0, a1\n\
+         amoand.w a1, t2, (t0)\n add a0, a0, a1\n amomin.d a1, t1, (t0)\n add a0, a0, a1\n\
+         amomax.w a1, t1, (t0)\n add a0, a0, a1\n amominu.w a1, t1, (t0)\n add a0, a0, a1\n\
+         amomaxu.d a1, t1, (t0)\n add a0, a0, a1\n ld a1, 0(t0)\n add a0, a0, a1\n\
+         li a2, 9\n amoadd.w a2, a2, (t0)\n add a0, a0, a2\n amoadd.d x0, t2, (t0)\n ld a1, 0(t0)\n\
+         add a0, a0, a1\n li a7, 93\n ecall",
+    ),
+    (
+        "lr_sc_pairing",
+        "addi t0, sp, -64\n li a0, 0\n sc.d a1, a0, (t0)\n add a0, a0, a1\n slli a0, a0, 1\n\
+         lr.d a1, (t0)\n sc.d a1, t0, (t0)\n add a0, a0, a1\n slli a0, a0, 1\n\
+         sc.d a1, t0, (t0)\n add a0, a0, a1\n slli a0, a0, 1\n\
+         lr.w a1, (t0)\n addi t1, t0, 8\n sc.w a1, t0, (t1)\n add a0, a0, a1\n slli a0, a0, 1\n\
+         sc.w a1, t0, (t0)\n add a0, a0, a1\n slli a0, a0, 1\n\
+         lr.d a1, (t0)\n sc.w a1, a0, (t0)\n add a0, a0, a1\n lw a1, 0(t0)\n add a0, a0, a1\n\
+         li a7, 93\n ecall",
+    ),
+    (
+        "sc_misaligned_keeps_reservation",
+        "addi t0, sp, -64\n lr.d a1, (t0)\n addi t1, t0, 4\n sc.d a2, a1, (t1)\n\
+         sc.d a3, a1, (t0)\n slli a0, a2, 1\n or a0, a0, a3\n li a7, 93\n ecall",
+    ),
+    (
+        "amo_misaligned_d",
+        "la t0, D\n addi t0, t0, 4\n li a0, 1\n amoadd.d a0, a1, (t0)\n li a7, 93\n ecall\n\
+         .data\n .align 3\n D: .dword 0, 0",
+    ),
+    (
+        "amo_misaligned_w",
+        "la t0, D\n addi t0, t0, 2\n li a0, 1\n amoswap.w a0, a1, (t0)\n li a7, 93\n ecall\n\
+         .data\n .align 3\n D: .dword 0, 0",
+    ),
+    (
+        "lr_misaligned",
+        "addi t0, sp, -60\n li a0, 1\n lr.d a0, (t0)\n li a7, 93\n ecall",
+    ),
+    (
+        "lr_rs2_nonzero",
+        "addi t0, sp, -64\n li a0, 1\n .insn r 0x2f, 3, 0x08, a0, t0, a1\n li a7, 93\n ecall",
+    ),
+    (
+        "amo_unknown_funct5",
+        "addi t0, sp, -64\n li a0, 1\n .insn r 0x2f, 3, 0x14, a0, t0, a1\n li a7, 93\n ecall",
+    ),
+    (
+        "amo_unknown_width",
+        "addi t0, sp, -64\n li a0, 1\n .insn r 0x2f, 1, 0x00, a0, t0, a1\n li a7, 93\n ecall",
+    ),
+    (
+        "fall_off_end_amo",
+        "addi t0, sp, -64\n li a0, 1\n li a7, 93\n amoadd.d a0, a1, (t0)",
+    ),
+];
+
+/// A extension through the compiler: fetch-ops, compare-and-swap loops
+/// (LR/SC) and a spinlock.
+const ATOMICS: &str = r#"
+static long sys(long n, long a) {
+    register long a0 asm("a0") = a; register long a7 asm("a7") = n;
+    asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return a0;
+}
+static long counter;
+static int small[8];
+static int lock;
+static unsigned long hash;
+static void spin_lock(int *l) { while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) {} }
+static void spin_unlock(int *l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
+int main(void) {
+    for (long i = 0; i < 2000; i++) {
+        long old = __atomic_fetch_add(&counter, i ^ 0x55, __ATOMIC_SEQ_CST);
+        __atomic_fetch_xor(&small[i & 7], (int)(old * 2654435761u), __ATOMIC_RELAXED);
+        __atomic_fetch_or(&small[(i + 3) & 7], 1 << (i & 31), __ATOMIC_RELAXED);
+        __atomic_fetch_and(&small[(i + 5) & 7], ~(1 << ((i * 7) & 31)), __ATOMIC_RELAXED);
+        int expected = small[i & 7];
+        __atomic_compare_exchange_n(&small[i & 7], &expected, expected + 1, 0,
+                                    __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        __atomic_fetch_sub(&small[(i + 1) & 7], (int)i - 1000, __ATOMIC_RELAXED);
+        /* min/max have no builtin: use the AMOs directly */
+        int v = (int)i - 1000, w = (int)(i * 977);
+        asm volatile("amomax.w zero, %1, (%0)" :: "r"(&small[(i + 2) & 7]), "r"(v) : "memory");
+        asm volatile("amominu.w zero, %1, (%0)" :: "r"(&small[(i + 4) & 7]), "r"(w) : "memory");
+        asm volatile("amomaxu.d zero, %1, (%0)" :: "r"(&counter), "r"((long)i) : "memory");
+        spin_lock(&lock);
+        hash = hash * 31 + (unsigned long)counter;
+        spin_unlock(&lock);
+    }
+    for (int i = 0; i < 8; i++) hash = hash * 131 + (unsigned)small[i];
+    return (int)(hash & 0x7f) ^ (int)((hash >> 7) & 0x7f);
+}
+void _start(void) { sys(93, main()); }
+"#;
+
+const ATOMIC_MARCHES: &[&str] = &["rv64ima_zicsr", "rv64imac_zcb_zicsr"];
+
+#[test]
+fn freestanding_atomics() {
+    if !have_tools() {
+        return;
+    }
+    for march in ATOMIC_MARCHES {
+        // -mno-relax: no crt0 sets up gp, and gp-relative globals would
+        // land outside the arena (the oracle's paging would map them).
+        for opt in ["-O0 -mno-relax", "-O2 -mno-relax"] {
+            diff(&build_freestanding(ATOMICS, march, opt));
+        }
+        let elf = build_freestanding(ATOMICS, march, "-O2 -mno-relax");
+        for fuel in [1, 10, 100, 1000, 4321, 10_000, 54_321] {
+            diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+        }
+    }
+}
+
+#[test]
+fn freestanding_atomic_edge_cases() {
+    if !have_tools() {
+        return;
+    }
+    for march in ATOMIC_MARCHES {
+        for (name, body) in ATOMIC_ASM_CASES {
+            eprintln!("difftest: {name} ({march})");
+            diff(&build_asm(body, march));
+        }
+    }
+}
 
 fn build_asm(body: &str, march: &str) -> PathBuf {
     let escaped = body.replace('\n', "\\n");

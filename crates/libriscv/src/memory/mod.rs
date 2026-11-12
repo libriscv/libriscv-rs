@@ -64,6 +64,10 @@ pub struct Memory {
     /// Further execute segments. Slots can be empty after an eviction, and
     /// count towards `MAX_EXECUTE_SEGS`, as in C++.
     exec: Vec<Option<Arc<DecodedSegment>>>,
+
+    /// The LR/SC reservation (C++ `Memory::m_atomics`).
+    #[cfg(feature = "ext-a")]
+    pub(crate) atomics: crate::isa::rva::AtomicMemory,
 }
 
 macro_rules! read_write {
@@ -97,6 +101,33 @@ macro_rules! read_write {
                 {
                     *b = value.to_le_bytes();
                     return Ok(());
+                }
+            }
+            Err(protection_fault(addr))
+        }
+    )*};
+}
+
+/// Read-modify-write of one aligned value (C++ `writable_read<T>` followed
+/// by the update): the address must be writable, even though it is also
+/// read.
+#[cfg(feature = "ext-a")]
+macro_rules! read_modify_write {
+    ($($rmw:ident, $t:ty;)*) => {$(
+        /// Apply `f` to the value at `addr` and return the old value; faults
+        /// outside the writable range.
+        #[inline(always)]
+        pub(crate) fn $rmw(&mut self, addr: u64, f: impl FnOnce($t) -> $t) -> Result<$t> {
+            const N: usize = size_of::<$t>();
+            if addr.wrapping_sub(self.initial_rodata_end) < self.write_boundary {
+                if let Some(b) = usize::try_from(addr)
+                    .ok()
+                    .and_then(|a| self.arena.get_mut(a..))
+                    .and_then(|s| s.first_chunk_mut::<N>())
+                {
+                    let old = <$t>::from_le_bytes(*b);
+                    *b = f(old).to_le_bytes();
+                    return Ok(old);
                 }
             }
             Err(protection_fault(addr))
@@ -160,6 +191,8 @@ impl Memory {
             binary,
             main_exec: None,
             exec: Vec::new(),
+            #[cfg(feature = "ext-a")]
+            atomics: Default::default(),
         };
         let mut first_segment = None;
         if !memory.binary.is_empty() {
@@ -173,6 +206,12 @@ impl Memory {
         read_u16, write_u16, u16;
         read_u32, write_u32, u32;
         read_u64, write_u64, u64;
+    }
+
+    #[cfg(feature = "ext-a")]
+    read_modify_write! {
+        rmw_u32, u32;
+        rmw_u64, u64;
     }
 
     /// Port of `Memory::memcpy` (flat arena): copy host data into the guest.

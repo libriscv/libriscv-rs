@@ -106,11 +106,19 @@ fn main() -> ExitCode {
     // exit_group, brk and stubs.
     let _ = &args.guest_args;
     machine.setup_minimal_syscalls();
-    machine.install_syscall_handler(94, |m| {
-        // exit_group
+    // C++ rvlinux installs `setup_posix_threads`, whose exit/exit_group
+    // replace the minimal ones: for the main thread they stop and then
+    // `set_result(uint32_t status)`, which sign-extends the low 32 bits of
+    // a0 into the reported exit code. TODO(phase 5): threads.
+    let exit = |m: &mut libriscv::Machine| {
+        let status = m.return_value() as u32;
         m.stop();
+        m.cpu
+            .set_reg(libriscv::registers::REG_ARG0, status as i32 as u64);
         Ok(())
-    });
+    };
+    machine.install_syscall_handler(93, exit);
+    machine.install_syscall_handler(94, exit);
 
     // `--fuel 0` means no limit, as in C++.
     let fuel = match args.fuel {
