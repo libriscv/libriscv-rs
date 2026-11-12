@@ -17,8 +17,22 @@ ext-v = []
 fcsr = []
 # Extra runtime checks (C++: RISCV_DEBUG).
 debug-checks = []
+# Cranelift JIT (the counterpart of C++'s asmjit backend). Compiled code is
+# placed in executable memory and entered by `libriscv-jit-rt`, the only crate
+# with unsafe code; this crate stays `forbid(unsafe_code)` either way. See
+# "JIT" in PORTING.md.
+jit = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-native",
+    "dep:libriscv-jit-rt",
+]
 
 [dependencies]
+cranelift-codegen = { version = "0.137.1", optional = true }
+cranelift-frontend = { version = "0.137.1", optional = true }
+cranelift-native = { version = "0.137.1", optional = true }
+libriscv-jit-rt = { workspace = true, optional = true }
 
 [dev-dependencies]
 testutil.workspace = true

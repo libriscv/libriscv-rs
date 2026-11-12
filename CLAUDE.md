@@ -18,7 +18,8 @@ plan and the C++ → Rust file mapping live there.
 cargo test                                   # all tests (tool-dependent tests skip if tools missing)
 LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skipping
 cargo test -- --ignored                      # include not-yet-enabled difftests
-cargo clippy --all-targets -- -D warnings    # must be clean
+cargo clippy --all-targets -- -D warnings    # must be clean (also with --features libriscv/jit,rvlinux/jit)
+cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
 cargo fmt --all
 scripts/difftest.sh prog.elf [args...]       # diff one ELF against the C++ emulator
 scripts/build-cpp-reference.sh               # C++ threaded/tailcall/switch builds -> target/cpp-ref/
@@ -33,7 +34,10 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 ## Rules
 
 - **No `unsafe`.** Enforced by `forbid(unsafe_code)`; never work around it
-  (no `allow`, no unsafe-using helper crates added to dodge it).
+  (no `allow`, no unsafe-using helper crates added to dodge it). The one
+  exception is `crates/libriscv-jit-rt`, the executable-memory runtime of the
+  optional `jit` feature: keep its unsafe surface minimal and documented,
+  and keep everything else (including `libriscv/src/jit/`) unsafe-free.
 - **Guest input must never panic the host.** Return `MachineError`. Use
   `get`/`get_mut`, checked/wrapping arithmetic and `try_into` on anything a
   guest controls. The clippy lints `indexing_slicing`, `unwrap_used`,
@@ -58,8 +62,9 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 - Update the checkboxes/status in `PORTING.md` in the same commit as the work.
 - No new runtime dependencies in `libriscv` without asking. Dev-dependencies
   are fine.
-- Out-of-scope C++ components (JIT, binary translation, asm dispatch, win32,
-  RV32, RV128, C API) are listed in `PORTING.md`; don't port them. The port
+- Out-of-scope C++ components (binary translation, libtcc, asmjit, asm
+  dispatch, win32, RV32, RV128, C API) are listed in `PORTING.md`; don't port
+  them. The JIT is Cranelift-based instead (see "JIT" in `PORTING.md`). The port
   is RV64 only: no width generics, no `W == 4` paths.
 - Where C++'s tailcall and threaded dispatchers disagree, follow the threaded
   one (`cpu_dispatch.cpp`): it's what the oracle runs. See "Dispatch" in

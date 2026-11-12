@@ -1,0 +1,33 @@
+[package]
+name = "libriscv-jit-rt"
+description = "Executable-memory runtime for the libriscv Cranelift JIT: the only crate in the workspace that contains unsafe code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+memmap2 = "0.9.11"
+
+# Not `workspace = true`: this crate is the one exception to the workspace's
+# `forbid(unsafe_code)`. It denies unsafe code instead, so each unsafe block
+# needs a local `#[allow]` and a `// SAFETY:` comment. Keep the rest of this
+# table in sync with `[workspace.lints]`.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+indexing_slicing = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"

@@ -14,6 +14,7 @@ struct CliArgs {
     verbose: bool,
     accurate: bool,
     silent: bool,
+    jit: bool,
     fuel: Option<u64>,
     memory_mib: Option<u64>,
     program: PathBuf,
@@ -30,6 +31,9 @@ fn usage(name: &str) {
     println!("  -f, --fuel amt     Set max instructions until program halts");
     println!("  -m, --memory amt   Set max memory size in MiB (default: 4000 MiB)");
     println!("  -n, --no-translate Accepted for compatibility (always interpreted)");
+    if cfg!(feature = "jit") {
+        println!("  -j, --jit          Compile to native code with the Cranelift JIT");
+    }
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -52,6 +56,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "-a" | "--accurate" => args.accurate = true,
             "-s" | "--silent" => args.silent = true,
             "-n" | "--no-translate" => {}
+            "-j" | "--jit" if cfg!(feature = "jit") => args.jit = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
@@ -92,6 +97,7 @@ fn main() -> ExitCode {
     let options = libriscv::MachineOptions {
         memory_max: args.memory_mib.map_or(DEFAULT_MEMORY, |m| m << 20),
         verbose_loader: args.verbose,
+        jit: args.jit,
         ..Default::default()
     };
     let mut machine = match libriscv::Machine::new(&binary, options) {

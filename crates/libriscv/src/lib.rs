@@ -22,7 +22,9 @@
 //!
 //! # Guarantees
 //!
-//! * No `unsafe` code (`#![forbid(unsafe_code)]`, enforced workspace-wide).
+//! * No `unsafe` code (`#![forbid(unsafe_code)]`). The optional `jit`
+//!   feature generates code here without `unsafe`; mapping it executable and
+//!   entering it is done by the separate `libriscv-jit-rt` crate.
 //! * Guest-controlled input must never panic the host: every guest fault is
 //!   reported as a [`MachineError`].
 //!
@@ -46,6 +48,8 @@ mod elf;
 mod error;
 pub mod instruction;
 mod isa;
+#[cfg(feature = "jit")]
+mod jit;
 mod machine;
 pub mod memory;
 mod options;

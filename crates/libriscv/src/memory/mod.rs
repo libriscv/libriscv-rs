@@ -65,6 +65,10 @@ pub struct Memory {
     /// count towards `MAX_EXECUTE_SEGS`, as in C++.
     exec: Vec<Option<Arc<DecodedSegment>>>,
 
+    /// Compile execute segments with the JIT (`MachineOptions::jit`).
+    #[cfg(feature = "jit")]
+    jit: bool,
+
     /// The LR/SC reservation (C++ `Memory::m_atomics`).
     #[cfg(feature = "ext-a")]
     pub(crate) atomics: crate::isa::rva::AtomicMemory,
@@ -191,6 +195,8 @@ impl Memory {
             binary,
             main_exec: None,
             exec: Vec::new(),
+            #[cfg(feature = "jit")]
+            jit: options.jit,
             #[cfg(feature = "ext-a")]
             atomics: Default::default(),
         };
@@ -308,6 +314,12 @@ impl Memory {
     pub const fn initial_rodata_end(&self) -> u64 {
         self.initial_rodata_end
     }
+    /// The whole arena including the padding page, for the JIT.
+    #[cfg(feature = "jit")]
+    pub(crate) fn arena_mut(&mut self) -> &mut [u8] {
+        &mut self.arena
+    }
+
     /// The ELF binary the machine was created from.
     pub fn binary(&self) -> &[u8] {
         &self.binary
@@ -345,7 +357,13 @@ impl Memory {
         vaddr: u64,
         execute_only: bool,
     ) -> Result<Arc<DecodedSegment>> {
-        let segment = Arc::new(DecodedSegment::new(code, vaddr, execute_only)?);
+        #[allow(unused_mut)]
+        let mut segment = DecodedSegment::new(code, vaddr, execute_only)?;
+        #[cfg(feature = "jit")]
+        if self.jit {
+            crate::jit::JitSegment::attach(&mut segment);
+        }
+        let segment = Arc::new(segment);
         // The first segment becomes the main one. (C++ takes the slot before
         // decoding, and leaves a half-decoded segment registered if decoding
         // throws. Here a segment is only registered once it's complete.)

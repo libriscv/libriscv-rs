@@ -84,6 +84,9 @@ pub struct DecodedSegment {
     pub(crate) cache: Box<[DecoderEntry]>,
     stale: AtomicBool,
     execute_only: bool,
+    /// Native code for this segment, if the JIT compiled it.
+    #[cfg(feature = "jit")]
+    pub(crate) jit: Option<crate::jit::JitSegment>,
 }
 
 impl DecodedSegment {
@@ -95,6 +98,8 @@ impl DecodedSegment {
             cache: Box::new([]),
             stale: AtomicBool::new(false),
             execute_only: false,
+            #[cfg(feature = "jit")]
+            jit: None,
         }
     }
 
@@ -123,6 +128,16 @@ impl DecodedSegment {
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
     }
+    /// Number of decoder entries that enter JIT-compiled code (0 without the
+    /// JIT, or if nothing in the segment could be compiled).
+    pub fn jit_entry_count(&self) -> usize {
+        #[cfg(feature = "jit")]
+        if let Some(jit) = &self.jit {
+            return jit.entry_count();
+        }
+        0
+    }
+
     /// Execute-only segments must never be rebuilt, so they never go stale.
     pub(crate) fn set_stale(&self, stale: bool) {
         self.stale
@@ -210,6 +225,8 @@ impl DecodedSegment {
             cache: vec![DecoderEntry::invalid(0); n_entries].into_boxed_slice(),
             stale: AtomicBool::new(false),
             execute_only,
+            #[cfg(feature = "jit")]
+            jit: None,
         };
         let dst = seg.decode_execute_range(vaddr, end);
         // The entry after the last instruction is invalid (already is, from

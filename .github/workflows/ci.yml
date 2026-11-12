@@ -20,6 +20,7 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features libriscv/jit,rvlinux/jit -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -67,6 +68,16 @@ jobs:
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
         run: cargo test -p libriscv --no-default-features
+
+      - name: Test with the JIT (difftests also run --jit)
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+          LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          LIBRISCV_REQUIRE_TOOLCHAIN: "1"
+        run: cargo test --workspace --features libriscv/jit,rvlinux/jit
+
+      - name: Test the JIT without the C extension
+        run: cargo test -p libriscv --no-default-features --features jit
 
   features:
     runs-on: ubuntu-24.04

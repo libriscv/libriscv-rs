@@ -21,19 +21,33 @@ fn rvlinux() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rvlinux"))
 }
 
-/// Run both emulators and compare everything that must match.
+/// Run both emulators and compare everything that must match. With the
+/// `jit` feature, the Rust emulator also runs with `--jit`, against the same
+/// reference.
 fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     let reference =
         testutil::run_reference_with(elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
-    let rust =
-        testutil::run_rust_with(rvlinux(), elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
-    let what = format!("{} {flags:?}", elf.display());
     assert!(
         reference.exit_code.is_some(),
-        "reference emulator failed for {what}:\n{}{}",
+        "reference emulator failed for {} {flags:?}:\n{}{}",
+        elf.display(),
         reference.stdout,
         reference.stderr
     );
+    compare(&reference, elf, flags, args);
+    if cfg!(feature = "jit") {
+        let mut jit_flags = flags.to_vec();
+        jit_flags.push("--jit");
+        compare(&reference, elf, &jit_flags, args);
+    }
+    reference
+}
+
+/// Run the Rust emulator with `flags` and compare it with `reference`.
+fn compare(reference: &RunOutput, elf: &Path, flags: &[&str], args: &[&str]) {
+    let rust =
+        testutil::run_rust_with(rvlinux(), elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
+    let what = format!("{} {flags:?}", elf.display());
     assert_eq!(
         rust.exit_code, reference.exit_code,
         "exit code differs for {what}"
@@ -61,7 +75,6 @@ fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
             );
         }
     }
-    reference
 }
 
 fn diff(elf: &Path) -> RunOutput {

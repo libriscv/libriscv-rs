@@ -109,3 +109,17 @@ fn execution_timeout() {
     assert!(err.is_timeout());
     assert_eq!(machine.instruction_counter(), 250_000);
 }
+
+#[test]
+fn jit_option_requires_the_feature() {
+    let options = MachineOptions {
+        jit: true,
+        ..options()
+    };
+    let result = Machine::new(&[], options);
+    if cfg!(feature = "jit") {
+        assert!(result.is_ok());
+    } else {
+        assert_eq!(result.unwrap_err().kind, ExceptionKind::FeatureDisabled);
+    }
+}

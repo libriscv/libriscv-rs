@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/libriscv", "crates/rvlinux", "crates/testutil"]
+members = ["crates/libriscv", "crates/libriscv-jit-rt", "crates/rvlinux", "crates/testutil"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,12 @@ repository = "https://github.com/libriscv/libriscv-rs"
 
 [workspace.dependencies]
 libriscv = { path = "crates/libriscv" }
+libriscv-jit-rt = { path = "crates/libriscv-jit-rt" }
 testutil = { path = "crates/testutil" }
 
-# The whole point of this port: no `unsafe` anywhere, in any crate.
+# The whole point of this port: no `unsafe` anywhere, in any crate, with one
+# exception: `libriscv-jit-rt`, which the optional `jit` feature pulls in, has
+# its own lint table (see its Cargo.toml and "JIT" in PORTING.md).
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

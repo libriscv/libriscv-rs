@@ -1,7 +1,8 @@
 //! Machine construction options — port of C++ `MachineOptions<W>` (common.hpp).
 //!
-//! Only interpreter-relevant options are carried over. Binary-translation,
-//! libtcc and asmjit options are intentionally absent (see PORTING.md, "Scope").
+//! Only interpreter-relevant options are carried over. Binary-translation
+//! and libtcc options are intentionally absent (see PORTING.md, "Scope");
+//! the asmjit ones are replaced by `jit` (the Cranelift JIT).
 //! Add fields here as the features they control get ported.
 
 /// Options passed when constructing a machine.
@@ -29,6 +30,11 @@ pub struct MachineOptions {
     pub use_memory_arena: bool,
     /// Preserve vector registers when copying register state.
     pub preserve_vector_registers: bool,
+    /// Compile execute segments to native code with the Cranelift JIT.
+    /// Requires the `jit` feature; without it, `Machine::new` fails with
+    /// `FEATURE_DISABLED`. On hosts the JIT doesn't support yet, segments
+    /// are silently interpreted.
+    pub jit: bool,
 }
 
 impl Default for MachineOptions {
@@ -45,6 +51,7 @@ impl Default for MachineOptions {
             minimal_fork: false,
             use_memory_arena: true,
             preserve_vector_registers: true,
+            jit: false,
         }
     }
 }

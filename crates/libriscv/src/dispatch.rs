@@ -526,6 +526,71 @@ pub(crate) fn execute_invalid(
     )
 }
 
+/// The handler of decoder entries that begin a JIT-compiled block (C++ patches
+/// the decoder entry with the asmjit function the same way). Only installed
+/// at block starts, which are only reached through `BEGIN_BLOCK`, so the
+/// counter already includes this block; native code counts it itself.
+#[cfg(feature = "jit")]
+pub(crate) fn jit_enter(
+    exec: &DecodedSegment,
+    i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+) -> Exit {
+    use crate::jit::JitExit;
+
+    let e = entry!(exec, i, m, pc);
+    let start = exec.address_of(i);
+    let Some(jit) = exec.jit.as_ref() else {
+        return bad_entry(m, start);
+    };
+    // A stale segment is left at the next slow-path instruction, which
+    // native code doesn't check for: interpret it instead. (Nothing native
+    // code runs can make the segment stale, so checking once is enough.)
+    if exec.is_stale() {
+        return match jit.original_handler(i) {
+            Some(handler) => become handler(exec, i, m, pc, c),
+            None => bad_entry(m, start),
+        };
+    }
+    let before = c.value.wrapping_sub(e.instruction_count());
+    match jit.run(m, i, start, before, c.max) {
+        JitExit::Halt { pc, counter } => halt(
+            m,
+            pc,
+            Counter {
+                value: counter,
+                max: c.max,
+            },
+        ),
+        JitExit::Jump { pc, counter } => begin_block!(
+            exec,
+            exec.index(pc),
+            m,
+            pc,
+            Counter {
+                value: counter,
+                max: c.max,
+            }
+        ),
+        JitExit::Indirect { pc, counter } => unchecked_jump!(
+            exec,
+            m,
+            pc,
+            Counter {
+                value: counter,
+                max: c.max,
+            }
+        ),
+        JitExit::Fault(err) => fault(m, err),
+        JitExit::Unavailable => match jit.original_handler(i) {
+            Some(handler) => become handler(exec, i, m, pc, c),
+            None => bad_entry(m, start),
+        },
+    }
+}
+
 /// Port of `CPU::simulate_undecoded`: execute directly (and slowly) from the
 /// segment's code until reaching a decoded entry. Uses the machine's
 /// counters.

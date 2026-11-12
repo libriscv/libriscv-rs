@@ -10,9 +10,12 @@ together.
 
 ## Goals
 
-1. **Safe:** `#![forbid(unsafe_code)]` in every crate. No exceptions inside this
-   workspace. Prefer zero runtime dependencies for `libriscv`. Nightly
-   *language features* are fine (see Toolchain); unsafe is not.
+1. **Safe:** `#![forbid(unsafe_code)]` in every crate, with one exception:
+   `libriscv-jit-rt`, the executable-memory runtime of the optional JIT (see
+   "JIT"). `libriscv` itself forbids unsafe code with or without the JIT.
+   Prefer zero runtime dependencies for `libriscv` (the `jit` feature adds
+   Cranelift). Nightly *language features* are fine (see Toolchain); unsafe
+   is not.
 2. **Host never panics on guest input.** Every guest fault is a `MachineError`.
    `clippy::{indexing_slicing, unwrap_used, expect_used, panic}` warn in
    non-test code to keep this honest.
@@ -40,7 +43,7 @@ GDB stub.
 |---|---|---|
 | Binary translation | `tr_*.cpp`, `tr_*.hpp` | Compiles C and `dlopen`s it |
 | libtcc JIT | `tr_tcc.cpp` | Same |
-| asmjit JIT | `asmjit/` | Emits and executes machine code |
+| asmjit JIT | `asmjit/` | Replaced by the Cranelift JIT (see "JIT"), not ported |
 | Assembly dispatch | `amd64/` | Hand-written asm |
 | Windows-specific shims | `win32/` | Revisit after Linux parity; most of it is replaced by `std` |
 | RV32 | `rv32i.cpp`, the `W == 4` paths everywhere | Not needed; dropped on 2026-11-12 to keep the port non-generic |
@@ -191,6 +194,77 @@ LCG loop, 206.8M instructions, same machine and date:
 | C++ tailcall | ~1080 | −2% |
 | Rust (release) | ~708 | −36% |
 
+## JIT
+
+The optional `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
+counterpart of C++'s asmjit backend, built on Cranelift instead of porting
+`asmjit/`. Code: `crates/libriscv/src/jit/` (`classify.rs`: instruction
+selection, `region.rs`: segment analysis and region formation, `emit.rs`:
+Cranelift IR, linking) and `crates/libriscv-jit-rt`.
+
+**Unsafe boundary.** Generating code needs no `unsafe`; mapping it executable
+and calling it does. That lives in `libriscv-jit-rt`, a ~200-line crate with
+its own lint table (`unsafe_code = "deny"`, every block documented): it
+copies the linked image into an `mmap` (`memmap2`), validates the entry
+table and the guest-memory windows against the real arena length, and
+enters code through one `transmute`d trampoline pointer. `libriscv` stays
+`forbid(unsafe_code)`. The generated code's own memory safety (the inlined
+arena bounds checks) is the trust boundary; the rt crate documents the
+contract the code generator must keep.
+
+**Design** (mirrors `aj_translate.cpp`/`aj_emit.cpp`):
+
+- Execute segments are compiled synchronously when created. Compilable
+  instructions are grouped into regions that grow along fall-through and
+  direct branches (loops stay inside), stopping at calls, indirect jumps,
+  uncompiled instructions and other regions. One Cranelift function per
+  region, `tail` calling convention, signature `(state, pc, counter)`.
+- Region-to-region transfers are native tail calls (`return_call`; indirect
+  jumps via the entry table and `return_call_indirect`), so calls, returns
+  and loops never go back through the interpreter, and the stack doesn't
+  grow.
+- Guest registers live in SSA variables, loaded on function entry and stored
+  on exit; arena loads/stores are inlined with `Memory`'s exact range checks.
+- Decoder entries at block starts that native code can be entered at get the
+  `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
+  Native code exits to the interpreter on anything it doesn't compile
+  (system calls, CSRs, atomics, F/D, FENCE.I, CBO, CLMUL, FUNCBLOCK
+  entries), on faults and at the instruction limit, with exactly the PC,
+  registers and counter the interpreter would have.
+- Instruction selection follows `decode::fast_handler`, not the precise
+  decoder, quirks included. `x0` is still read from the register file rather
+  than assumed zero.
+  Counting follows the dispatcher: block counts on block entry, checks at the
+  same block ends, and mid-block exits pre-subtract the target's count.
+- Stale segments are interpreted (native code doesn't check staleness after
+  slow-path instructions, and nothing it runs can make a segment stale).
+- x86-64 only for now: AArch64 needs an instruction-cache flush in the rt
+  crate. Cranelift's x64 tail calls need `preserve_frame_pointers`.
+
+**Testing.** The difftests run every guest a second time with `--jit` when
+`rvlinux` is built with the feature (`cargo test --workspace --features
+libriscv/jit,rvlinux/jit`). `crates/libriscv/tests/jit.rs` compares complete
+machine state (registers, PC, counter, memory, error) between JIT and
+interpreter for hand-written and random programs at ~50 instruction limits
+each; `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer sessions (400k
+programs clean on 2026-11-12).
+
+**Performance** (2026-11-12, freestanding CoreMark built from
+`../coremark/barebones`, 4000 iterations, `--accurate`, best of 3):
+
+| | rv64imc | rv64imc_zba_zbb_zbs |
+|---|---|---|
+| Rust interpreter | 2081 ms | 1866 ms |
+| Rust JIT | 252 ms | 246 ms |
+| C++ threaded | 1876 ms | 1792 ms |
+| C++ asmjit | 239 ms | 244 ms |
+
+Execution is within ~5% of asmjit, and the JIT's instruction counts are
+exact (asmjit's are off by a few). Cranelift compiles more slowly: compiling
+the segment up front takes ~60 ms of CoreMark's 0.34 s wall time (asmjit:
+0.26 s total). Next steps: background or lazy compilation, register passing
+across tail calls, F/D, AArch64.
+
 ## Testing
 
 | Layer | Where | What |
@@ -318,6 +392,8 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Instruction fusion (`rvi_fuse.cpp`)
 - [ ] Shared execute segments across machines (`decoded_exec_segment.hpp`, `shared_rodata.cpp`)
 - [ ] Bounds-check elimination audit (`cargo asm`)
+- [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMC, Zcb, B (no CLMUL), Zicond
+- [ ] JIT: background/lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`)
 
 ### Phase 5 — Remaining features
 
@@ -380,9 +456,10 @@ phase starts; names below are the intended targets.
 | `dyncall.hpp` | `dyncall.rs` | 5 | |
 | `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | |
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
+| `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
 | `util/auxvec.hpp` | `machine.rs` | 2 | |
 | `util/crc32*.{hpp,cpp}` | `util/crc32.rs` | 3 | |
 | `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
 | `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | freestanding guests, incl. the main-thread exit of `setup_posix_threads` (Linux setup: Phase 2) |
-| `tr_*`, `asmjit/`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |
+| `tr_*`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

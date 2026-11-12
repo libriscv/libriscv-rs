@@ -95,6 +95,13 @@ impl Machine {
     /// Create a machine and load `binary` (a 64-bit RISC-V ELF) into it.
     /// An empty `binary` creates a machine with empty memory and no code.
     pub fn new(binary: &[u8], options: MachineOptions) -> Result<Self> {
+        if options.jit && !cfg!(feature = "jit") {
+            return Err(MachineError::new(
+                ExceptionKind::FeatureDisabled,
+                "The JIT requires the `jit` feature",
+                0,
+            ));
+        }
         let (memory, first_segment) = Memory::new(Arc::from(binary), &options)?;
         let mut machine = Self {
             cpu: Cpu::new(),
