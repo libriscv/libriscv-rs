@@ -19,3 +19,7 @@ workspace = true
 
 [dev-dependencies]
 testutil.workspace = true
+
+[[bench]]
+name = "coremark"
+harness = false

@@ -9,6 +9,7 @@ plan and the C++ → Rust file mapping live there.
 - C++ reference source: `../libriscv` (or `$LIBRISCV_CPP`). Library code is in
   `../libriscv/lib/libriscv/`; `../libriscv/AGENTS.md` is its architecture guide.
 - C++ reference emulator (the test oracle): `../libriscv/emulator/rvlinux`.
+- CoreMark sources (difftest and benchmark): `../coremark` (or `$COREMARK_DIR`).
 - `crates/libriscv` — the library. `crates/rvlinux` — CLI. `crates/testutil` —
   guest cross-compilation and oracle helpers (test-only).
 
@@ -23,6 +24,7 @@ cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, 
 cargo fmt --all
 scripts/difftest.sh prog.elf [args...]       # diff one ELF against the C++ emulator
 scripts/build-cpp-reference.sh               # C++ threaded/tailcall/switch builds -> target/cpp-ref/
+cargo bench -p rvlinux --features jit --bench coremark   # CoreMark: Rust interpreter/JIT vs C++
 ```
 
 Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Don't bump it

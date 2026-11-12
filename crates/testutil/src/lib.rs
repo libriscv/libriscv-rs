@@ -97,6 +97,57 @@ pub fn cpp_source_dir() -> PathBuf {
         .unwrap_or_else(|| workspace_root().join("..").join("libriscv"))
 }
 
+/// Path to the CoreMark sources (`$COREMARK_DIR`, default `../coremark`),
+/// from <https://github.com/eembc/coremark>.
+pub fn coremark_dir() -> PathBuf {
+    std::env::var_os("COREMARK_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("..").join("coremark"))
+}
+
+/// Skip-or-fail helper for tests that need the CoreMark sources.
+pub fn need_coremark() -> bool {
+    let dir = coremark_dir();
+    tool_available(
+        &format!("CoreMark sources in {} (set $COREMARK_DIR)", dir.display()),
+        dir.join("core_main.c").exists(),
+    )
+}
+
+/// Build freestanding CoreMark (performance run parameters, `iterations`
+/// iterations) for `march` with our port (`guests/coremark`): output through
+/// the `write` system call, time from `rdinstret` (so the output is
+/// deterministic). ABIs with hardware floating point (`lp64d`) also print
+/// the floating-point statistics.
+pub fn build_coremark(march: &str, abi: &str, iterations: u32) -> Result<PathBuf, BuildError> {
+    let dir = coremark_dir();
+    let port = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("guests")
+        .join("coremark");
+    // The port is embedded so that changing it invalidates the cached ELF
+    // (core_portme.h is found through -I; it is part of the key as text).
+    let mut code = String::from(include_str!("../guests/coremark/core_portme.c"));
+    code.push_str("\n/* core_portme.h:\n");
+    code.push_str(&include_str!("../guests/coremark/core_portme.h").replace("*/", "* /"));
+    code.push_str("*/\n");
+    let sources = [
+        "core_list_join.c",
+        "core_main.c",
+        "core_matrix.c",
+        "core_state.c",
+        "core_util.c",
+    ]
+    .map(|file| dir.join(file));
+    let has_float = u8::from(abi.ends_with('d') || abi.ends_with('f'));
+    let args = format!(
+        "-march={march} -mabi={abi} -O2 -mno-relax -static -nostdlib -ffreestanding \
+         -I{} -I{} -DPERFORMANCE_RUN=1 -DITERATIONS={iterations} -DHAS_FLOAT={has_float}",
+        port.display(),
+        dir.display()
+    );
+    build_with_sources(&code, &sources, &args, Lang::C)
+}
+
 /// Prebuilt guest ELFs shipped with C++ libriscv (`tests/unit/elf`).
 pub fn cpp_fixture(name: &str) -> PathBuf {
     cpp_source_dir()
@@ -157,9 +208,20 @@ pub fn need_compiler() -> bool {
 /// Compile `code` with extra compiler `args` (whitespace-separated) and
 /// return the path to the cached ELF.
 pub fn build(code: &str, args: &str, lang: Lang) -> Result<PathBuf, BuildError> {
+    build_with_sources(code, &[], args, lang)
+}
+
+/// [`build`] with further source files compiled and linked along with
+/// `code`. The cache key covers their paths, not their contents.
+pub fn build_with_sources(
+    code: &str,
+    sources: &[PathBuf],
+    args: &str,
+    lang: Lang,
+) -> Result<PathBuf, BuildError> {
     let cc = compiler(lang);
     let mut h = DefaultHasher::new();
-    (code, args, lang, &cc).hash(&mut h);
+    (code, sources, args, lang, &cc).hash(&mut h);
     let key = format!("{:016x}", h.finish());
 
     let dir = target_dir().join("riscv-guests");
@@ -191,6 +253,7 @@ pub fn build(code: &str, args: &str, lang: Lang) -> Result<PathBuf, BuildError> 
         .arg(&tmp)
         .args(args.split_whitespace())
         .arg(&src)
+        .args(sources)
         .arg("-lm");
     let command = format!("{cmd:?}");
     let out = cmd

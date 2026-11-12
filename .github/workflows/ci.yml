@@ -10,6 +10,8 @@ env:
   # C++ libriscv commit used as the differential-testing oracle.
   # Keep in sync with PORTING.md.
   LIBRISCV_CPP_REF: 6b81381257f00826da357c40e7288a0e5e523274
+  # eembc/coremark commit for the CoreMark difftest and benchmark.
+  COREMARK_REF: eefc986ebd3452d6adde22eafaff3e5c859f29e4
 
 jobs:
   lint:
@@ -48,6 +50,12 @@ jobs:
           git -C libriscv-cpp fetch --depth 1 https://github.com/libriscv/libriscv.git "$LIBRISCV_CPP_REF"
           git -C libriscv-cpp checkout FETCH_HEAD
 
+      - name: Fetch CoreMark
+        run: |
+          git init coremark
+          git -C coremark fetch --depth 1 https://github.com/eembc/coremark.git "$COREMARK_REF"
+          git -C coremark checkout FETCH_HEAD
+
       - name: Build C++ reference emulator
         if: steps.cache-ref.outputs.cache-hit != 'true'
         run: |
@@ -59,6 +67,7 @@ jobs:
         env:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          COREMARK_DIR: ${{ github.workspace }}/coremark
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
         run: cargo test --workspace
 
@@ -66,6 +75,7 @@ jobs:
         env:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          COREMARK_DIR: ${{ github.workspace }}/coremark
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
         run: cargo test -p libriscv --no-default-features
 
@@ -73,6 +83,7 @@ jobs:
         env:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
           LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          COREMARK_DIR: ${{ github.workspace }}/coremark
           LIBRISCV_REQUIRE_TOOLCHAIN: "1"
         run: cargo test --workspace --features libriscv/jit,rvlinux/jit
 

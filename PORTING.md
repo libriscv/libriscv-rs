@@ -194,6 +194,26 @@ LCG loop, 206.8M instructions, same machine and date:
 | C++ tailcall | ~1080 | −2% |
 | Rust (release) | ~708 | −36% |
 
+CoreMark (`cargo bench -p rvlinux --features jit --bench coremark`):
+freestanding, built with our port (`crates/testutil/guests/coremark`, from
+`../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
+iterations, `-O2`, wall-clock time of the whole process, best of 3, on
+2026-11-12. All runs validate, and all exact-counting variants report the
+same instruction counts (1442120574 / 1442122541 / 1272208341):
+
+| | rv64imc | rv64imafdc | rv64imafdc_zba_zbb_zbs |
+|---|---|---|---|
+| Rust interpreter | 1967 ms | 2029 ms | 1838 ms |
+| Rust JIT (up front) | 297 ms | 299 ms | 302 ms |
+| Rust JIT (background) | 292 ms | 293 ms | 296 ms |
+| C++ threaded | 1831 ms | 1816 ms | 1770 ms |
+| C++ tailcall | 1999 ms | 1987 ms | 2004 ms |
+| C++ asmjit (up front) | 301 ms | 304 ms | 770 ms* |
+| C++ asmjit (background) | 291 ms | 294 ms | 725 ms* |
+
+\* The local `rvlinux-asmjit` binary predates the reference commit and
+doesn't compile Zba/Zbb/Zbs.
+
 ## JIT
 
 The optional `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
@@ -303,7 +323,7 @@ what native code would have.
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load` |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
@@ -430,7 +450,8 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 ### Phase 4 — Performance
 
-- [ ] Benchmark harness: coremark/dhrystone/STREAM vs `target/cpp-ref/{tailcall,threaded}`
+- [x] Benchmark harness: CoreMark (`crates/rvlinux/benches/coremark.rs`) vs the C++ reference, `target/cpp-ref/{threaded,tailcall}` and `rvlinux-asmjit`
+- [ ] Benchmark harness: dhrystone, STREAM
 - [ ] Specialised bytecodes (`decode_bytecodes.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`)
 - [ ] `extern "rust-preserve-none"` handlers; keep if faster
 - [ ] Instruction fusion (`rvi_fuse.cpp`)

@@ -1120,6 +1120,38 @@ fn freestanding_float_edge_cases() {
     }
 }
 
+/// The CoreMark variants: soft-float (no FP statistics) and with F/D, the
+/// latter with and without the bit-manipulation extensions.
+const COREMARK_MARCHES: &[(&str, &str)] = &[
+    ("rv64imc_zicsr", "lp64"),
+    ("rv64imafdc_zicsr", "lp64d"),
+    ("rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
+];
+
+/// CoreMark (`testutil::build_coremark`), a short run: its CRCs check the
+/// list, matrix and state kernels, and its clock is the instruction counter,
+/// so the whole output must match the oracle.
+///
+/// No `--fuel` runs: the "exit code" of a timeout is `a0`, which often holds
+/// a stack address in CoreMark, and the C++ `rvlinux` pushes argv/env/auxv
+/// on the stack even for freestanding guests (Phase 2, `setup_linux`).
+#[test]
+fn coremark() {
+    if !have_tools() || !testutil::need_coremark() {
+        return;
+    }
+    for &(march, abi) in COREMARK_MARCHES {
+        let elf = testutil::build_coremark(march, abi, 10).unwrap_or_else(|e| panic!("{e}"));
+        let out = diff(&elf);
+        assert!(
+            out.stdout.contains("Correct operation validated."),
+            "{march}: {}",
+            out.stdout
+        );
+        assert_eq!(out.exit_code, Some(0), "{march}: {}", out.stdout);
+    }
+}
+
 fn build_asm(body: &str, march: &str) -> PathBuf {
     let escaped = body.replace('\n', "\\n");
     let code = format!(".global _start\\n_start:\\n {escaped}\\n");
