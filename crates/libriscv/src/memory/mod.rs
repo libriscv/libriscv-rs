@@ -15,6 +15,10 @@
 //! (Phase 5); without it they are a no-op, as in C++.
 
 mod loader;
+mod mmap;
+
+pub(crate) use mmap::page_round_up;
+pub use mmap::{MEMSTRING_MAX, MmapCache, MmapRange, PageAttributes};
 
 use std::sync::Arc;
 
@@ -54,6 +58,8 @@ pub struct Memory {
     exit_address: u64,
     sigreturn_address: u64,
     mmap_address: u64,
+    /// Free ranges below `mmap_address` (C++ `m_mmap_cache`).
+    mmap_cache: MmapCache,
     heap_address: u64,
     brk_address: u64,
     is_dynamic: bool,
@@ -195,6 +201,7 @@ impl Memory {
             exit_address: 0,
             sigreturn_address: 0,
             mmap_address: 0,
+            mmap_cache: MmapCache::default(),
             heap_address: 0,
             brk_address: 0,
             is_dynamic: false,
@@ -332,6 +339,9 @@ impl Memory {
 
     /// The ELF binary the machine was created from.
     pub fn binary(&self) -> &[u8] {
+        &self.binary
+    }
+    pub(crate) const fn binary_arc(&self) -> &Arc<[u8]> {
         &self.binary
     }
 

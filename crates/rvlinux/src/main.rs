@@ -16,6 +16,9 @@ struct CliArgs {
     silent: bool,
     jit: bool,
     no_background: bool,
+    sandbox: bool,
+    proxy: bool,
+    allowed_files: Vec<String>,
     fuel: Option<u64>,
     memory_mib: Option<u64>,
     program: PathBuf,
@@ -32,6 +35,11 @@ fn usage(name: &str) {
     println!("  -f, --fuel amt     Set max instructions until program halts");
     println!("  -m, --memory amt   Set max memory size in MiB (default: 4000 MiB)");
     println!("  -n, --no-translate Accepted for compatibility (always interpreted)");
+    println!("  -S, --sandbox      Enable strict sandbox");
+    println!(
+        "  -P, --proxy        Enable proxy mode, allowing access to all files (disabling the sandbox)"
+    );
+    println!("  -A, --allow file   Allow file to be opened by the guest");
     if cfg!(feature = "jit") {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
         println!("  -B, --background   Compile in the background while interpreting (default)");
@@ -59,6 +67,12 @@ fn parse_args() -> Result<CliArgs, String> {
             "-a" | "--accurate" => args.accurate = true,
             "-s" | "--silent" => args.silent = true,
             "-n" | "--no-translate" => {}
+            "-S" | "--sandbox" => args.sandbox = true,
+            "-P" | "--proxy" => args.proxy = true,
+            "-A" | "--allow" => args.allowed_files.push(
+                it.next()
+                    .ok_or_else(|| "--allow requires a value".to_owned())?,
+            ),
             "-j" | "--jit" if cfg!(feature = "jit") => args.jit = true,
             "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
             "--no-background" if cfg!(feature = "jit") => args.no_background = true,
@@ -107,6 +121,16 @@ fn main() -> ExitCode {
         jit_background: !args.no_background,
         ..Default::default()
     };
+    if let Some(interp) = libriscv::elf_interpreter(&binary) {
+        // C++ runs the dynamic linker instead, which maps the program and
+        // its libraries at runtime: that needs virtual paging (Phase 5).
+        eprintln!(
+            "{}: dynamically linked executables are not supported yet \
+             (interpreter {interp}); link with -static",
+            args.program.display()
+        );
+        return ExitCode::FAILURE;
+    }
     let mut machine = match libriscv::Machine::new(&binary, options) {
         Ok(m) => m,
         Err(e) => {
@@ -114,24 +138,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // TODO(phase 2): setup_linux (argv/env/auxv on the stack) and the Linux
-    // system calls. Until then only freestanding guests run: write, exit,
-    // exit_group, brk and stubs.
-    let _ = &args.guest_args;
-    machine.setup_minimal_syscalls();
-    // C++ rvlinux installs `setup_posix_threads`, whose exit/exit_group
-    // replace the minimal ones: for the main thread they stop and then
-    // `set_result(uint32_t status)`, which sign-extends the low 32 bits of
-    // a0 into the reported exit code. TODO(phase 5): threads.
-    let exit = |m: &mut libriscv::Machine| {
-        let status = m.return_value() as u32;
-        m.stop();
-        m.cpu
-            .set_reg(libriscv::registers::REG_ARG0, status as i32 as u64);
-        Ok(())
-    };
-    machine.install_syscall_handler(93, exit);
-    machine.install_syscall_handler(94, exit);
+    if let Err(e) = setup_linux(&mut machine, &args) {
+        eprintln!("Exception: {e}");
+        return ExitCode::FAILURE;
+    }
 
     // `--fuel 0` means no limit, as in C++.
     let fuel = match args.fuel {
@@ -166,6 +176,7 @@ fn main() -> ExitCode {
                 libriscv::VECTOR_EXTENSION
             );
         }
+        run_sighandler(&mut machine, signal_for_exception(e.kind));
     }
     let runtime = t0.elapsed().as_secs_f64();
 
@@ -193,4 +204,167 @@ fn main() -> ExitCode {
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
     ExitCode::SUCCESS
+}
+
+/// The guest environment (as in C++).
+const GUEST_ENV: [&str; 3] = ["LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full"];
+
+/// Libraries the guest may open, from `/lib/riscv64-linux-gnu/` (C++
+/// `filter_open`; used by dynamic executables, which need paging first).
+const GUEST_LIBS: [&str; 9] = [
+    "libdl.so.2",
+    "libm.so.6",
+    "libgcc_s.so.1",
+    "libc.so.6",
+    "libatomic.so.1",
+    "libstdc++.so.6",
+    "libresolv.so.2",
+    "libnss_dns.so.2",
+    "libnss_files.so.2",
+];
+const SANDBOX_LIBDIR: &str = "/lib/riscv64-linux-gnu/";
+const REAL_LIBDIR: &str = "/usr/riscv64-linux-gnu/lib/";
+
+/// The Linux environment of the C++ emulator (`full_linux_guest`): initial
+/// stack with argv/env/auxv, Linux system calls with a sandboxed file
+/// system, and POSIX threads.
+fn setup_linux(machine: &mut libriscv::Machine, args: &CliArgs) -> libriscv::Result<()> {
+    let mut guest_args = vec![args.program.to_string_lossy().into_owned()];
+    guest_args.extend(args.guest_args.iter().cloned());
+    machine.setup_linux(&guest_args, &GUEST_ENV)?;
+    machine.setup_linux_syscalls(true, true);
+
+    let program = guest_args.first().cloned().unwrap_or_default();
+    let verbose = args.verbose;
+    let proxy = args.proxy;
+    let allowed = args.allowed_files.clone();
+    if let Some(fds) = machine.fds_mut() {
+        fds.permit_filesystem = !args.sandbox;
+        fds.permit_sockets = !args.sandbox;
+        if args.proxy {
+            if args.sandbox {
+                eprintln!("Warning: Proxy mode is enabled, but sandbox is also enabled");
+            }
+            fds.permit_filesystem = true;
+            fds.permit_sockets = true;
+            fds.proxy_mode = true;
+            if let Ok(cwd) = std::env::current_dir() {
+                fds.cwd = cwd.to_string_lossy().into_owned();
+            }
+        }
+        let cwd = fds.cwd.clone();
+        fds.filter_readlink = Some(Box::new(move |path: &mut String| {
+            if path == "/proc/self/exe" {
+                *path = format!("{cwd}/program");
+                return true;
+            }
+            if path == "/proc/self/fd/1" || path == "/proc/self/fd/2" {
+                return true;
+            }
+            eprintln!("Guest wanted to readlink: {path} (denied)");
+            false
+        }));
+        fds.filter_open = Some(Box::new(move |path: &mut String| {
+            const ALLOWED: [&str; 7] = [
+                "/etc/hostname",
+                "/etc/hosts",
+                "/etc/nsswitch.conf",
+                "/etc/host.conf",
+                "/etc/resolv.conf",
+                "/dev/urandom",
+                "/etc/ssl/certs/ca-certificates.crt",
+            ];
+            if ALLOWED.contains(&path.as_str()) {
+                return true;
+            }
+            if path == "/program" {
+                // The fake program path opens the real program
+                *path = program.clone();
+                return true;
+            }
+            if let Some(lib) = path.strip_prefix(SANDBOX_LIBDIR) {
+                if !GUEST_LIBS.contains(&lib) {
+                    if verbose {
+                        eprintln!("Guest wanted to open: {path} (denied)");
+                    }
+                    return false;
+                }
+                if verbose {
+                    eprintln!("Guest wanted to open: {path} (allowed)");
+                }
+                *path = format!("{REAL_LIBDIR}{lib}");
+                return true;
+            }
+            if proxy || allowed.iter().any(|a| a == path) {
+                return true;
+            }
+            if verbose {
+                eprintln!("Guest wanted to open: {path} (denied)");
+            }
+            false
+        }));
+    }
+    if args.proxy {
+        machine.set_stdin(|_, buf| {
+            use std::io::Read;
+            std::io::stdin()
+                .read(buf)
+                .map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX))
+        });
+    }
+    machine.setup_posix_threads();
+    Ok(())
+}
+
+/// The signal a machine exception corresponds to (C++ `signal_for_exception`).
+const fn signal_for_exception(kind: libriscv::ExceptionKind) -> i32 {
+    use libriscv::ExceptionKind as K;
+    match kind {
+        K::IllegalOpcode
+        | K::IllegalOperation
+        | K::UnimplementedInstruction
+        | K::UnimplementedInstructionLength
+        | K::MisalignedInstruction
+        | K::InvalidAlignment => 4, // SIGILL
+        _ => 11, // SIGSEGV
+    }
+}
+
+/// After a fault, give the guest's signal handler (or its SIGSEGV
+/// handler) a chance to run, for at most 60k instructions, as C++
+/// `run_sighandler` does. Its errors are ignored.
+fn run_sighandler(machine: &mut libriscv::Machine, signal: i32) {
+    use libriscv::registers::{REG_ARG0, REG_RA};
+    const SIGSEGV: i32 = 11;
+    let unset =
+        |m: &mut libriscv::Machine, sig: i32| m.sigaction(sig).map_or(true, |a| a.is_unset());
+    let mut signal = signal;
+    if unset(machine, signal) {
+        if signal == SIGSEGV || unset(machine, SIGSEGV) {
+            return;
+        }
+        let segv = machine.sigaction(SIGSEGV).map(|a| *a);
+        if let (Ok(segv), Ok(action)) = (segv, machine.sigaction(signal)) {
+            *action = segv;
+        }
+        signal = SIGSEGV;
+    }
+    let Ok(action) = machine.sigaction(signal) else {
+        return;
+    };
+    let handler = action.handler;
+    // Avoid re-triggering
+    action.handler = 0;
+    let ra = machine.cpu.reg(REG_RA);
+    if machine.stack_push(&ra.to_le_bytes()).is_ok() {
+        let pc = machine.cpu.pc();
+        machine.cpu.set_reg(REG_RA, pc);
+        machine.cpu.set_reg(REG_ARG0, signal as u64);
+        if machine.cpu.jump(handler).is_ok() {
+            let _ = machine.simulate(60_000);
+        }
+    }
+    if let Ok(action) = machine.sigaction(signal) {
+        action.handler = handler;
+    }
 }

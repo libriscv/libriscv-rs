@@ -148,6 +148,49 @@ pub fn build_coremark(march: &str, abi: &str, iterations: u32) -> Result<PathBuf
     build_with_sources(&code, &sources, &args, Lang::C)
 }
 
+/// Build CoreMark as a regular Linux executable: upstream's unmodified
+/// POSIX port (`posix/core_portme.c`) linked statically against glibc,
+/// performance run parameters, `iterations` iterations. Time comes from
+/// `clock()`, which is redirected to `rdinstret` so that the output (and
+/// the instruction count) is deterministic and can be compared with the
+/// C++ emulator; its "Iterations/Sec" is therefore not a speed.
+pub fn build_coremark_linux(
+    march: &str,
+    abi: &str,
+    iterations: u32,
+) -> Result<PathBuf, BuildError> {
+    let dir = coremark_dir();
+    let code = "#include <time.h>\n\
+        /* clock() for CoreMark: 4 ticks per retired instruction, at\n\
+           CLOCKS_PER_SEC (1 MHz): a nominal 250k instructions per\n\
+           second, so that short runs pass the \"at least 10 secs\"\n\
+           rule (10 iterations are ~14 seconds). */\n\
+        clock_t coremark_instret_clock(void) {\n\
+            unsigned long v;\n\
+            __asm__ volatile(\"rdinstret %0\" : \"=r\"(v));\n\
+            return (clock_t)(v * 4);\n\
+        }\n";
+    let sources = [
+        "core_list_join.c",
+        "core_main.c",
+        "core_matrix.c",
+        "core_state.c",
+        "core_util.c",
+        "posix/core_portme.c",
+    ]
+    .map(|file| dir.join(file));
+    let flags = format!("-march={march} -mabi={abi} -O2 -static");
+    let args = format!(
+        "{flags} -I{} -I{} -DPERFORMANCE_RUN=1 -DITERATIONS={iterations} \
+         -DSEED_METHOD=SEED_VOLATILE -DUSE_CLOCK=1 -Dclock=coremark_instret_clock \
+         -DFLAGS_STR=\"{}\"",
+        dir.join("posix").display(),
+        dir.display(),
+        flags.replace(' ', ","),
+    );
+    build_with_sources(code, &sources, &args, Lang::C)
+}
+
 /// Prebuilt guest ELFs shipped with C++ libriscv (`tests/unit/elf`).
 pub fn cpp_fixture(name: &str) -> PathBuf {
     cpp_source_dir()

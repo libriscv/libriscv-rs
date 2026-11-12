@@ -1,8 +1,4 @@
-//! Port of `tests/unit/basic.cpp` (the cases that don't need Linux).
-//!
-//! Not yet ported (need `setup_linux` and Linux system calls, Phase 2):
-//! "Verify program arguments and environment", "Catch output from write
-//! system call", "Calculate fib(50)", "Count using EBREAK".
+//! Port of `tests/unit/basic.cpp`.
 
 #![allow(
     clippy::panic,
@@ -122,4 +118,131 @@ fn jit_option_requires_the_feature() {
     } else {
         assert_eq!(result.unwrap_err().kind, ExceptionKind::FeatureDisabled);
     }
+}
+
+/// The environment the C++ tests give Linux guests.
+const ENV: [&str; 3] = ["LC_TYPE=C", "LC_ALL=C", "USER=root"];
+const MAX_INSTRUCTIONS: u64 = 10_000_000;
+
+/// Linux guests get the default memory size: the main stack is allocated
+/// above the 16 MiB of brk space, which is outside an 8 MiB flat arena.
+/// (The C++ tests use 8 MiB with virtual paging, Phase 5 here.)
+fn linux_options() -> MachineOptions {
+    MachineOptions::default()
+}
+
+#[test]
+fn verify_program_arguments_and_environment() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(
+        r#"
+        #include <string.h>
+        extern char* getenv(const char *);
+        int main(int argc, char** argv) {
+            if (strcmp(argv[0], "program") != 0)
+                return -1;
+            if (strcmp(argv[1], "this is a test") != 0)
+                return -1;
+            if (strcmp(getenv("SOMETHING"), "something") != 0)
+                return -1;
+            return 666;
+        }"#,
+        "-O2 -static",
+    );
+    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    machine.setup_linux_syscalls(true, true);
+    machine
+        .setup_linux(
+            &["program", "this is a test"],
+            &["LC_TYPE=C", "LC_ALL=C", "SOMETHING=something"],
+        )
+        .unwrap();
+    machine.simulate(MAX_INSTRUCTIONS).unwrap();
+    assert_eq!(machine.return_value() as i32, 666);
+}
+
+#[test]
+fn catch_output_from_write_system_call() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static HELLO: AtomicBool = AtomicBool::new(false);
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(
+        r#"
+        extern long write(int, const void*, unsigned long);
+        int main() {
+            write(1, "Hello World!", 12);
+            return 666;
+        }"#,
+        "-O2 -static",
+    );
+    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    machine.setup_linux_syscalls(false, false);
+    machine.setup_linux(&["basic"], &ENV).unwrap();
+    machine.set_printer(|_, data| HELLO.store(data == b"Hello World!", Ordering::Relaxed));
+    machine.simulate(MAX_INSTRUCTIONS).unwrap();
+    assert_eq!(machine.return_value() as i32, 666);
+    // The write system call forwarded exactly "Hello World!" to the printer.
+    assert!(HELLO.load(Ordering::Relaxed));
+}
+
+const FIB: &str = r#"
+    #include <stdlib.h>
+    long fib(long n, long acc, long prev)
+    {
+        EBREAK;
+        if (n < 1)
+            return acc;
+        else
+            return fib(n - 1, prev + acc, acc);
+    }
+    int main(int argc, char** argv) {
+        const long n = atoi(argv[1]);
+        return fib(n, 0, 1);
+    }"#;
+
+#[test]
+fn calculate_fib_50() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(&FIB.replace("EBREAK;", ""), "-O2 -static");
+    let mut machine = Machine::new(&binary, linux_options()).unwrap();
+    machine.setup_linux_syscalls(false, false);
+    machine.setup_linux(&["basic", "50"], &ENV).unwrap();
+    machine.simulate(MAX_INSTRUCTIONS).unwrap();
+    assert_eq!(machine.return_value() as i64, -298_632_863);
+}
+
+#[test]
+fn count_using_ebreak() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(
+        &FIB.replace("EBREAK;", "__asm__(\"ebreak\");"),
+        "-O2 -static",
+    );
+    let mut machine = Machine::new(&binary, MachineOptions::default()).unwrap();
+    machine.setup_linux_syscalls(false, false);
+    machine.setup_linux(&["basic", "50"], &ENV).unwrap();
+    // Count the EBREAKs, and stop at the 25th.
+    machine.install_syscall_handler(libriscv::SYSCALL_EBREAK_NR, |m| {
+        if COUNTER.fetch_add(1, Ordering::Relaxed) + 1 == 25 {
+            m.stop();
+        }
+        Ok(())
+    });
+    machine.simulate(u64::MAX).unwrap();
+    // EBREAK isn't a block end like ECALL, so in the threaded dispatcher
+    // (which the port follows) stopping only takes effect at the next
+    // check, and fib runs to the end. C++ accepts 51 (threaded) or 25
+    // (tail-call dispatch, which exits immediately).
+    assert_eq!(COUNTER.load(Ordering::Relaxed), 51);
+    assert_eq!(machine.return_value() as i64, -298_632_863);
 }

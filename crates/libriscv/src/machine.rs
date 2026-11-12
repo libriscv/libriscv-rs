@@ -9,9 +9,10 @@
 //!   [`Machine::simulate`] (timeout is an error) and
 //!   [`Machine::try_simulate`] (timeout returns `Ok(false)`).
 //!
-//! Not ported yet: Linux setup and argv (Phase 2), vmcall/preempt, typed
-//! `sysargs`, userdata, fork and serialization (Phase 3), threads and the
-//! native heap (Phase 5).
+//! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
+//! `signals.rs`. Not ported yet: vmcall/preempt, typed `sysargs`,
+//! userdata, fork and serialization (Phase 3) and the native heap
+//! (Phase 5).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -36,6 +37,9 @@ pub type UnhandledCsr = fn(&mut Machine, u32, u32, u32);
 pub type Printer = fn(&Machine, &[u8]);
 /// Produces the value of the TIME CSR (C++ `rdtime_func`).
 pub type Rdtime = fn(&Machine) -> u64;
+/// Reads guest standard input into the buffer and returns the number of
+/// bytes read (C++ `stdin_func`).
+pub type Stdin = fn(&Machine, &mut [u8]) -> i64;
 
 /// A RISC-V RV64 machine: CPU, memory and system call table.
 pub struct Machine {
@@ -49,8 +53,15 @@ pub struct Machine {
     on_unhandled_csr: UnhandledCsr,
     printer: Printer,
     rdtime: Rdtime,
-    epoch: Instant,
+    stdin: Stdin,
+    pub(crate) epoch: Instant,
     pub(crate) dispatch: DispatchState,
+    /// File descriptors, with `setup_linux_syscalls(true, ..)` (C++ `m_fds`).
+    pub(crate) fds: Option<Box<crate::syscalls::fds::FileDescriptors>>,
+    /// Threads, with `setup_posix_threads` (C++ `m_mt`).
+    pub(crate) mt: Option<Box<crate::threads::MultiThreading>>,
+    /// Signal handlers, created on first use (C++ `m_signals`).
+    pub(crate) signals: Option<Box<crate::signals::Signals>>,
 }
 
 impl core::fmt::Debug for Machine {
@@ -114,8 +125,12 @@ impl Machine {
             on_unhandled_csr: |_, _, _, _| {},
             printer: default_printer,
             rdtime: default_rdtime,
+            stdin: |_, _| 0,
             epoch: Instant::now(),
             dispatch: DispatchState::default(),
+            fds: None,
+            mt: None,
+            signals: None,
         };
         if let Some(segment) = first_segment {
             machine.cpu.exec = segment;
@@ -311,6 +326,16 @@ impl Machine {
     /// Set the source of the TIME CSR.
     pub const fn set_rdtime(&mut self, f: Rdtime) {
         self.rdtime = f;
+    }
+
+    /// Set where guest standard input comes from (C++ `set_stdin`). By
+    /// default the guest reads nothing.
+    pub const fn set_stdin(&mut self, f: Stdin) {
+        self.stdin = f;
+    }
+    /// Read guest standard input (C++ `stdin_read`).
+    pub fn stdin_read(&self, buf: &mut [u8]) -> i64 {
+        (self.stdin)(self, buf)
     }
 
     /// Send guest output to the printer.

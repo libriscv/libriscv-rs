@@ -2,9 +2,10 @@
 //! retired-instruction count and exception under the Rust `rvlinux` and the
 //! C++ reference emulator.
 //!
-//! Freestanding guests run for every ISA variant in [`MARCHES`] (only the
-//! minimal system calls exist so far). The Linux guests are ignored until
-//! the rest of Phase 2; run them with `cargo test -- --ignored`.
+//! Freestanding guests run for every ISA variant in [`MARCHES`]. Linux
+//! guests are static glibc executables (C and C++, with threads) and the
+//! prebuilt Rust, Go, Zig and newlib fixtures of C++ libriscv. Dynamic
+//! executables need virtual paging (Phase 5).
 
 #![allow(
     clippy::panic,
@@ -1132,9 +1133,6 @@ const COREMARK_MARCHES: &[(&str, &str)] = &[
 /// list, matrix and state kernels, and its clock is the instruction counter,
 /// so the whole output must match the oracle.
 ///
-/// No `--fuel` runs: the "exit code" of a timeout is `a0`, which often holds
-/// a stack address in CoreMark, and the C++ `rvlinux` pushes argv/env/auxv
-/// on the stack even for freestanding guests (Phase 2, `setup_linux`).
 #[test]
 fn coremark() {
     if !have_tools() || !testutil::need_coremark() {
@@ -1205,7 +1203,6 @@ fn freestanding_edge_case_timeouts() {
 }
 
 #[test]
-#[ignore = "phase 2: needs setup_linux and the Linux system calls"]
 fn hello_world_c() {
     if !have_tools() {
         return;
@@ -1221,7 +1218,6 @@ fn hello_world_c() {
 }
 
 #[test]
-#[ignore = "phase 2: needs setup_linux and the Linux system calls"]
 fn prebuilt_fixtures() {
     if !testutil::need_reference() {
         return;
@@ -1230,8 +1226,232 @@ fn prebuilt_fixtures() {
         "newlib-rv64gb-hello-world",
         "rust-riscv64-hello-world",
         "zig-riscv64-hello-world",
-        "golang-riscv64-hello-world",
     ] {
         diff(&testutil::cpp_fixture(name));
     }
+    // The Go runtime's scheduling depends on time: its instruction count
+    // varies from run to run, also under the oracle.
+    let go = testutil::cpp_fixture("golang-riscv64-hello-world");
+    let reference = testutil::run_reference(&go, &[]).unwrap_or_else(|e| panic!("{e}"));
+    let rust = testutil::run_rust(rvlinux(), &go, &[]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(rust.stdout, reference.stdout);
+    assert_eq!(rust.exit_code, reference.exit_code);
+    assert!(
+        reference.stdout.contains("hello world"),
+        "{}",
+        reference.stdout
+    );
+}
+
+/// The variants glibc CoreMark is built for: glibc itself is only
+/// installed for `lp64d` (and is built for RV64GC).
+const GLIBC_COREMARK_MARCHES: &[(&str, &str)] = &[
+    ("rv64imafdc_zicsr", "lp64d"),
+    ("rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
+];
+
+/// CoreMark as a regular Linux executable (`testutil::build_coremark_linux`:
+/// upstream's POSIX port, static glibc), a short run. Its clock is the
+/// instruction counter, so the whole output must match the oracle.
+#[test]
+fn coremark_glibc() {
+    if !have_tools() || !testutil::need_coremark() {
+        return;
+    }
+    for &(march, abi) in GLIBC_COREMARK_MARCHES {
+        let elf = testutil::build_coremark_linux(march, abi, 10).unwrap_or_else(|e| panic!("{e}"));
+        let out = diff(&elf);
+        assert!(
+            out.stdout.contains("Correct operation validated."),
+            "{march}: {}",
+            out.stdout
+        );
+        assert_eq!(out.exit_code, Some(0), "{march}: {}", out.stdout);
+    }
+}
+
+/// A glibc program exercising stdio, malloc (brk and mmap), qsort, strings
+/// and floating point.
+const GLIBC_PROGRAM: &str = r#"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int cmp(const void* a, const void* b) { return *(const int*)a - *(const int*)b; }
+int main(int argc, char** argv) {
+    printf("argc=%d argv[0]=%s argv[1]=%s\n", argc, argv[0], argc > 1 ? argv[1] : "-");
+    printf("env LC_ALL=%s\n", getenv("LC_ALL"));
+    int* v = malloc(1000 * sizeof(int));
+    for (int i = 0; i < 1000; i++) v[i] = (i * 7919) % 1000;
+    qsort(v, 1000, sizeof(int), cmp);
+    long sum = 0;
+    for (int i = 0; i < 1000; i++) sum += v[i] * (long)i;
+    printf("sorted sum=%ld\n", sum);
+    char* big = malloc(8 << 20);
+    memset(big, 'x', 8 << 20);
+    big[(8 << 20) - 1] = 0;
+    printf("strlen=%zu\n", strlen(big));
+    free(big);
+    free(v);
+    printf("sqrt(2)=%.12f sin(1)=%.12f\n", sqrt(2.0), sin(1.0));
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%08x|%-6s|%+.3e", 0xC0FFEE, "ab", 12345.678);
+    puts(buf);
+    fprintf(stderr, "to stderr\n");
+    return (int)(sum % 256);
+}
+"#;
+
+fn build_glibc(code: &str, lang: testutil::Lang) -> PathBuf {
+    testutil::build(code, "-O2 -static -pthread", lang).unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn glibc_program() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(GLIBC_PROGRAM, testutil::Lang::C);
+    let out = diff_with(&elf, &[], &["first"]);
+    assert!(out.stdout.contains("sorted sum="), "{}", out.stdout);
+}
+
+#[test]
+fn glibc_timeouts() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(GLIBC_PROGRAM, testutil::Lang::C);
+    for fuel in [1, 100, 1000, 5000, 20_000, 100_000, 250_000, 1_000_000] {
+        diff_with(&elf, &["--fuel", &fuel.to_string()], &["first"]);
+    }
+}
+
+/// `tests/unit/threads/test_threads.cpp` of C++ libriscv: pthreads,
+/// `sched_yield`, `pthread_join` and C++ `std::thread`.
+#[test]
+fn glibc_threads() {
+    if !have_tools() {
+        return;
+    }
+    let source = testutil::cpp_source_dir().join("tests/unit/threads/test_threads.cpp");
+    let code =
+        std::fs::read_to_string(&source).unwrap_or_else(|e| panic!("{}: {e}", source.display()));
+    let elf = build_glibc(&code, testutil::Lang::Cxx);
+    let out = diff(&elf);
+    assert_eq!(out.exit_code, Some(123_666_123), "{}", out.stdout);
+    for fuel in [10_000, 300_000, 1_000_000] {
+        diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+    }
+}
+
+/// Condition variables, mutexes and joins across eight threads.
+#[test]
+fn glibc_condvars() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(
+        r#"
+        #include <pthread.h>
+        #include <stdio.h>
+        static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+        static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+        static int ready = 0, sum = 0;
+        static void* worker(void* arg) {
+            pthread_mutex_lock(&mtx);
+            while (!ready) pthread_cond_wait(&cond, &mtx);
+            sum += (int)(long)arg;
+            printf("worker %ld\n", (long)arg);
+            pthread_mutex_unlock(&mtx);
+            return arg;
+        }
+        int main() {
+            pthread_t t[8];
+            for (long i = 0; i < 8; i++) pthread_create(&t[i], 0, worker, (void*)(i + 1));
+            pthread_mutex_lock(&mtx);
+            ready = 1;
+            pthread_cond_broadcast(&cond);
+            pthread_mutex_unlock(&mtx);
+            long total = 0;
+            for (int i = 0; i < 8; i++) { void* r; pthread_join(t[i], &r); total += (long)r; }
+            printf("sum=%d total=%ld\n", sum, total);
+            return sum;
+        }"#,
+        testutil::Lang::C,
+    );
+    let out = diff(&elf);
+    assert_eq!(out.exit_code, Some(36), "{}", out.stdout);
+}
+
+/// A C++ program: iostreams, exceptions, containers.
+#[test]
+fn glibc_cxx() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(
+        r#"
+        #include <iostream>
+        #include <map>
+        #include <stdexcept>
+        #include <string>
+        #include <vector>
+        int main(int argc, char** argv) {
+            std::map<std::string, int> m;
+            std::vector<std::string> words = {"one", "two", "three", "two", "one", "one"};
+            for (auto& w : words) m[w]++;
+            for (auto& [k, v] : m) std::cout << k << "=" << v << "\n";
+            try {
+                throw std::runtime_error("caught it");
+            } catch (const std::exception& e) {
+                std::cout << e.what() << std::endl;
+            }
+            return m["one"];
+        }"#,
+        testutil::Lang::Cxx,
+    );
+    let out = diff(&elf);
+    assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
+}
+
+/// abort(): SIGABRT through tgkill, without a handler.
+#[test]
+fn glibc_abort() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(
+        r#"
+        #include <stdio.h>
+        #include <stdlib.h>
+        int main() { printf("aborting\n"); fflush(stdout); abort(); }"#,
+        testutil::Lang::C,
+    );
+    diff(&elf);
+}
+
+/// A guest fault with a SIGSEGV handler installed: rvlinux runs the handler
+/// after the exception, like C++ `run_sighandler`. (An illegal instruction,
+/// which falls back to the SIGSEGV handler: the data of a protection fault
+/// differs from the paging oracle, see PORTING.md.)
+#[test]
+fn glibc_segfault_handler() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(
+        r#"
+        #include <signal.h>
+        #include <unistd.h>
+        static void handler(int sig) { write(1, "in handler\n", 11); _exit(sig); }
+        int main() {
+            signal(SIGSEGV, handler);
+            write(1, "faulting\n", 9);
+            __asm__ volatile(".word 0");
+            return 0;
+        }"#,
+        testutil::Lang::C,
+    );
+    diff(&elf);
 }

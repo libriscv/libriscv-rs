@@ -13,12 +13,16 @@
 //! (`$LIBRISCV_CPP_EMULATOR`), the dispatch variants from
 //! `scripts/build-cpp-reference.sh`, and `$LIBRISCV_CPP/emulator/rvlinux-asmjit`.
 //!
+//! Two builds of CoreMark: freestanding (our port in
+//! `crates/testutil/guests/coremark`, minimal system calls) and a regular
+//! Linux executable (upstream's POSIX port, static glibc:
+//! `testutil::build_coremark_linux`), which only exists for `lp64d`.
+//!
 //! Every run must print "Correct operation validated", and every variant
 //! that counts instructions exactly must report the same count (asmjit's
 //! counts are approximate and not compared). The guest's own timing is the
-//! instruction counter (see `crates/testutil/guests/coremark`), so its
-//! "Iterations/Sec" is not a speed; the score printed here is iterations per
-//! wall-clock second.
+//! instruction counter in both builds, so its "Iterations/Sec" is not a
+//! speed; the score printed here is iterations per wall-clock second.
 
 #![allow(
     clippy::panic,
@@ -33,11 +37,23 @@ use std::time::{Duration, Instant};
 
 use testutil::CppDispatch;
 
-const MARCHES: &[(&str, &str)] = &[
-    ("rv64imc_zicsr", "lp64"),
-    ("rv64imafdc_zicsr", "lp64d"),
-    ("rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
+/// The columns: `(glibc, march, abi)`.
+const BUILDS: &[(bool, &str, &str)] = &[
+    (false, "rv64imc_zicsr", "lp64"),
+    (false, "rv64imafdc_zicsr", "lp64d"),
+    (false, "rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
+    (true, "rv64imafdc_zicsr", "lp64d"),
+    (true, "rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
 ];
+
+fn column_name(glibc: bool, march: &str) -> String {
+    let march = march.trim_end_matches("_zicsr");
+    if glibc {
+        format!("glibc {march}")
+    } else {
+        march.to_owned()
+    }
+}
 
 struct Variant {
     name: String,
@@ -147,20 +163,25 @@ fn main() {
     let variants = variants();
     println!("CoreMark, {iterations} iterations, best of {runs} (wall-clock ms per process)\n");
     let mut header = format!("| {:<26} |", "");
-    for (march, _) in MARCHES {
-        header += &format!(" {:>28} |", march.trim_end_matches("_zicsr"));
+    for &(glibc, march, _) in BUILDS {
+        header += &format!(" {:>28} |", column_name(glibc, march));
     }
     println!("{header}");
     println!(
         "|{}|{}",
         "-".repeat(28),
-        format!("{}:|", "-".repeat(29)).repeat(MARCHES.len())
+        format!("{}:|", "-".repeat(29)).repeat(BUILDS.len())
     );
 
-    let elfs: Vec<PathBuf> = MARCHES
+    let elfs: Vec<PathBuf> = BUILDS
         .iter()
-        .map(|&(march, abi)| {
-            testutil::build_coremark(march, abi, iterations).unwrap_or_else(|e| panic!("{e}"))
+        .map(|&(glibc, march, abi)| {
+            let built = if glibc {
+                testutil::build_coremark_linux(march, abi, iterations)
+            } else {
+                testutil::build_coremark(march, abi, iterations)
+            };
+            built.unwrap_or_else(|e| panic!("{e}"))
         })
         .collect();
     let mut counts: Vec<Option<u64>> = vec![None; elfs.len()];
@@ -178,7 +199,7 @@ fn main() {
                         Some(expected),
                         "{}: instruction count differs on {}",
                         variant.name,
-                        MARCHES[col].0
+                        column_name(BUILDS[col].0, BUILDS[col].1)
                     );
                 }
             }

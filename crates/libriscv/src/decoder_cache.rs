@@ -190,6 +190,17 @@ impl DecodedSegment {
         usize::try_from(pc.wrapping_sub(self.begin).wrapping_add(4)).ok()
     }
 
+    /// The original code in `[lo, hi)`, if it is inside the segment
+    /// (C++ `exec_data(lo)`).
+    pub(crate) fn exec_bytes(&self, lo: u64, hi: u64) -> Option<&[u8]> {
+        if lo < self.begin || hi > self.end || lo > hi {
+            return None;
+        }
+        let a = self.data_offset(lo)?;
+        let b = self.data_offset(hi)?;
+        self.data.get(a..b)
+    }
+
     /// 16 bits of the original code at `pc` (C++ `*(uint16_t*)exec_data(pc)`).
     pub(crate) fn read_u16(&self, pc: u64) -> u16 {
         self.data_offset(pc)

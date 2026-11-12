@@ -20,6 +20,27 @@
 //! # }
 //! ```
 //!
+//! A regular (static) Linux executable, with the Linux system calls, the
+//! initial stack and threads, and read access to one file:
+//!
+//! ```no_run
+//! use libriscv::{Machine, MachineOptions};
+//!
+//! # fn main() -> libriscv::Result<()> {
+//! let binary = std::fs::read("program.elf").unwrap();
+//! let mut machine = Machine::new(&binary, MachineOptions::default())?;
+//! machine.setup_linux(&["program", "arg"], &["LC_ALL=C"])?;
+//! machine.setup_linux_syscalls(true, false);
+//! machine.setup_posix_threads();
+//! if let Some(fds) = machine.fds_mut() {
+//!     fds.permit_filesystem = true;
+//!     fds.filter_open = Some(Box::new(|path| path == "/etc/hostname"));
+//! }
+//! machine.simulate(1_000_000_000)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Guarantees
 //!
 //! * No `unsafe` code (`#![forbid(unsafe_code)]`). The optional `jit`
@@ -50,21 +71,31 @@ pub mod instruction;
 mod isa;
 #[cfg(feature = "jit")]
 mod jit;
+mod linux;
 mod machine;
 pub mod memory;
 mod options;
 pub mod registers;
+mod signals;
 mod syscalls;
 #[cfg(test)]
 mod tail_call_tests;
+mod threads;
 
 pub use cpu::Cpu;
 pub use decoder_cache::DecodedSegment;
+pub use elf::interpreter as elf_interpreter;
 pub use error::{ExceptionKind, MachineError, Result};
-pub use machine::{Machine, Printer, Rdtime, SyscallHandler, UnhandledCsr, UnhandledSyscall};
+pub use linux::auxv;
+pub use machine::{
+    Machine, Printer, Rdtime, Stdin, SyscallHandler, UnhandledCsr, UnhandledSyscall,
+};
 pub use memory::{Memory, PAGE_SIZE};
 pub use options::MachineOptions;
 pub use registers::Registers;
+pub use signals::{SignalAction, SignalPerThread, SignalStack, Signals};
+pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, StatFilter, Target};
+pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
 
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;

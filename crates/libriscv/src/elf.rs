@@ -311,3 +311,22 @@ pub(crate) fn symbol_at(bin: &[u8], symtab: &SectionHeader, idx: u64) -> Result<
     }
     symbol(bin, symtab.sh_offset + idx * SYM_SIZE as u64)
 }
+/// The program interpreter (`PT_INTERP`) of an executable, if it has one:
+/// dynamically linked executables are run by their interpreter (C++
+/// `Elf::is_dynamic`, which also returns the interpreter). `None` for
+/// static (and static-pie) executables and for anything unparsable.
+pub fn interpreter(bin: &[u8]) -> Option<String> {
+    const PT_INTERP: u32 = 3;
+    let hdr = header(bin).ok()?;
+    (0..u64::from(hdr.e_phnum)).find_map(|i| {
+        let ph = program_header(bin, hdr.e_phoff.checked_add(i * 56)?).ok()?;
+        if ph.p_type != PT_INTERP {
+            return None;
+        }
+        let start = usize::try_from(ph.p_offset).ok()?;
+        let end = start.checked_add(usize::try_from(ph.p_filesz).ok()?)?;
+        let raw = bin.get(start..end)?;
+        let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        Some(String::from_utf8_lossy(raw.get(..len)?).into_owned())
+    })
+}

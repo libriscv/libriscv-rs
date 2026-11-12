@@ -214,6 +214,25 @@ same instruction counts (1442120574 / 1442122541 / 1272208341):
 \* The local `rvlinux-asmjit` binary predates the reference commit and
 doesn't compile Zba/Zbb/Zbs.
 
+CoreMark as a regular Linux executable (`testutil::build_coremark_linux`:
+upstream's POSIX port, static glibc, `lp64d` only; `clock()` is
+`rdinstret` so the output is deterministic), same settings and date. All
+exact-counting variants report 1435905543 / 1266007356 instructions:
+
+| | glibc rv64imafdc | glibc rv64imafdc_zba_zbb_zbs |
+|---|---|---|
+| Rust interpreter | 2056 ms | 1854 ms |
+| Rust JIT (up front) | 2120 ms | 2109 ms |
+| Rust JIT (background) | 1920 ms | 1850 ms |
+| C++ threaded | 1874 ms | 1804 ms |
+| C++ tailcall | 1996 ms | 1956 ms |
+| C++ asmjit (up front) | 1646 ms | 2116 ms |
+| C++ asmjit (background) | 1638 ms | 2106 ms |
+
+The JITs don't pay off here: the executable segment holds all of libc
+(460 KB), and compiling it takes ~1.9 s with Cranelift, after which
+CoreMark runs in ~260 ms. Lazy compilation (see Phase 4) is what fixes this.
+
 ## JIT
 
 The optional `jit` feature (`MachineOptions::jit`, `rvlinux --jit`) is the
@@ -322,8 +341,8 @@ what native code would have.
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load` |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts), the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
@@ -388,6 +407,43 @@ Expected until the listed phase:
 - Arena allocation failure aborts the process (fallible zeroed allocation
   needs `unsafe`); C++ throws `OUT_OF_MEMORY`.
 
+### Linux system calls
+
+`syscalls/linux/` follows `linux/system_calls.cpp`, with the host reached
+only through `std` (no raw file descriptors, no `libc`). Where C++ hands
+the guest raw host access, the port is deliberately stricter:
+
+- `ioctl` never reaches the host (C++ forwards terminal requests in proxy
+  mode): `ENOSYS`, or `EPERM` from `filter_ioctl`. `fcntl` is emulated
+  (`F_GETFD`/`F_SETFD`/`F_GETFL`/`F_SETFL`/`F_DUPFD*`) instead of being
+  forwarded with guest arguments.
+- `openat` refuses write access (`O_WRONLY`/`O_RDWR`/`O_CREAT`/`O_TRUNC`/
+  `O_APPEND`) outside proxy mode with `EACCES`; C++ opens (creating or
+  truncating the host file) and only refuses the writes.
+- Host paths are only looked up through the filters: `fstatat` with a path
+  needs `filter_stat` (or `filter_open` without rewriting), `faccessat`
+  needs `filter_open`, `readlinkat` needs `filter_readlink`; without them
+  only proxy mode allows it. C++ goes to the host when no filter is set.
+- `dup` returns a virtual descriptor (C++: a host number the guest can't
+  use), `dup3` can't replace descriptors (`EPERM`), `pipe2` and
+  `getdents64` are `ENOSYS` (a pipe nobody reads would block the host),
+  reading fds 1/2 is `EBADF`, and the guest can have at most 1024 files
+  open (`EMFILE`).
+- `ppoll` answers from the descriptor table (stdin readable, stdout/stderr
+  writable, files both, unknown `POLLNVAL`) instead of polling host fds,
+  and never waits.
+- `getrusage` is always the deterministic answer; time is `SystemTime` and
+  monotonic clocks count from machine creation (C++: host uptime).
+- `getcwd` checks the buffer size (`ERANGE`); `readlinkat` truncates to
+  the buffer.
+- Anonymous `mmap` and `madvise(DONTNEED)` zero memory without committing
+  never-touched pages (C++ uses `madvise`).
+
+Without paging, a Linux guest needs `memory_max` large enough for the main
+stack (above the 16 MiB of brk space; the C++ tests use 8 MiB with
+paging), `mprotect` is a no-op, `ru_maxrss` is 0, and fixed mappings must
+lie inside the arena (the paging oracle creates pages anywhere).
+
 ### Known C++ quirks kept for parity
 
 Bugs or oddities in C++ that the port reproduces on purpose:
@@ -421,6 +477,25 @@ Bugs or oddities in C++ that the port reproduces on purpose:
 - Not reproduced: C++ registers an execute segment before decoding it and
   leaves it registered if decoding throws; here it's registered only when
   complete.
+- `clone` reads `ptid`/`tls`/`ctid` from `a4`-`a6`, where glibc's wrapper
+  leaves them (the kernel ABI has them in `a2`-`a4`); `set_tid_address`
+  truncates the address to an `int`.
+- A futex wait that would deadlock (no other runnable thread) writes 8
+  zero bytes at the futex address and returns 0. When the running thread
+  exits or blocks and nothing is suspended, the main thread is resumed
+  even if it's blocked. Exiting threads clear their TID word but don't wake
+  futex waiters; futex timeouts are ignored.
+- `getrandom` of more than 256 bytes returns -1 (not an errno) and charges
+  20k instructions per byte; `uname` says "RISC-V C++ Emulator";
+  `readlinkat` with a buffer over 1024 bytes is `ENOMEM`; `nanosleep`
+  writes the clamped request back; `sigaction` reports an unset handler as
+  `~0xF`.
+- EBREAK isn't a block end, so a handler's `stop()` only takes effect at
+  the next check (C++ `basic.cpp` accepts both 51 and 25 EBREAKs).
+- Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
+  killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
+  scheduler lists, here the thread is removed from them; a signal number
+  above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
 
 ### Phase 2 — Linux userspace parity
 
@@ -430,12 +505,14 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] A extension (`rva.hpp`, `rva_instr.cpp`)
 - [x] F/D, Zfhmin, Zfa (`rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp`), C++'s default (non-FCSR) semantics. FCSR emulation (`fcsr` feature) not ported: C++ computes exact results in `long double`; enabling the feature is a compile error until it is
 - [x] Zba/Zbb/Zbc/Zbs/Zicond and the RV64 part of Zbkb (in `rvi_instr.cpp`)
-- [ ] `setup_linux` stack/auxv/argv/env (`machine.cpp`, `util/auxvec.hpp`)
-- [ ] mmap/brk allocator (`memory_mmap.cpp`, `mmap_cache.hpp`)
-- [ ] Linux syscalls incl. sandboxed fd table (`linux/system_calls.cpp`, `linux/syscalls_*.cpp`, `posix/filedesc.hpp`)
-- [ ] newlib and minimal syscalls (`posix/minimal.cpp`, `machine_defaults.cpp`)
-- [ ] Signals (`posix/signals.cpp`)
-- [ ] `rvlinux` parity for the flags above; un-ignore difftests
+- [x] `setup_linux` stack/auxv/argv/env, `setup_argv`, `stack_push` (`machine.cpp`, `util/auxvec.hpp`)
+- [x] mmap/brk allocator (`memory_mmap.cpp`, `mmap_cache.hpp`), flat-arena `memdiscard`
+- [x] Linux syscalls incl. sandboxed fd table (`linux/system_calls.cpp`, `linux/syscalls_{mman,poll,select}.cpp`, `posix/filedesc.hpp`); see "Linux system calls" below. epoll/eventfd/sockets: Phase 5
+- [x] newlib and minimal syscalls (`posix/minimal.cpp`, `machine_defaults.cpp`)
+- [x] Signals (`posix/signals.cpp`): sigaction, sigaltstack, tkill/tgkill delivery, rt_sigreturn
+- [x] POSIX threads (`threads.hpp`, `posix/threads.cpp`): clone/clone3, futex, sched_yield, exit; moved up from Phase 5
+- [x] `rvlinux` parity: `setup_linux` + Linux syscalls + threads for every guest, `--sandbox`/`--proxy`/`--allow`, the C++ open/readlink filters, `run_sighandler` after a fault; Linux difftests enabled
+- [ ] Dynamic executables (`rvlinux` loads the interpreter): need virtual paging for code mapped at runtime (Phase 5); `rvlinux` refuses them
 
 ### Phase 3 — Embedding API
 
@@ -464,7 +541,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 ### Phase 5 — Remaining features
 
 - [ ] V extension (`rvv.hpp`, `rvv_instr.cpp`, `rvv_registers.hpp`)
-- [ ] POSIX threads / native threads (`threads.hpp`, `posix/threads.cpp`, `native_threads.cpp`)
+- [ ] Native threads (`native_threads.cpp`); POSIX threads are done (Phase 2)
 - [ ] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`)
 - [ ] Guest datatypes (`guest/`, `guest_datatypes.hpp`)
 - [ ] Dynamic calls (`dyncall.hpp`)
@@ -488,7 +565,7 @@ phase starts; names below are the intended targets.
 | `rv32i_instr.hpp` | `instruction.rs` | 0 | ✅ |
 | `elf.hpp`, `memory_elf.cpp` | `elf.rs`, `memory/loader.rs` | 1 | ✅ (symbol listing/lookup for backtraces: Phase 3) |
 | `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp`, `page.hpp` | `memory/` | 1 | ✅ flat arena (`page.hpp`: Phase 5) |
-| `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | |
+| `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | ✅ (+ flat-arena `memdiscard`, `memstring`, `flush_execute_segments`) |
 | `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
@@ -509,11 +586,11 @@ phase starts; names below are the intended targets.
 | `decode_bytecodes.cpp`, `bytecode_*.cpp`, `threaded_bytecodes.hpp`, `threaded_bytecode_array.hpp`, `threaded_rewriter.cpp` | `decoder_cache/bytecodes.rs` | 4 | |
 | `shared_rodata.*` | `memory/shared.rs` | 4 | |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |
-| `linux/system_calls.cpp`, `linux/syscalls_*.cpp` | `syscalls/linux/` | 2, 5 | |
-| `posix/filedesc.hpp` | `syscalls/fds.rs` | 2 | |
-| `posix/signals.*` | `signals.rs` | 2 | |
+| `linux/system_calls.cpp`, `linux/syscalls_*.cpp` | `syscalls/linux/` | 2, 5 | ✅ incl. mman, poll, select (epoll, eventfd: Phase 5) |
+| `posix/filedesc.hpp` | `syscalls/fds.rs` | 2 | ✅ (`std::fs::File`s, no raw fds) |
+| `posix/signals.*` | `signals.rs` | 2 | ✅ |
 | `posix/socket_calls.cpp` | `syscalls/socket.rs` | 5 | |
-| `posix/threads.cpp`, `threads.hpp`, `native_threads.cpp` | `threads.rs` | 5 | |
+| `posix/threads.cpp`, `threads.hpp`, `native_threads.cpp` | `threads.rs` | 2, 5 | ✅ POSIX threads (native threads: Phase 5) |
 | `native_heap.hpp`, `native_libc.cpp` | `native/` | 5 | |
 | `serialize.cpp` | `serialize.rs` | 3 | |
 | `debug.*` | `debug.rs` | 5 | |
@@ -523,9 +600,9 @@ phase starts; names below are the intended targets.
 | `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | |
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
-| `util/auxvec.hpp` | `machine.rs` | 2 | |
+| `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |
 | `util/crc32*.{hpp,cpp}` | `util/crc32.rs` | 3 | |
 | `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
-| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | freestanding guests, incl. the main-thread exit of `setup_posix_threads` (Linux setup: Phase 2) |
+| `emulator/src/main.cpp` | `crates/rvlinux` | 0–2 | ✅ static Linux guests (`full_linux_guest`); debugger, GDB, `--call`, dynamic executables: later |
 | `tr_*`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

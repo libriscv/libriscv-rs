@@ -1,0 +1,271 @@
+//! Port of `linux/syscalls_mman.cpp`: munmap, mmap, mremap, mprotect and
+//! madvise on the flat arena.
+
+use std::os::unix::fs::FileExt;
+
+use crate::error::{ExceptionKind, MachineError, Result};
+use crate::machine::Machine;
+use crate::memory::{PAGE_SIZE, PageAttributes, page_round_up};
+use crate::syscalls::errno::{EEXIST, EINVAL, ENOMEM, neg};
+use crate::syscalls::fds::Target;
+
+const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_NORESERVE: i32 = 0x04000;
+const MAP_FIXED: i32 = 0x10;
+const MAP_FIXED_NOREPLACE: i32 = 0x10_0000;
+const MAP_FAILED: u64 = u64::MAX;
+
+pub(super) fn syscall_munmap(m: &mut Machine) -> Result<()> {
+    let addr = m.sysarg(0);
+    let len = m.sysarg(1);
+    let Some(end) = addr.checked_add(len) else {
+        return Err(MachineError::new(
+            ExceptionKind::SystemCallFailed,
+            "munmap() arguments overflow",
+            0,
+        ));
+    };
+    m.memory.free_pages(addr, len);
+    if addr >= m.memory.mmap_start() && end <= m.memory.mmap_address() {
+        m.memory.mmap_unmap(addr, len);
+    }
+    m.set_result(0);
+    Ok(())
+}
+
+/// Read file `vfd` from `offset` into `[dst, dst + length)`: the file
+/// mapping of C++ (`lseek` + `readv`). A short file leaves the rest as it
+/// was. Returns false on failure.
+fn map_file(m: &mut Machine, vfd: i32, offset: u64, dst: u64, length: u64) -> Result<bool> {
+    let Some(fds) = m.fds.as_deref_mut() else {
+        return Ok(false);
+    };
+    let Some(Target::File(f)) = fds.translate(vfd) else {
+        return Ok(false);
+    };
+    let file = &f.file;
+    let buf = m.memory.memview_mut(dst, length)?;
+    let mut done = 0usize;
+    while let Some(rest) = buf.get_mut(done..) {
+        if rest.is_empty() {
+            break;
+        }
+        let Some(pos) = offset.checked_add(done as u64) else {
+            return Ok(false);
+        };
+        match file.read_at(rest, pos) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
+    let addr_g = m.sysarg(0);
+    let length = m.sysarg(1);
+    let prot = m.sysarg(2) as i32;
+    let flags = m.sysarg(3) as i32;
+    let vfd = m.sysarg(4) as i32;
+    let voff = m.sysarg(5);
+    let attr = PageAttributes::from_prot(prot);
+    let failed = |m: &mut Machine| {
+        m.set_result(MAP_FAILED);
+        Ok(())
+    };
+    let taken = |m: &mut Machine| {
+        m.set_result(neg(EEXIST));
+        Ok(())
+    };
+
+    if !addr_g.is_multiple_of(PAGE_SIZE) {
+        return failed(m);
+    }
+    let prev_nextfree = m.memory.mmap_address();
+    let mut nextfree = prev_nextfree;
+    let length = page_round_up(length);
+    if length == 0 {
+        return failed(m);
+    }
+    let arena_size = m.memory.memory_arena_size();
+
+    if vfd != -1 {
+        if m.fds.is_none() {
+            // File descriptors are disabled: fail like the kernel would.
+            return failed(m);
+        }
+        let dst = if addr_g == 0 {
+            let Some(end) = nextfree.checked_add(length) else {
+                return failed(m);
+            };
+            m.memory.set_mmap_address(end);
+            nextfree
+        } else {
+            if addr_g.checked_add(length).is_none() {
+                return failed(m);
+            }
+            addr_g
+        };
+        if !map_file(m, vfd, voff, dst, length)? {
+            return failed(m);
+        }
+        m.memory.set_page_attr(dst, length, attr);
+        m.set_result(dst);
+        return Ok(());
+    }
+
+    let result;
+    if addr_g != 0 && flags & MAP_FIXED_NOREPLACE != 0 {
+        // MAP_FIXED_NOREPLACE maps at exactly the given address or fails
+        // with EEXIST, and is never relocated.
+        let Some(end) = addr_g.checked_add(length) else {
+            return taken(m);
+        };
+        if addr_g < m.memory.mmap_start() || end > arena_size {
+            return taken(m);
+        }
+        if addr_g >= nextfree {
+            // Untouched territory: move the cursor above it, and donate
+            // the skipped gap to the free list.
+            if addr_g > nextfree {
+                m.memory
+                    .mmap_cache_mut()
+                    .insert(nextfree, addr_g - nextfree);
+            }
+            nextfree = end;
+        } else if !m.memory.mmap_cache_mut().carve(addr_g, length) {
+            // Below the cursor and not entirely free: occupied
+            return taken(m);
+        }
+        result = addr_g;
+    } else if addr_g == 0 || flags & MAP_FIXED == 0 {
+        // Without MAP_FIXED the address is only a hint, which is ignored.
+        let range = m.memory.mmap_cache_mut().find(length);
+        if range.size == 0 {
+            match nextfree.checked_add(length) {
+                Some(end) if end <= arena_size => {
+                    result = nextfree;
+                    nextfree = end;
+                }
+                _ => return failed(m),
+            }
+        } else {
+            result = range.addr;
+        }
+    } else {
+        let end = addr_g.checked_add(length);
+        match end {
+            Some(e) if e > arena_size => return failed(m),
+            None => return failed(m),
+            Some(_) if addr_g < m.memory.mmap_start() => {
+                // A fixed range below the mmap area: just return it
+                result = addr_g;
+            }
+            Some(e) if e <= nextfree => {
+                // Inside the mmap area: it may cover a range on the free
+                // list, which must not be handed out a second time.
+                let cache = m.memory.mmap_cache_mut();
+                if !cache.carve(addr_g, length) {
+                    cache.invalidate(addr_g, length);
+                }
+                result = addr_g;
+            }
+            Some(e) => {
+                // Ending after the current end of the mmap area
+                let cache = m.memory.mmap_cache_mut();
+                if addr_g > nextfree {
+                    cache.insert(nextfree, addr_g - nextfree);
+                } else {
+                    cache.invalidate(addr_g, length);
+                }
+                result = addr_g;
+                nextfree = nextfree.max(e);
+            }
+        }
+    }
+    m.memory.set_mmap_address(nextfree);
+
+    let untouched = result >= prev_nextfree;
+    // Anonymous pages need to be zeroed
+    if flags & MAP_ANONYMOUS != 0 {
+        m.memory.memdiscard(result, length)?;
+    }
+    // Avoid creating pages for MAP_NORESERVE and untouched PROT_NONE
+    if flags & MAP_NORESERVE == 0 && !(prot == 0 && untouched) {
+        m.memory.set_page_attr(result, length, attr);
+    }
+    m.set_result(result);
+    Ok(())
+}
+
+pub(super) fn syscall_mremap(m: &mut Machine) -> Result<()> {
+    const MREMAP_FIXED: i32 = 0x0002;
+    let old_addr = m.sysarg(0);
+    let old_size = m.sysarg(1);
+    let new_size = m.sysarg(2);
+    let flags = m.sysarg(3) as i32;
+    // Only the common case of growing (or shrinking) the last mapping.
+    if flags & MREMAP_FIXED == 0
+        && let Some(old_end) = old_addr.checked_add(old_size)
+        && old_end == m.memory.mmap_address()
+        && let Some(new_end) = old_addr.checked_add(new_size)
+    {
+        m.memory.set_mmap_address(new_end);
+        m.set_result(old_addr);
+        return Ok(());
+    }
+    m.set_result(MAP_FAILED);
+    Ok(())
+}
+
+pub(super) fn syscall_mprotect(m: &mut Machine) -> Result<()> {
+    let addr = m.sysarg(0);
+    let len = m.sysarg(1);
+    let prot = m.sysarg(2) as i32;
+    if !addr.is_multiple_of(PAGE_SIZE) {
+        m.set_result(neg(EINVAL));
+        return Ok(());
+    }
+    if addr.checked_add(len).is_none() {
+        m.set_result(neg(ENOMEM));
+        return Ok(());
+    }
+    m.memory
+        .set_page_attr(addr, len, PageAttributes::from_prot(prot));
+    m.set_result(0);
+    Ok(())
+}
+
+pub(super) fn syscall_madvise(m: &mut Machine) -> Result<()> {
+    let addr = m.sysarg(0);
+    let len = m.sysarg(1);
+    let advice = m.sysarg(2) as i32;
+    match advice {
+        // NORMAL, RANDOM, SEQUENTIAL, WILLNEED, DONTFORK, DOFORK,
+        // MERGEABLE, NOHUGEPAGE, WIPEONFORK
+        0..=3 | 10 | 11 | 12 | 15 | 18 => m.set_result(0),
+        4 => {
+            // MADV_DONTNEED
+            m.memory.memdiscard(addr, len)?;
+            m.set_result(0);
+        }
+        8 | 9 => {
+            // MADV_FREE, MADV_REMOVE
+            m.memory.free_pages(addr, len);
+            m.set_result(0);
+        }
+        // MADV_GUARD_INSTALL/REMOVE: unsupported, as on Linux < 6.13. The
+        // -1 is a work-around for Zig.
+        102 | 103 | -1 => m.set_result(neg(EINVAL)),
+        _ => {
+            return Err(MachineError::new(
+                ExceptionKind::SystemCallFailed,
+                "Unimplemented madvise() advice",
+                advice as u64,
+            ));
+        }
+    }
+    Ok(())
+}
