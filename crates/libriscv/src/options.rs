@@ -46,6 +46,15 @@ pub struct MachineOptions {
     /// Instructions between checks for finished background compilations
     /// (at least 1). Smaller slices switch to native code sooner.
     pub jit_background_slice: u64,
+    /// With `jit`, mask guest addresses with `arena size - 1` in native code
+    /// instead of bounds-checking them (C++
+    /// `translate_automatic_nbit_address_space`). Much cheaper loads and
+    /// stores, but native code then reads and writes anywhere in the arena,
+    /// read-only data and the first page included, and accesses outside it
+    /// wrap around instead of going to the page table. Only power-of-two
+    /// arenas qualify; otherwise (reported with `verbose_loader`) the
+    /// accesses stay checked. The interpreter is unaffected.
+    pub jit_automatic_nbit_address_space: bool,
 }
 
 impl Default for MachineOptions {
@@ -65,6 +74,7 @@ impl Default for MachineOptions {
             jit: false,
             jit_background: false,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
+            jit_automatic_nbit_address_space: false,
         }
     }
 }

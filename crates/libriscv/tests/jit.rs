@@ -6,6 +6,10 @@
 //! counter, memory and the error, for hand-written and random programs,
 //! stopped at many different instruction limits. Without the C extension
 //! (`--no-default-features`), only 4-byte instructions are generated.
+//!
+//! Register sets are [`Regs`]: the 32 integer registers, then the 32 FP
+//! registers (raw bits). NaN results are the host's in native code (see the
+//! JIT's `emit` module), so FP programs are compared up to the first NaN.
 
 #![cfg(feature = "jit")]
 #![allow(
@@ -22,6 +26,9 @@ const SCRATCH: u64 = 0x40000;
 const SCRATCH_LEN: u64 = 0x2000;
 /// The base register of generated loads and stores; never a destination.
 const BASE: u32 = 5;
+
+/// Initial registers: `x0..x31`, then `f0..f31`.
+type Regs = [u64; 64];
 
 fn machine(code: &[u8], jit: bool) -> Machine {
     machine_with(
@@ -48,10 +55,14 @@ fn background_machine(code: &[u8], slice: u64) -> Machine {
 }
 
 fn machine_with(code: &[u8], options: MachineOptions) -> Machine {
+    machine_sized(code, 1 << 20, options)
+}
+
+fn machine_sized(code: &[u8], memory_max: u64, options: MachineOptions) -> Machine {
     let mut m = Machine::new(
         &[],
         MachineOptions {
-            memory_max: 1 << 20,
+            memory_max,
             ..options
         },
     )
@@ -66,15 +77,19 @@ fn machine_with(code: &[u8], options: MachineOptions) -> Machine {
 struct Outcome {
     result: Result<bool, (ExceptionKind, u64)>,
     regs: [u64; 32],
+    fregs: [u64; 32],
     pc: u64,
     counter: u64,
     memory: Vec<u8>,
 }
 
-fn run(m: &mut Machine, regs: &[u64; 32], fuel: u64) -> Outcome {
+fn run(m: &mut Machine, regs: &Regs, fuel: u64) -> Outcome {
     m.cpu.registers_mut().clone_from(&Default::default());
-    for (i, &v) in regs.iter().enumerate().skip(1) {
+    for (i, &v) in regs[..32].iter().enumerate().skip(1) {
         m.cpu.set_reg(i as u32, v);
+    }
+    for (i, &v) in regs[32..].iter().enumerate() {
+        m.cpu.registers_mut().set_fp_bits(i as u32, v);
     }
     m.copy_to_guest(SCRATCH, &vec![0x5A; SCRATCH_LEN as usize])
         .unwrap();
@@ -84,6 +99,7 @@ fn run(m: &mut Machine, regs: &[u64; 32], fuel: u64) -> Outcome {
     Outcome {
         result,
         regs: *m.cpu.registers().all(),
+        fregs: *m.cpu.registers().all_fp(),
         pc: m.cpu.pc(),
         counter: m.instruction_counter(),
         memory: m.memory.memview(SCRATCH, SCRATCH_LEN).unwrap().to_vec(),
@@ -91,8 +107,89 @@ fn run(m: &mut Machine, regs: &[u64; 32], fuel: u64) -> Outcome {
 }
 
 /// Run `code` with and without the JIT at every limit in `fuels`.
-fn compare(code: &[u8], regs: &[u64; 32], fuels: &[u64], what: &str) -> usize {
+fn compare(code: &[u8], regs: &Regs, fuels: &[u64], what: &str) -> usize {
     compare_machines(machine(code, true), code, regs, fuels, what)
+}
+
+/// A NaN as either a double or (in the low half) a single.
+fn nanish(bits: u64) -> bool {
+    f64::from_bits(bits).is_nan() || f32::from_bits(bits as u32).is_nan()
+}
+
+/// Equal, or NaN in the same places.
+fn same_fp(a: u64, b: u64) -> bool {
+    a == b
+        || (f64::from_bits(a).is_nan() && f64::from_bits(b).is_nan())
+        || (f32::from_bits(a as u32).is_nan()
+            && f32::from_bits(b as u32).is_nan()
+            && a >> 32 == b >> 32)
+}
+
+fn describe(got: &Outcome, expected: &Outcome) -> String {
+    let mut diff = String::new();
+    if got.result != expected.result {
+        diff += &format!(
+            "result: jit {:?}, interpreter {:?}\n",
+            got.result, expected.result
+        );
+    }
+    if got.pc != expected.pc {
+        diff += &format!("pc: jit {:#x}, interpreter {:#x}\n", got.pc, expected.pc);
+    }
+    if got.counter != expected.counter {
+        diff += &format!(
+            "counter: jit {}, interpreter {}\n",
+            got.counter, expected.counter
+        );
+    }
+    for r in 0..32 {
+        if got.regs[r] != expected.regs[r] {
+            diff += &format!(
+                "x{r}: jit {:#x}, interpreter {:#x}\n",
+                got.regs[r], expected.regs[r]
+            );
+        }
+        if got.fregs[r] != expected.fregs[r] {
+            diff += &format!(
+                "f{r}: jit {:#x}, interpreter {:#x}\n",
+                got.fregs[r], expected.fregs[r]
+            );
+        }
+    }
+    if let Some(i) = (0..got.memory.len()).find(|&i| got.memory[i] != expected.memory[i]) {
+        diff += &format!("memory differs from {:#x}\n", SCRATCH + i as u64);
+    }
+    diff
+}
+
+/// Like [`compare`] for FP programs, at ascending `fuels`: exact until the
+/// interpreter has a NaN in an FP register, then once more with NaNs
+/// matching any NaN, and no further (which NaN comes out is the host's).
+fn compare_fp(code: &[u8], regs: &Regs, fuels: &[u64], what: &str) -> usize {
+    let mut interp = machine(code, false);
+    let mut jit = machine(code, true);
+    let entries = jit.cpu.current_execute_segment().jit_entry_count();
+    for &fuel in fuels {
+        let expected = run(&mut interp, regs, fuel);
+        let got = run(&mut jit, regs, fuel);
+        if !expected.fregs.iter().copied().any(nanish) {
+            if got != expected {
+                panic!("{what}, fuel {fuel}:\n{}", describe(&got, &expected));
+            }
+            continue;
+        }
+        let fp_ok = (0..32).all(|r| same_fp(got.fregs[r], expected.fregs[r]));
+        let rest_ok = got.result == expected.result
+            && got.regs == expected.regs
+            && got.pc == expected.pc
+            && got.counter == expected.counter
+            && got.memory == expected.memory;
+        if !fp_ok || !rest_ok {
+            panic!("{what}, fuel {fuel} (NaN):\n{}", describe(&got, &expected));
+        }
+        break;
+    }
+    entries
 }
 
 /// Run `code` in the interpreter and on `jit` at every limit in `fuels`.
@@ -100,7 +197,7 @@ fn compare(code: &[u8], regs: &[u64; 32], fuels: &[u64], what: &str) -> usize {
 fn compare_machines(
     mut jit: Machine,
     code: &[u8],
-    regs: &[u64; 32],
+    regs: &Regs,
     fuels: &[u64],
     what: &str,
 ) -> usize {
@@ -110,34 +207,7 @@ fn compare_machines(
         let expected = run(&mut interp, regs, fuel);
         let got = run(&mut jit, regs, fuel);
         if got != expected {
-            let mut diff = String::new();
-            if got.result != expected.result {
-                diff += &format!(
-                    "result: jit {:?}, interpreter {:?}\n",
-                    got.result, expected.result
-                );
-            }
-            if got.pc != expected.pc {
-                diff += &format!("pc: jit {:#x}, interpreter {:#x}\n", got.pc, expected.pc);
-            }
-            if got.counter != expected.counter {
-                diff += &format!(
-                    "counter: jit {}, interpreter {}\n",
-                    got.counter, expected.counter
-                );
-            }
-            for r in 0..32 {
-                if got.regs[r] != expected.regs[r] {
-                    diff += &format!(
-                        "x{r}: jit {:#x}, interpreter {:#x}\n",
-                        got.regs[r], expected.regs[r]
-                    );
-                }
-            }
-            if let Some(i) = (0..got.memory.len()).find(|&i| got.memory[i] != expected.memory[i]) {
-                diff += &format!("memory differs from {:#x}\n", SCRATCH + i as u64);
-            }
-            panic!("{what}, fuel {fuel}:\n{diff}");
+            panic!("{what}, fuel {fuel}:\n{}", describe(&got, &expected));
         }
     }
     entries
@@ -207,10 +277,10 @@ fn loops_calls_and_returns_stay_native() {
         rtype(0x33, 0, 0, 12, 12, 11), // 0x24: add a2, a2, a1
         itype(0x67, 0, 0, 1, 0),       // 0x28: ret
     ];
-    let entries = compare(&words(&program), &[0; 32], &fuels(), "loop");
+    let entries = compare(&words(&program), &[0; 64], &fuels(), "loop");
     assert!(entries > 0, "nothing was compiled");
     let mut m = machine(&words(&program), true);
-    run(&mut m, &[0; 32], 1000);
+    run(&mut m, &[0; 64], 1000);
     assert_eq!(m.cpu.reg(10), 3 * 5050);
 }
 
@@ -226,7 +296,7 @@ fn faults_and_syscalls_leave_the_jit_precisely() {
         itype(0x03, 2, 12, 0, 0x7F0), // lw a2, 0x7F0(x0): read fault
         jtype(0, 0),
     ];
-    let mut regs = [0u64; 32];
+    let mut regs = [0u64; 64];
     regs[BASE as usize] = SCRATCH;
     compare(&words(&program), &regs, &fuels(), "faults");
     // A store into the read-only window faults too.
@@ -254,7 +324,7 @@ fn accesses_outside_the_arena_use_the_page_table() {
         btype(1, 11, 0, -32),           // 0x28: bnez a1, loop
         jtype(0, 0),                    // 0x2C: j .
     ];
-    let mut regs = [0u64; 32];
+    let mut regs = [0u64; 64];
     regs[BASE as usize] = SCRATCH;
     regs[FAR as usize] = 0x7000_0000_0802;
     let entries = compare(&words(&program), &regs, &fuels(), "outside the arena");
@@ -280,9 +350,9 @@ fn x0_writes_are_discarded() {
         itype(0x13, 0, 10, 10, 1),    // addi a0, a0, 1
         jtype(0, 0),
     ];
-    compare(&words(&program), &[0; 32], &fuels(), "x0");
+    compare(&words(&program), &[0; 64], &fuels(), "x0");
     let mut m = machine(&words(&program), true);
-    run(&mut m, &[0; 32], 100);
+    run(&mut m, &[0; 64], 100);
     assert_eq!((m.cpu.reg(0), m.cpu.reg(10)), (0, 0));
 }
 
@@ -428,10 +498,13 @@ fn random_item(rng: &mut Rng, n: usize) -> Item {
             1 => Item::Word(itype(0x13, 0, 17, 0, rng.below(600) as i32)), // li a7, n
             2 => Item::Word(rng.next() as u32 | 3),                        // anything
             3 => Item::Word(0x0000_000F),                                  // FENCE
+            4..=6 if cfg!(feature = "ext-f") && !cfg!(feature = "debug-checks") => {
+                Item::Word(random_fp_move(rng))
+            }
             _ => Item::Word(itype(0x13, 0, rng.rd(), rng.rs(), rng.below(4096) as i32)),
         },
         16..=17 => {
-            // Random compressed instructions (the F/D ones stay interpreted).
+            // Random compressed instructions.
             let mut h = rng.next() as u16;
             if h & 3 == 3 {
                 h &= !1;
@@ -510,14 +583,14 @@ fn background_compilation_switches_to_native_code() {
     // The segment starts out interpreted.
     assert_eq!(m.cpu.current_execute_segment().jit_entry_count(), 0);
     // Results don't depend on when the code arrives...
-    let early = run(&mut m, &[0; 32], 150);
+    let early = run(&mut m, &[0; 64], 150);
     m.wait_for_jit();
     assert!(!m.jit_pending());
     assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
     // ...and from here on everything runs natively.
-    let late = run(&mut m, &[0; 32], 150);
+    let late = run(&mut m, &[0; 64], 150);
     assert_eq!(early, late);
-    let expected = run(&mut machine(&code, false), &[0; 32], 150);
+    let expected = run(&mut machine(&code, false), &[0; 64], 150);
     assert_eq!(late, expected);
     // Waiting again is a no-op.
     m.wait_for_jit();
@@ -533,9 +606,12 @@ fn background_compilation_matches_the_interpreter() {
         let n = 8 + rng.below(56) as usize;
         let items: Vec<Item> = (0..n).map(|_| random_item(&mut rng, n)).collect();
         let code = encode(&items);
-        let mut regs = [0u64; 32];
+        let mut regs = [0u64; 64];
         for r in regs.iter_mut().skip(1) {
             *r = rng.below(64);
+        }
+        for r in regs.iter_mut().skip(32) {
+            *r = random_fp(&mut rng);
         }
         regs[BASE as usize] = SCRATCH + 64;
         let slice = 1 + rng.below(9);
@@ -563,7 +639,7 @@ fn random_programs_match_the_interpreter() {
         let n = 8 + rng.below(56) as usize;
         let items: Vec<Item> = (0..n).map(|_| random_item(&mut rng, n)).collect();
         let code = encode(&items);
-        let mut regs = [0u64; 32];
+        let mut regs = [0u64; 64];
         for r in regs.iter_mut().skip(1) {
             *r = match rng.below(4) {
                 0 => rng.below(16),
@@ -571,6 +647,9 @@ fn random_programs_match_the_interpreter() {
                 2 => (rng.next() as i32) as u64,
                 _ => [0, 1, u64::MAX, 1 << 63, (1 << 63) - 1, 0x8000_0000][rng.below(6) as usize],
             };
+        }
+        for r in regs.iter_mut().skip(32) {
+            *r = random_fp(&mut rng);
         }
         regs[BASE as usize] = SCRATCH + 64;
         if compare(
@@ -587,4 +666,511 @@ fn random_programs_match_the_interpreter() {
         compiled * 4 > programs * 3,
         "only {compiled} of {programs} programs were compiled"
     );
+}
+
+// --- F and D ---------------------------------------------------------------
+
+/// OP-FP: `rd = rs1 op rs2` with funct7 = `fpfunc << 2 | fmt`.
+const fn fp(fpfunc: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+    rtype(0x53, rm, (fpfunc << 2) | fmt, rd, rs1, rs2)
+}
+/// An R4-type fused multiply-add (`op` is the major opcode).
+const fn r4(op: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> u32 {
+    (rs3 << 27) | (fmt << 25) | (rs2 << 20) | (rs1 << 15) | (rm << 12) | (rd << 7) | op
+}
+/// FLW (width 2) / FLD (width 3).
+const fn fload(width: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+    itype(0x07, width, rd, rs1, imm)
+}
+/// FSW (width 2) / FSD (width 3).
+const fn fstore(width: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+    stype(width, rs1, rs2, imm) | 0x04
+}
+/// `fsrmi x0, rm`: CSRRWI on `frm`.
+const fn fsrmi(rm: u32) -> u32 {
+    (0x002 << 20) | (rm << 15) | (5 << 12) | 0x73
+}
+
+const SPECIAL_F64: [f64; 24] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    1.5,
+    2.5,
+    -2.5,
+    3.5,
+    -3.5,
+    2147483647.5,
+    2147483648.0,
+    -2147483648.5,
+    4294967295.5,
+    4294967296.0,
+    9.3e18,
+    -9.3e18,
+    1.9e19,
+    1e300,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+    5e-324,
+    -1e-310,
+];
+
+/// A random non-NaN FP register value: a double, or a single in the low
+/// half.
+fn random_fp(rng: &mut Rng) -> u64 {
+    loop {
+        let bits = match rng.below(5) {
+            0 => rng.pick(&SPECIAL_F64).to_bits(),
+            1 => ((rng.next() as i64 % 4_000_000) as f64 / 8.0).to_bits(),
+            2 | 3 => {
+                let v = if rng.below(2) == 0 {
+                    rng.pick(&SPECIAL_F64) as f32
+                } else {
+                    (rng.next() as i32 % 1_000_000) as f32 / 4.0
+                };
+                let random = rng.next() & 0x3FFF_FFFF;
+                let upper = rng.pick(&[0, 0x3FF0_0000, random]);
+                (upper << 32) | u64::from(v.to_bits())
+            }
+            _ => rng.next(),
+        };
+        if !nanish(bits) {
+            return bits;
+        }
+    }
+}
+
+/// An F/D instruction whose result doesn't depend on which NaN the host
+/// produces: loads, stores, moves, sign injection, FCLASS, compares and
+/// conversions to and from integers.
+fn random_fp_move(rng: &mut Rng) -> u32 {
+    let fmt = rng.below(2) as u32;
+    let (frd, frs1, frs2) = (rng.rs(), rng.rs(), rng.rs());
+    let off = rng.below(1100) as i32 - 64;
+    match rng.below(9) {
+        0 => fload(2 + fmt, frd, BASE, off),
+        1 => fstore(2 + fmt, BASE, frs2, off),
+        2 => fp(0x1C, fmt, rng.below(2) as u32, rng.rd(), frs1, 0), // FMV.X, FCLASS
+        3 => fp(0x1E, fmt, 0, frd, rng.rs(), 0),                    // FMV.W.X/D.X
+        4 => fp(0x04, fmt, rng.below(4) as u32, frd, frs1, frs2),   // FSGNJ*
+        5 => fp(0x14, fmt, rng.below(3) as u32, rng.rd(), frs1, frs2), // FLE/FLT/FEQ
+        6 => fp(
+            0x18,
+            fmt,
+            rng.below(8) as u32,
+            rng.rd(),
+            frs1,
+            rng.below(4) as u32,
+        ),
+        7 => fp(
+            0x1A,
+            fmt,
+            rng.below(8) as u32,
+            frd,
+            rng.rs(),
+            rng.below(4) as u32,
+        ),
+        _ => rng.next() as u32 & !0x7F | rng.pick(&[0x07, 0x27, 0x43, 0x53]),
+    }
+}
+
+/// Any F/D instruction, mostly on `f0..f7`, and the occasional rounding
+/// mode change or integer operation.
+fn random_fp_item(rng: &mut Rng) -> u32 {
+    let f = |rng: &mut Rng| rng.below(8) as u32;
+    let fmt = if rng.below(32) == 0 {
+        2
+    } else {
+        rng.below(2) as u32
+    };
+    let rm = rng.below(8) as u32;
+    let (frd, frs1, frs2) = (f(rng), f(rng), f(rng));
+    match rng.below(16) {
+        0..=2 => fp(rng.below(4) as u32, fmt, rm, frd, frs1, frs2),
+        3 => fp(0x05, fmt, rng.pick(&[0, 1, 0, 1, 2]), frd, frs1, frs2), // FMIN/FMAX
+        4 => fp(0x0B, fmt, rm, frd, frs1, rng.below(2) as u32),          // FSQRT
+        5..=6 => r4(
+            rng.pick(&[0x43, 0x47, 0x4B, 0x4F]),
+            fmt,
+            rm,
+            frd,
+            frs1,
+            frs2,
+            f(rng),
+        ),
+        7 => {
+            let src = if rng.below(16) == 0 {
+                rng.pick(&[2, 4])
+            } else {
+                fmt ^ 1
+            };
+            fp(0x08, fmt, rm, frd, frs1, src) // FCVT.S.D / FCVT.D.S
+        }
+        8..=9 => {
+            let kind = if rng.below(16) == 0 {
+                8
+            } else {
+                rng.below(4) as u32
+            };
+            fp(0x18, fmt, rm, rng.rd(), frs1, kind) // FCVT.int.fmt
+        }
+        10 => fsrmi(rng.below(8) as u32),
+        11 => itype(0x13, 0, rng.rd(), rng.rs(), rng.below(4096) as i32 - 2048),
+        _ => {
+            // The same as in the integer programs, on f0..f7.
+            let w = random_fp_move(rng);
+            let reg_mask = !((0x18 << 7) | (0x18 << 15) | (0x18 << 20));
+            if w & 0x7F == 0x53 && (w >> 27) != 0x1C && (w >> 27) != 0x14 && (w >> 27) != 0x18 {
+                w & reg_mask
+            } else {
+                w
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+#[test]
+fn fp_loops_stay_native() {
+    // fa0 = sum(i * 0.5 + fa1) for i in 1..=100, with a conversion, a
+    // compare, loads and stores in the loop.
+    let program = [
+        itype(0x13, 0, 11, 0, 100),     // 0x00: li a1, 100
+        fp(0x1E, 1, 0, 10, 0, 0),       // 0x04: fmv.d.x fa0, zero
+        fp(0x1A, 1, 0, 12, 11, 0),      // 0x08: loop: fcvt.d.w fa2, a1
+        fstore(3, BASE, 12, 0),         // 0x0C: fsd fa2, 0(t0)
+        fload(3, 13, BASE, 0),          // 0x10: fld fa3, 0(t0)
+        r4(0x43, 1, 0, 10, 13, 14, 10), // 0x14: fmadd.d fa0, fa3, fa4, fa0
+        fp(0x00, 1, 7, 10, 10, 11),     // 0x18: fadd.d fa0, fa0, fa1
+        fp(0x14, 1, 1, 12, 10, 15),     // 0x1C: flt.d a2, fa0, fa5
+        itype(0x13, 0, 11, 11, -1),     // 0x20: addi a1, a1, -1
+        btype(1, 11, 0, -28),           // 0x24: bnez a1, loop
+        fp(0x18, 1, 1, 10, 10, 0),      // 0x28: fcvt.w.d a0, fa0, rtz
+        jtype(0, 0),                    // 0x2C: j .
+    ];
+    let mut regs = [0u64; 64];
+    regs[BASE as usize] = SCRATCH;
+    regs[32 + 11] = 0.25f64.to_bits();
+    regs[32 + 14] = 0.5f64.to_bits();
+    regs[32 + 15] = 1000.0f64.to_bits();
+    let entries = compare(&words(&program), &regs, &fuels(), "fp loop");
+    assert!(entries > 0, "nothing was compiled");
+    let mut m = machine(&words(&program), true);
+    run(&mut m, &regs, 10_000);
+    assert_eq!(m.cpu.reg(10), (0.5 * 5050.0 + 25.0) as u64);
+    assert_eq!(
+        m.cpu.registers().fp_bits(10),
+        (0.5 * 5050.0 + 25.0f64).to_bits()
+    );
+}
+
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+#[test]
+fn fp_conversions_round_and_saturate() {
+    // FCVT.W.D and FCVT.LU.S with every rounding mode, then DYN under
+    // every FCSR.frm; NaN and out-of-range values saturate.
+    let mut program = Vec::new();
+    for rm in 0..8 {
+        program.push(fp(0x18, 1, rm, 10 + rm, 1, 0)); // fcvt.w.d a(rm), ft1, rm
+        program.push(fp(0x18, 0, rm, 18 + rm % 6, 2, 3)); // fcvt.lu.s s(..), ft2, rm
+    }
+    for frm in 0..8 {
+        program.push(fsrmi(frm));
+        program.push(fp(0x18, 1, 7, 10 + frm, 1, 2)); // fcvt.l.d, dyn
+    }
+    program.push(jtype(0, 0));
+    let code = words(&program);
+    for v in [
+        2.5f64,
+        -2.5,
+        3.5,
+        -0.5,
+        1e10,
+        -1e10,
+        f64::NAN,
+        f64::INFINITY,
+        1.9e19,
+    ] {
+        let mut regs = [0u64; 64];
+        regs[32 + 1] = v.to_bits();
+        regs[32 + 2] = u64::from((v as f32).to_bits());
+        compare(&code, &regs, &[0, 1, 2, 17, 40, 100], &format!("fcvt {v}"));
+    }
+}
+
+/// `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs a longer session here too.
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+#[test]
+fn random_fp_programs_match_the_interpreter() {
+    let config = std::env::var("LIBRISCV_JIT_FUZZ").unwrap_or_default();
+    let mut parts = config.split(':');
+    let programs: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(400);
+    let seed: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let mut compiled = 0;
+    for program in 0..programs {
+        // Straight-line code with a JAL after every instruction, so that
+        // every instruction limit stops at a different instruction.
+        let n = 4 + rng.below(40) as usize;
+        let mut words_ = Vec::with_capacity(2 * n + 1);
+        for _ in 0..n {
+            words_.push(random_fp_item(&mut rng));
+            words_.push(jtype(0, 4));
+        }
+        words_.push(jtype(0, 0));
+        let code = words(&words_);
+        let mut regs = [0u64; 64];
+        for r in regs.iter_mut().take(32).skip(1) {
+            *r = match rng.below(4) {
+                0 => rng.below(16),
+                1 => rng.next(),
+                2 => (rng.next() as i32) as u64,
+                _ => [u64::MAX, 1 << 63, (1 << 63) - 1, 0x8000_0000, 0xFFFF_FFFF]
+                    [rng.below(5) as usize],
+            };
+        }
+        for r in regs.iter_mut().skip(32) {
+            *r = random_fp(&mut rng);
+        }
+        regs[BASE as usize] = SCRATCH + 64;
+        let fuels: Vec<u64> = (0..=2 * n as u64 + 2).chain([1000]).collect();
+        if compare_fp(
+            &code,
+            &regs,
+            &fuels,
+            &format!("fp program {program}: {code:02x?}"),
+        ) > 0
+        {
+            compiled += 1;
+        }
+    }
+    assert!(
+        compiled * 4 > programs * 3,
+        "only {compiled} of {programs} programs were compiled"
+    );
+}
+
+// --- N-bit address space ---------------------------------------------------
+
+fn nbit_machine(code: &[u8], memory_max: u64) -> Machine {
+    machine_sized(
+        code,
+        memory_max,
+        MachineOptions {
+            jit: true,
+            jit_automatic_nbit_address_space: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Inside the arena windows, masked accesses are the checked ones.
+#[test]
+fn nbit_masked_accesses_match_inside_the_arena() {
+    let mut rng = Rng(0x5EED_0000_0000_0001);
+    let fuels: Vec<u64> = (0..=48).chain([64, 100, 333, 1000, 20_000]).collect();
+    for program in 0..100 {
+        let n = 8 + rng.below(56) as usize;
+        // No loads or stores with a random base, nor compressed ones (based
+        // on registers the program overwrites): those would leave the
+        // windows.
+        let items: Vec<Item> = (0..n)
+            .map(|_| {
+                loop {
+                    match random_item(&mut rng, n) {
+                        Item::Half(_) => continue,
+                        Item::Word(w)
+                            if matches!(w & 0x7F, 0x03 | 0x23 | 0x07 | 0x27)
+                                && (w >> 15) & 0x1F != BASE =>
+                        {
+                            continue;
+                        }
+                        it => break it,
+                    }
+                }
+            })
+            .collect();
+        let code = encode(&items);
+        let mut regs = [0u64; 64];
+        for r in regs.iter_mut().skip(1) {
+            *r = rng.below(64);
+        }
+        regs[BASE as usize] = SCRATCH + 64;
+        compare_machines(
+            nbit_machine(&code, 1 << 20),
+            &code,
+            &regs,
+            &fuels,
+            &format!("nbit program {program}: {code:02x?}"),
+        );
+    }
+}
+
+/// Masked accesses wrap around the arena and ignore its protections, where
+/// checked ones go through the page table.
+#[test]
+fn nbit_accesses_wrap_and_ignore_protection() {
+    const ARENA: u64 = 1 << 20;
+    let program = [
+        itype(0x13, 0, 10, 0, 0x55), // li a0, 0x55
+        stype(3, 6, 10, 0),          // sd a0, 0(t1): ARENA + SCRATCH
+        itype(0x03, 3, 11, BASE, 0), // ld a1, 0(t0): SCRATCH
+        stype(2, 0, 10, 0x10),       // sw a0, 16(x0): below the read window
+        itype(0x03, 2, 12, 0, 0x10), // lw a2, 16(x0)
+        itype(0x03, 3, 13, 7, 0),    // ld a3, 0(t2): far outside
+        jtype(0, 0),
+    ];
+    let code = words(&program);
+    let mut regs = [0u64; 64];
+    regs[BASE as usize] = SCRATCH;
+    regs[6] = ARENA + SCRATCH;
+    regs[7] = 0x7000_0000_0000_0000 + SCRATCH;
+    let mut m = nbit_machine(&code, ARENA);
+    assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
+    let out = run(&mut m, &regs, 100);
+    assert_eq!(out.result, Ok(false));
+    assert_eq!(
+        (out.regs[11], out.regs[12], out.regs[13]),
+        (0x55, 0x55, 0x55)
+    );
+    // Checked (and in the interpreter), the store at x0 + 16 faults.
+    let checked = run(&mut machine(&code, true), &regs, 100);
+    assert_eq!(
+        checked.result.map_err(|e| e.0),
+        Err(ExceptionKind::ProtectionFault)
+    );
+    assert_eq!(checked, run(&mut machine(&code, false), &regs, 100));
+}
+
+/// Only power-of-two arenas are masked; others stay checked.
+#[test]
+fn nbit_needs_a_power_of_two_arena() {
+    const ARENA: u64 = 3 << 20;
+    let program = [
+        itype(0x13, 0, 10, 0, 0x55), // li a0, 0x55
+        stype(3, 6, 10, 0),          // sd a0, 0(t1): 4 MiB + SCRATCH
+        itype(0x03, 3, 11, BASE, 0), // ld a1, 0(t0): SCRATCH
+        jtype(0, 0),
+    ];
+    let code = words(&program);
+    let mut regs = [0u64; 64];
+    regs[BASE as usize] = SCRATCH;
+    regs[6] = (4 << 20) + SCRATCH;
+    let mut m = nbit_machine(&code, ARENA);
+    assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
+    let out = run(&mut m, &regs, 100);
+    assert_eq!(out.regs[11], 0x5A5A_5A5A_5A5A_5A5A);
+    let interp = machine_sized(&code, ARENA, MachineOptions::default());
+    assert_eq!(out, run(&mut { interp }, &regs, 100));
+}
+
+/// Every compiled F/D operation on the special values of the `rvlinux`
+/// float difftest (zeros, infinities, extremes, subnormals, signaling and
+/// quiet NaNs, unboxed singles), with every rounding mode: the same as the
+/// interpreter, except that where both produce a NaN, it may be another.
+#[test]
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+fn fp_special_values_match_up_to_nan() {
+    const fn r4(op: u32, fmt: u32, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> u32 {
+        (rs3 << 27) | (fmt << 25) | (rs2 << 20) | (rs1 << 15) | (7 << 12) | (rd << 7) | op
+    }
+    let boxed = |x: u64| 0xFFFF_FFFF_0000_0000 | x;
+    let vals = [
+        0,
+        0x8000_0000_0000_0000,
+        0x3FF0_0000_0000_0000,
+        0xC004_0000_0000_0000,
+        0x3FB9_9999_9999_999A,
+        0x7E37_E43C_8800_759C,
+        1,
+        0x7FEF_FFFF_FFFF_FFFF,
+        0x7FF0_0000_0000_0000,
+        0xFFF0_0000_0000_0000,
+        0x7FF0_0000_0000_0123,
+        0x7FF8_0000_0000_0123,
+        0x41DF_FFFF_FFE0_0000,
+        0x43E0_0000_0000_0000,
+        boxed(0x8000_0000),
+        boxed(0x3FC0_0000),
+        boxed(0x3DCC_CCCD),
+        boxed(0x7F7F_FFFF),
+        boxed(1),
+        boxed(0xFF80_0000),
+        boxed(0x7F80_0123),
+        boxed(0x4F00_0000),
+        boxed(0xBF00_0000),
+        0x1234_5678_3F80_0000,
+    ];
+    // (instruction, double, integer result); results go to a0 or ft3.
+    let mut ops = Vec::new();
+    for fmt in 0..2 {
+        let dbl = fmt == 1;
+        for func in [0, 1, 2, 3] {
+            ops.push((fp(func, fmt, 7, 3, 0, 1), dbl, false));
+        }
+        for f3 in [0, 1] {
+            ops.push((fp(0x05, fmt, f3, 3, 0, 1), dbl, false)); // FMIN/FMAX
+        }
+        for f3 in [0, 1, 2] {
+            ops.push((fp(0x04, fmt, f3, 3, 0, 1), dbl, false)); // FSGNJ*
+            ops.push((fp(0x14, fmt, f3, 10, 0, 1), dbl, true)); // FLE/FLT/FEQ
+        }
+        ops.push((fp(0x0B, fmt, 0, 3, 0, 0), dbl, false)); // FSQRT
+        ops.push((fp(0x08, fmt, 0, 3, 0, fmt ^ 1), dbl, false)); // FCVT.S.D/D.S
+        ops.push((fp(0x1C, fmt, 0, 10, 0, 0), dbl, true)); // FMV.X
+        ops.push((fp(0x1C, fmt, 1, 10, 0, 0), dbl, true)); // FCLASS
+        for kind in 0..4 {
+            for rm in 0..8 {
+                ops.push((fp(0x18, fmt, rm, 10, 0, kind), dbl, true));
+            }
+        }
+        for op in [0x43, 0x47, 0x4B, 0x4F] {
+            ops.push((r4(op, fmt, 3, 0, 1, 2), dbl, false));
+        }
+    }
+    let run = |m: &mut Machine, a: u64, b: u64, c: u64, frm: u32| {
+        m.cpu.registers_mut().clone_from(&Default::default());
+        let r = m.cpu.registers_mut();
+        r.set_fp_bits(0, a);
+        r.set_fp_bits(1, b);
+        r.set_fp_bits(2, c);
+        r.set_fp_bits(3, 0x5555_5555_5555_5555);
+        r.fcsr_mut().set_frm(frm);
+        m.cpu.jump(V).unwrap();
+        m.set_instruction_counter(0);
+        m.try_simulate(10, 0).unwrap();
+        (m.cpu.reg(10), m.cpu.registers().fp_bits(3))
+    };
+    let nan = |v: u64, dbl: bool| {
+        if dbl {
+            f64::from_bits(v).is_nan()
+        } else {
+            f32::from_bits(v as u32).is_nan() && v >> 32 == 0x5555_5555
+        }
+    };
+    for (w, dbl, int) in ops {
+        let code = words(&[w, jtype(0, 0)]);
+        let (mut interp, mut jit) = (machine(&code, false), machine(&code, true));
+        assert!(
+            jit.cpu.current_execute_segment().jit_entry_count() > 0,
+            "{w:#x}"
+        );
+        for &a in &vals {
+            for &b in &vals {
+                for (c, frm) in [(0, 0), (0x3FF0_0000_0000_0000, 2), (boxed(0x3F80_0000), 4)] {
+                    let x = run(&mut interp, a, b, c, frm);
+                    let y = run(&mut jit, a, b, c, frm);
+                    let ok = x == y || (!int && x.0 == y.0 && nan(x.1, dbl) && nan(y.1, dbl));
+                    assert!(
+                        ok,
+                        "{w:#010x} a={a:#x} b={b:#x} c={c:#x} frm={frm}: \
+                         interpreter {x:#x?}, jit {y:#x?}"
+                    );
+                }
+            }
+        }
+    }
 }

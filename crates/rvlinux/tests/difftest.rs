@@ -30,6 +30,14 @@ fn rvlinux() -> &'static Path {
 /// executable mapping (1.5 MB) when it's first entered, which takes minutes
 /// in a debug build.
 fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
+    diff_jit_output(elf, flags, args, true)
+}
+
+/// [`diff_with`], comparing the `--jit` runs' output only if `jit_output`.
+/// Native code produces the host's NaNs (see the JIT's `emit` module), so
+/// guests that print NaN payloads only match in exit code, instruction
+/// count and exception there.
+fn diff_jit_output(elf: &Path, flags: &[&str], args: &[&str], jit_output: bool) -> RunOutput {
     let reference =
         testutil::run_reference_with(elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
     assert!(
@@ -39,7 +47,7 @@ fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
         reference.stdout,
         reference.stderr
     );
-    compare(&reference, elf, flags, args);
+    compare(&reference, elf, flags, args, true);
     if cfg!(feature = "jit") {
         let dynamic = std::fs::read(elf)
             .ok()
@@ -54,14 +62,15 @@ fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
         for &extra in modes {
             let mut jit_flags = flags.to_vec();
             jit_flags.extend_from_slice(extra);
-            compare(&reference, elf, &jit_flags, args);
+            compare(&reference, elf, &jit_flags, args, jit_output);
         }
     }
     reference
 }
 
-/// Run the Rust emulator with `flags` and compare it with `reference`.
-fn compare(reference: &RunOutput, elf: &Path, flags: &[&str], args: &[&str]) {
+/// Run the Rust emulator with `flags` and compare it with `reference`
+/// (the guest's output only if `output`).
+fn compare(reference: &RunOutput, elf: &Path, flags: &[&str], args: &[&str], output: bool) {
     let rust =
         testutil::run_rust_with(rvlinux(), elf, flags, args).unwrap_or_else(|e| panic!("{e}"));
     let what = format!("{} {flags:?}", elf.display());
@@ -79,6 +88,9 @@ fn compare(reference: &RunOutput, elf: &Path, flags: &[&str], args: &[&str]) {
         exception,
         "exception differs for {what}"
     );
+    if !output {
+        return;
+    }
     match exception {
         None => assert_eq!(rust.stdout, reference.stdout, "stdout differs for {what}"),
         Some(line) => {
@@ -993,18 +1005,18 @@ fn freestanding_float() {
     if !have_tools() {
         return;
     }
+    // The output hashes NaN payloads, which are the host's in native code:
+    // `tests/jit.rs` (`fp_special_values_match_up_to_nan`) checks the same
+    // values against the interpreter up to NaNs.
     for march in FP_MARCHES {
         for opt in ["-O0", "-O2"] {
-            let out = diff(&build_freestanding(
-                FLOAT,
-                march,
-                &format!("{opt} {FP_ABI}"),
-            ));
+            let elf = build_freestanding(FLOAT, march, &format!("{opt} {FP_ABI}"));
+            let out = diff_jit_output(&elf, &[], &[], false);
             assert_eq!(out.exit_code, Some(0), "{}", out.stdout);
         }
         let elf = build_freestanding(FLOAT, march, &format!("-O2 {FP_ABI}"));
         for fuel in [1, 10, 100, 1000, 4321, 10_000, 54_321, 200_000] {
-            diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+            diff_jit_output(&elf, &["--fuel", &fuel.to_string()], &[], false);
         }
     }
 }

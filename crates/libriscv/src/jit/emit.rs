@@ -25,22 +25,38 @@
 //!
 //! # Memory safety
 //!
-//! Generated code only touches the state block, the 32 integer registers
-//! and the guest arena, and every arena access is preceded by the same range
-//! check as `Memory::read_*`/`write_*`. `libriscv-jit-rt` validates the
+//! Generated code only touches the state block, the 32 integer and 32
+//! floating-point registers and the guest arena, and every arena access is
+//! preceded by the same range check as `Memory::read_*`/`write_*`, or with
+//! an N-bit address space, masked with the arena size minus one (C++
+//! `arena_index` in `aj_emit.cpp`); `CodeMemory` checks the arena is that
+//! large. `libriscv-jit-rt` validates the
 //! checked windows against the real arena length. See its crate
-//! documentation for the full contract.
+//! documentation for the full contract. Besides other region functions, it
+//! only calls the pure floating-point helpers below (Cranelift's libcalls
+//! for rounding and FMA on hosts without SSE4.1 or FMA).
+//!
+//! # Floating point
+//!
+//! F/D arithmetic uses Cranelift's operations as they are: results for
+//! non-NaN inputs are the interpreter's (both use the host's IEEE
+//! operations in round-to-nearest), but which NaN comes out follows the
+//! host (NaN payloads are FCSR emulation's business). FMIN/FMAX with one
+//! NaN operand give the other one, and FCVT to integers honours the
+//! rounding mode and saturates (NaN to the maximum), exactly like the
+//! interpreter.
 
 use std::collections::HashMap;
 
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
-use cranelift_codegen::ir::types::{I8, I16, I32, I64};
+use cranelift_codegen::ir::types::{F32, F64, I8, I16, I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, Endianness, ExtFuncData, ExternalName, FuncRef, Function,
-    InstBuilder, MemFlagsData, SigRef, Signature, Type, UserExternalName, UserFuncName, Value,
+    InstBuilder, LibCall, MemFlagsData, SigRef, Signature, Type, UserExternalName, UserFuncName,
+    Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -48,7 +64,7 @@ use cranelift_codegen::{Context, RelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use libriscv_jit_rt::{CodeMemory, JitState};
 
-use super::classify::{AluI, AluR, Cond, JOp, Unary};
+use super::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary};
 use super::region::{Analysis, Insn, RegionId, block_icount};
 use super::{EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
@@ -84,9 +100,20 @@ fn host_isa() -> Option<OwnedTargetIsa> {
             },
         )
         .ok()?;
+    #[cfg(test)]
+    if BASELINE_ISA.load(std::sync::atomic::Ordering::Relaxed) {
+        // Plain x86-64 (SSE2): rounding and FMA become libcalls.
+        let isa = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").ok()?;
+        return isa.finish(settings::Flags::new(flags)).ok();
+    }
     let isa = cranelift_native::builder().ok()?;
     isa.finish(settings::Flags::new(flags)).ok()
 }
+
+/// Tests: compile for baseline x86-64 instead of the host's features.
+#[cfg(test)]
+pub(crate) static BASELINE_ISA: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn tail_signature() -> Signature {
     let mut sig = Signature::new(CallConv::Tail);
@@ -96,11 +123,76 @@ fn tail_signature() -> Signature {
     sig
 }
 
+/// What a relocation refers to.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// Another function of the image.
+    Function(usize),
+    /// A host function, by absolute address.
+    Host(u64),
+}
+
 /// One function's machine code and the calls in it that need linking.
 struct Object {
     bytes: Vec<u8>,
-    /// `(offset, kind, addend, target function)`
-    relocs: Vec<(usize, Reloc, i64, usize)>,
+    /// `(offset, kind, addend, target)`
+    relocs: Vec<(usize, Reloc, i64, Target)>,
+}
+
+// Cranelift's libcalls, for hosts without the instructions (SSE4.1's
+// `roundss`/`roundsd`, FMA). Plain Rust: the same results as the
+// interpreter's.
+extern "C" fn ceil_f32(x: f32) -> f32 {
+    x.ceil()
+}
+extern "C" fn ceil_f64(x: f64) -> f64 {
+    x.ceil()
+}
+extern "C" fn floor_f32(x: f32) -> f32 {
+    x.floor()
+}
+extern "C" fn floor_f64(x: f64) -> f64 {
+    x.floor()
+}
+extern "C" fn trunc_f32(x: f32) -> f32 {
+    x.trunc()
+}
+extern "C" fn trunc_f64(x: f64) -> f64 {
+    x.trunc()
+}
+extern "C" fn nearest_f32(x: f32) -> f32 {
+    x.round_ties_even()
+}
+extern "C" fn nearest_f64(x: f64) -> f64 {
+    x.round_ties_even()
+}
+extern "C" fn fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    a.mul_add(b, c)
+}
+extern "C" fn fma_f64(a: f64, b: f64, c: f64) -> f64 {
+    a.mul_add(b, c)
+}
+
+/// The address of the helper implementing `call`, if there is one.
+fn libcall_address(call: LibCall) -> Option<u64> {
+    type F1 = extern "C" fn(f32) -> f32;
+    type D1 = extern "C" fn(f64) -> f64;
+    type F3 = extern "C" fn(f32, f32, f32) -> f32;
+    type D3 = extern "C" fn(f64, f64, f64) -> f64;
+    let address = match call {
+        LibCall::CeilF32 => ceil_f32 as F1 as usize,
+        LibCall::CeilF64 => ceil_f64 as D1 as usize,
+        LibCall::FloorF32 => floor_f32 as F1 as usize,
+        LibCall::FloorF64 => floor_f64 as D1 as usize,
+        LibCall::TruncF32 => trunc_f32 as F1 as usize,
+        LibCall::TruncF64 => trunc_f64 as D1 as usize,
+        LibCall::NearestF32 => nearest_f32 as F1 as usize,
+        LibCall::NearestF64 => nearest_f64 as D1 as usize,
+        LibCall::FmaF32 => fma_f32 as F3 as usize,
+        LibCall::FmaF64 => fma_f64 as D3 as usize,
+        _ => return None,
+    };
+    u64::try_from(address).ok()
 }
 
 fn compile_function(ctx: &mut Context, isa: &OwnedTargetIsa) -> Option<Object> {
@@ -111,10 +203,15 @@ fn compile_function(ctx: &mut Context, isa: &OwnedTargetIsa) -> Option<Object> {
     };
     let mut relocs = Vec::new();
     for r in &raw {
-        let RelocTarget::ExternalName(ExternalName::User(name)) = &r.target else {
-            return None;
+        let target = match &r.target {
+            RelocTarget::ExternalName(ExternalName::User(name)) => {
+                Target::Function(ctx.func.params.user_named_funcs().get(*name)?.index as usize)
+            }
+            RelocTarget::ExternalName(ExternalName::LibCall(call)) => {
+                Target::Host(libcall_address(*call)?)
+            }
+            _ => return None,
         };
-        let target = ctx.func.params.user_named_funcs().get(*name)?.index as usize;
         relocs.push((r.offset as usize, r.kind, r.addend, target));
     }
     Some(Object { bytes, relocs })
@@ -128,6 +225,12 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
         Reloc::X86CallPCRel4 | Reloc::X86CallPLTRel4 => {
             let v = i32::try_from(pcrel).ok()?;
             image.get_mut(at..at + 4)?.copy_from_slice(&v.to_le_bytes());
+        }
+        // An absolute host address (`what` is one already).
+        Reloc::Abs8 => {
+            image
+                .get_mut(at..at + 8)?
+                .copy_from_slice(&what.to_le_bytes());
         }
         Reloc::Arm64Call => {
             let diff = pcrel >> 2;
@@ -145,7 +248,8 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
 }
 
 /// Compile every region of `a`, link them and map the result executable.
-pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis) -> Option<Compiled> {
+/// `mask`: see [`JitSegment::compile`](super::JitSegment::compile).
+pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, mask: u64) -> Option<Compiled> {
     if a.regions.is_empty() {
         return None;
     }
@@ -156,7 +260,7 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis) -> Option<Compiled> {
     for r in 0..a.regions.len() {
         ctx.clear();
         ctx.func = Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
-        RegionEmitter::emit(exec, a, r, &mut ctx.func, &mut fctx, &isa)?;
+        RegionEmitter::emit(exec, a, r, mask, &mut ctx.func, &mut fctx, &isa)?;
         objects.push(compile_function(&mut ctx, &isa)?);
     }
     // The trampoline: called from Rust with the C calling convention as
@@ -175,10 +279,14 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis) -> Option<Compiled> {
     }
     for (obj, &base) in objects.iter().zip(&offsets) {
         for &(offset, kind, addend, target) in &obj.relocs {
-            let what = i64::try_from(*offsets.get(target)?)
-                .ok()?
-                .checked_add(addend)?;
-            relocate(&mut image, base + offset, kind, what)?;
+            let what = match (target, kind) {
+                (Target::Function(f), _) if kind != Reloc::Abs8 => {
+                    i64::try_from(*offsets.get(f)?).ok()?
+                }
+                (Target::Host(address), Reloc::Abs8) => address as i64,
+                _ => return None,
+            };
+            relocate(&mut image, base + offset, kind, what.checked_add(addend)?)?;
         }
     }
 
@@ -190,7 +298,7 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis) -> Option<Compiled> {
         }
     }
     let trampoline = *offsets.last()?;
-    let code = CodeMemory::new(&image, trampoline, &entries).ok()?;
+    let code = CodeMemory::new(&image, trampoline, &entries, mask).ok()?;
     let patch = a
         .block_starts
         .iter()
@@ -240,13 +348,19 @@ struct RegionEmitter<'a, 'f> {
     exec: &'a DecodedSegment,
     a: &'a Analysis,
     region: RegionId,
+    /// Guest address mask, 0 for bounds checks.
+    mask: u64,
     b: FunctionBuilder<'f>,
     regs: [Variable; 32],
+    /// The FP registers, as raw 64-bit patterns.
+    fregs: [Variable; 32],
     counter: Variable,
     /// Registers written anywhere in the region (stored on every exit).
     written: [bool; 32],
+    fwritten: [bool; 32],
     state: Value,
     regs_ptr: Value,
+    fregs_ptr: Value,
     arena: Value,
     read_base: Value,
     read_len: Value,
@@ -271,26 +385,36 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         exec: &'a DecodedSegment,
         a: &'a Analysis,
         region: RegionId,
+        mask: u64,
         func: &'f mut Function,
         fctx: &'f mut FunctionBuilderContext,
         isa: &OwnedTargetIsa,
     ) -> Option<()> {
         let r = a.regions.get(region)?;
-        let mut used = [false; 32];
-        let mut written = [false; 32];
+        let (mut used, mut written) = ([false; 32], [false; 32]);
+        let (mut fused, mut fwritten) = ([false; 32], [false; 32]);
         for &i in &r.insns {
-            let (reads, write) = operands(a.insns.get(i)?.op);
-            for s in reads.into_iter().flatten() {
+            let u = operands(a.insns.get(i)?.op);
+            for s in u.x.into_iter().flatten() {
                 *used.get_mut(s as usize)? = true;
             }
-            if let Some(d) = write {
+            if let Some(d) = u.xw {
                 *used.get_mut(d as usize)? = true;
                 *written.get_mut(d as usize)? = true;
+            }
+            for s in u.f.into_iter().flatten() {
+                *fused.get_mut(s as usize)? = true;
+            }
+            if let Some(d) = u.fw {
+                // A single-precision write keeps the upper half: read it too.
+                *fused.get_mut(d as usize)? = true;
+                *fwritten.get_mut(d as usize)? = true;
             }
         }
 
         let mut b = FunctionBuilder::new(func, fctx);
         let regs: [Variable; 32] = std::array::from_fn(|_| b.declare_var(I64));
+        let fregs: [Variable; 32] = std::array::from_fn(|_| b.declare_var(I64));
         let counter = b.declare_var(I64);
         let tail_sig = b.import_signature(tail_signature());
 
@@ -305,6 +429,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let ld =
             |b: &mut FunctionBuilder<'_>, off: i32| b.ins().load(I64, host_flags(), state, off);
         let regs_ptr = ld(&mut b, JitState::OFFSET_REGS);
+        let fregs_ptr = ld(&mut b, JitState::OFFSET_FREGS);
         let arena = ld(&mut b, JitState::OFFSET_ARENA);
         let read_base = ld(&mut b, JitState::OFFSET_READ_BASE);
         let read_len = ld(&mut b, JitState::OFFSET_READ_LEN);
@@ -314,6 +439,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         for (n, (&u, &var)) in used.iter().zip(&regs).enumerate() {
             if u {
                 let v = b.ins().load(I64, host_flags(), regs_ptr, (n * 8) as i32);
+                b.def_var(var, v);
+            }
+        }
+        for (n, (&u, &var)) in fused.iter().zip(&fregs).enumerate() {
+            if u {
+                let v = b.ins().load(I64, host_flags(), fregs_ptr, (n * 8) as i32);
                 b.def_var(var, v);
             }
         }
@@ -332,12 +463,16 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             exec,
             a,
             region,
+            mask,
             b,
             regs,
+            fregs,
             counter,
             written,
+            fwritten,
             state,
             regs_ptr,
+            fregs_ptr,
             arena,
             read_base,
             read_len,
@@ -400,6 +535,56 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         #[allow(clippy::indexing_slicing)]
         let var = self.regs[(r & 31) as usize];
         self.b.def_var(var, v);
+    }
+
+    /// FP register `r` as raw bits.
+    fn freg(&mut self, r: u32) -> Value {
+        // The index is masked to 0..32, so it is always in bounds.
+        #[allow(clippy::indexing_slicing)]
+        let var = self.fregs[(r & 31) as usize];
+        self.b.use_var(var)
+    }
+
+    fn set_freg(&mut self, r: u32, v: Value) {
+        // The index is masked to 0..32, so it is always in bounds.
+        #[allow(clippy::indexing_slicing)]
+        let var = self.fregs[(r & 31) as usize];
+        self.b.def_var(var, v);
+    }
+
+    /// FP register `r` as an `F32` (its low half) or `F64`.
+    fn fval(&mut self, r: u32, dbl: bool) -> Value {
+        let bits = self.freg(r);
+        if dbl {
+            self.b.ins().bitcast(F64, MemFlagsData::new(), bits)
+        } else {
+            let lo = self.b.ins().ireduce(I32, bits);
+            self.b.ins().bitcast(F32, MemFlagsData::new(), lo)
+        }
+    }
+
+    /// Write `v` (`F32` or `F64`) to FP register `rd`. A single goes into the
+    /// low half, keeping the upper one (no NaN-boxing, as the interpreter).
+    fn set_fval(&mut self, rd: u32, v: Value) {
+        if self.b.func.dfg.value_type(v) == F64 {
+            let bits = self.b.ins().bitcast(I64, MemFlagsData::new(), v);
+            self.set_freg(rd, bits);
+        } else {
+            let bits = self.b.ins().bitcast(I32, MemFlagsData::new(), v);
+            self.set_low_word(rd, bits);
+        }
+    }
+
+    /// Replace the low 32 bits of FP register `rd` with the `I32` `word`.
+    fn set_low_word(&mut self, rd: u32, word: Value) {
+        let word = self.b.ins().uextend(I64, word);
+        let old = self.freg(rd);
+        let upper = self
+            .b
+            .ins()
+            .band_imm_s(old, 0xFFFF_FFFF_0000_0000u64 as i64);
+        let v = self.b.ins().bor(upper, word);
+        self.set_freg(rd, v);
     }
 
     fn count(&mut self) -> Value {
@@ -516,6 +701,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     .ins()
                     .store(host_flags(), v, self.regs_ptr, (n * 8) as i32);
             }
+            if self.fwritten.get(n as usize).copied().unwrap_or(false) {
+                let v = self.freg(n);
+                self.b
+                    .ins()
+                    .store(host_flags(), v, self.fregs_ptr, (n * 8) as i32);
+            }
         }
     }
 
@@ -617,8 +808,19 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
 
     /// Bounds-check `addr` against `[base, base + len)` and return the host
     /// address. Like `Memory`'s fast path, anything else goes to the page
-    /// table: the interpreter takes over at the instruction at `pc`.
+    /// table: the interpreter takes over at the instruction at `pc`. With
+    /// an N-bit address space, mask it instead, without a check.
     fn guest_addr(&mut self, addr: Value, write: bool, pc: u64) -> Value {
+        if self.mask != 0 {
+            let index = if self.mask == u64::from(u32::MAX) {
+                // A 32-bit zero extension, without materialising the mask.
+                let low = self.b.ins().ireduce(I32, addr);
+                self.b.ins().uextend(I64, low)
+            } else {
+                self.b.ins().band_imm_s(addr, self.mask as i64)
+            };
+            return self.b.ins().iadd(self.arena, index);
+        }
         let (base, len) = if write {
             (self.write_base, self.write_len)
         } else {
@@ -761,8 +963,319 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 self.b.ins().jump(blk, &args(&[target, c]));
                 return Some(false);
             }
+            JOp::FLoad {
+                width,
+                rd,
+                rs1,
+                imm,
+            } => {
+                let base = self.reg(rs1);
+                let addr = self.b.ins().iadd_imm_s(base, imm);
+                let host = self.guest_addr(addr, false, ins.pc);
+                if width == 4 {
+                    let w = self.b.ins().load(I32, guest_flags(), host, 0);
+                    self.set_low_word(rd, w);
+                } else {
+                    let v = self.b.ins().load(I64, guest_flags(), host, 0);
+                    self.set_freg(rd, v);
+                }
+            }
+            JOp::FStore {
+                width,
+                rs1,
+                rs2,
+                imm,
+            } => {
+                let base = self.reg(rs1);
+                let value = self.freg(rs2);
+                let addr = self.b.ins().iadd_imm_s(base, imm);
+                let host = self.guest_addr(addr, true, ins.pc);
+                self.store(width, value, host);
+            }
+            JOp::FBin {
+                op,
+                dbl,
+                rd,
+                rs1,
+                rs2,
+            } => self.fbin(op, dbl, rd, rs1, rs2),
+            JOp::FSqrt { dbl, rd, rs1 } => {
+                let a = self.fval(rs1, dbl);
+                let v = self.b.ins().sqrt(a);
+                self.set_fval(rd, v);
+            }
+            JOp::FFma {
+                op,
+                dbl,
+                rd,
+                rs1,
+                rs2,
+                rs3,
+            } => {
+                let a = self.fval(rs1, dbl);
+                let b = self.fval(rs2, dbl);
+                let c = self.fval(rs3, dbl);
+                let ins = &mut self.b;
+                let v = match op {
+                    FFma::Madd => ins.ins().fma(a, b, c),
+                    FFma::Msub => {
+                        let c = ins.ins().fneg(c);
+                        ins.ins().fma(a, b, c)
+                    }
+                    FFma::Nmsub => {
+                        let a = ins.ins().fneg(a);
+                        ins.ins().fma(a, b, c)
+                    }
+                    FFma::Nmadd => {
+                        let r = ins.ins().fma(a, b, c);
+                        ins.ins().fneg(r)
+                    }
+                };
+                self.set_fval(rd, v);
+            }
+            JOp::FCvtFF { to_dbl, rd, rs1 } => {
+                let a = self.fval(rs1, !to_dbl);
+                let v = if to_dbl {
+                    self.b.ins().fpromote(F64, a)
+                } else {
+                    self.b.ins().fdemote(F32, a)
+                };
+                self.set_fval(rd, v);
+            }
+            JOp::FCmp {
+                op,
+                dbl,
+                rd,
+                rs1,
+                rs2,
+            } => {
+                let a = self.fval(rs1, dbl);
+                let b = self.fval(rs2, dbl);
+                let cc = match op {
+                    FCmp::Eq => FloatCC::Equal,
+                    FCmp::Lt => FloatCC::LessThan,
+                    FCmp::Le => FloatCC::LessThanOrEqual,
+                };
+                let c = self.b.ins().fcmp(cc, a, b);
+                let v = self.b.ins().uextend(I64, c);
+                self.set_reg(rd, v);
+            }
+            JOp::FToInt {
+                kind,
+                dbl,
+                rm,
+                rd,
+                rs1,
+            } => {
+                let a = self.fval(rs1, dbl);
+                let v = self.fcvt_to_int(kind, rm, a);
+                self.set_reg(rd, v);
+            }
+            JOp::IntToF { kind, dbl, rd, rs1 } => {
+                let x = self.reg(rs1);
+                let ty = if dbl { F64 } else { F32 };
+                let ins = &mut self.b;
+                let v = match kind {
+                    FInt::W => {
+                        let w = ins.ins().ireduce(I32, x);
+                        ins.ins().fcvt_from_sint(ty, w)
+                    }
+                    FInt::Wu => {
+                        let w = ins.ins().ireduce(I32, x);
+                        ins.ins().fcvt_from_uint(ty, w)
+                    }
+                    FInt::L => ins.ins().fcvt_from_sint(ty, x),
+                    FInt::Lu => ins.ins().fcvt_from_uint(ty, x),
+                };
+                self.set_fval(rd, v);
+            }
+            JOp::FMvXF { dbl, rd, rs1 } => {
+                let bits = self.freg(rs1);
+                let v = if dbl {
+                    bits
+                } else {
+                    let lo = self.b.ins().ireduce(I32, bits);
+                    self.b.ins().sextend(I64, lo)
+                };
+                self.set_reg(rd, v);
+            }
+            JOp::FClass { dbl, rd, rs1 } => {
+                let bits = self.freg(rs1);
+                let v = self.fclass(dbl, bits);
+                self.set_reg(rd, v);
+            }
+            JOp::FMvFX { dbl, rd, rs1 } => {
+                let x = self.reg(rs1);
+                if dbl {
+                    self.set_freg(rd, x);
+                } else {
+                    let lo = self.b.ins().ireduce(I32, x);
+                    self.set_low_word(rd, lo);
+                }
+            }
         }
         Some(true)
+    }
+
+    fn fbin(&mut self, op: FBin, dbl: bool, rd: u32, rs1: u32, rs2: u32) {
+        if matches!(op, FBin::SgnJ | FBin::SgnJN | FBin::SgnJX) {
+            // Bit operations on the raw patterns; a single's are in the low
+            // half.
+            let a = self.freg(rs1);
+            let b = self.freg(rs2);
+            let sign: i64 = if dbl { i64::MIN } else { 0x8000_0000 };
+            let ins = &mut self.b;
+            let s = match op {
+                FBin::SgnJ => ins.ins().band_imm_s(b, sign),
+                FBin::SgnJN => {
+                    let n = ins.ins().bnot(b);
+                    ins.ins().band_imm_s(n, sign)
+                }
+                _ => {
+                    let x = ins.ins().bxor(a, b);
+                    ins.ins().band_imm_s(x, sign)
+                }
+            };
+            let mag = ins.ins().band_imm_s(a, !sign);
+            let v = ins.ins().bor(mag, s);
+            if dbl {
+                self.set_freg(rd, v);
+            } else {
+                let lo = self.b.ins().ireduce(I32, v);
+                self.set_low_word(rd, lo);
+            }
+            return;
+        }
+        let a = self.fval(rs1, dbl);
+        let b = self.fval(rs2, dbl);
+        let ins = &mut self.b;
+        let v = match op {
+            FBin::Add => ins.ins().fadd(a, b),
+            FBin::Sub => ins.ins().fsub(a, b),
+            FBin::Mul => ins.ins().fmul(a, b),
+            FBin::Div => ins.ins().fdiv(a, b),
+            _ => {
+                // Cranelift's fmin/fmax order -0 below +0 like RISC-V, but
+                // propagate NaN: one NaN operand gives the other operand
+                // (IEEE minNum, C's fmin), which is a number, not a NaN
+                // detail.
+                let m = if op == FBin::Min {
+                    ins.ins().fmin(a, b)
+                } else {
+                    ins.ins().fmax(a, b)
+                };
+                let a_nan = ins.ins().fcmp(FloatCC::Unordered, a, a);
+                let b_nan = ins.ins().fcmp(FloatCC::Unordered, b, b);
+                let m = ins.ins().select(b_nan, a, m);
+                ins.ins().select(a_nan, b, m)
+            }
+        };
+        self.set_fval(rd, v);
+    }
+
+    /// `fcvt_round`: round `x` per the RISC-V rounding mode `rm` (a
+    /// constant). Reserved modes round to nearest-even.
+    fn round(&mut self, rm: u32, x: Value) -> Value {
+        let ins = &mut self.b;
+        match rm {
+            1 => ins.ins().trunc(x),
+            2 => ins.ins().floor(x),
+            3 => ins.ins().ceil(x),
+            4 => {
+                // Ties away from zero: x - trunc(x) is exact.
+                let ty = ins.func.dfg.value_type(x);
+                let t = ins.ins().trunc(x);
+                let frac = ins.ins().fsub(x, t);
+                let frac = ins.ins().fabs(frac);
+                let (half, one) = if ty == F64 {
+                    (ins.ins().f64const(0.5), ins.ins().f64const(1.0))
+                } else {
+                    (ins.ins().f32const(0.5), ins.ins().f32const(1.0))
+                };
+                let away = ins.ins().fcmp(FloatCC::GreaterThanOrEqual, frac, half);
+                let step = ins.ins().fcopysign(one, x);
+                let up = ins.ins().fadd(t, step);
+                ins.ins().select(away, up, t)
+            }
+            _ => ins.ins().nearest(x),
+        }
+    }
+
+    /// `fcvt_to_integer` plus the interpreter's widening: round, convert
+    /// with saturation, NaN to the maximum; 32-bit results sign-extended.
+    fn fcvt_to_int(&mut self, kind: FInt, rm: u32, x: Value) -> Value {
+        let rounded = if rm == 7 {
+            // DYN: FCSR.frm, which native code can't change (CSR
+            // instructions are interpreted).
+            let frm = self
+                .b
+                .ins()
+                .load(I64, host_flags(), self.state, JitState::OFFSET_FRM);
+            let mut v = self.round(0, x);
+            for mode in 1..=4 {
+                let r = self.round(mode, x);
+                let is = self.b.ins().icmp_imm_s(IntCC::Equal, frm, i64::from(mode));
+                v = self.b.ins().select(is, r, v);
+            }
+            v
+        } else if rm == 1 {
+            // The saturating conversions truncate already.
+            x
+        } else {
+            self.round(rm, x)
+        };
+        let ins = &mut self.b;
+        let (v, max) = match kind {
+            FInt::W => {
+                let v = ins.ins().fcvt_to_sint_sat(I32, rounded);
+                (ins.ins().sextend(I64, v), i64::from(i32::MAX))
+            }
+            FInt::Wu => {
+                let v = ins.ins().fcvt_to_uint_sat(I32, rounded);
+                (ins.ins().sextend(I64, v), -1)
+            }
+            FInt::L => (ins.ins().fcvt_to_sint_sat(I64, rounded), i64::MAX),
+            FInt::Lu => (ins.ins().fcvt_to_uint_sat(I64, rounded), -1),
+        };
+        let nan = ins.ins().fcmp(FloatCC::Unordered, x, x);
+        let max = ins.ins().iconst(I64, max);
+        ins.ins().select(nan, max, v)
+    }
+
+    /// `rv_fclass32`/`rv_fclass64` on the raw bits: exactly one bit set.
+    fn fclass(&mut self, dbl: bool, bits: Value) -> Value {
+        let ins = &mut self.b;
+        let (bits, exp_shift, exp_max, frac_mask, quiet) = if dbl {
+            (bits, 52, 0x7FF, 0xF_FFFF_FFFF_FFFFi64, 1i64 << 51)
+        } else {
+            let lo = ins.ins().ireduce(I32, bits);
+            (ins.ins().uextend(I64, lo), 23, 0xFF, 0x7F_FFFF, 1 << 22)
+        };
+        let sign_bit = if dbl { 63 } else { 31 };
+        let sign = ins.ins().ushr_imm_s(bits, sign_bit);
+        let negative = ins.ins().icmp_imm_s(IntCC::NotEqual, sign, 0);
+        let exp = ins.ins().ushr_imm_s(bits, exp_shift);
+        let exp = ins.ins().band_imm_s(exp, exp_max);
+        let frac = ins.ins().band_imm_s(bits, frac_mask);
+        let is_max = ins.ins().icmp_imm_s(IntCC::Equal, exp, exp_max);
+        let is_zero_exp = ins.ins().icmp_imm_s(IntCC::Equal, exp, 0);
+        let frac_zero = ins.ins().icmp_imm_s(IntCC::Equal, frac, 0);
+        let q = ins.ins().band_imm_s(frac, quiet);
+        let is_quiet = ins.ins().icmp_imm_s(IntCC::NotEqual, q, 0);
+        let mut pick = |c: Value, yes: i64, no: i64| {
+            let y = ins.ins().iconst(I64, yes);
+            let n = ins.ins().iconst(I64, no);
+            ins.ins().select(c, y, n)
+        };
+        let inf = pick(negative, 1 << 0, 1 << 7);
+        let nan = pick(is_quiet, 1 << 9, 1 << 8);
+        let zero = pick(negative, 1 << 3, 1 << 4);
+        let subnormal = pick(negative, 1 << 2, 1 << 5);
+        let normal = pick(negative, 1 << 1, 1 << 6);
+        let special = ins.ins().select(frac_zero, inf, nan);
+        let small = ins.ins().select(frac_zero, zero, subnormal);
+        let v = ins.ins().select(is_zero_exp, small, normal);
+        ins.ins().select(is_max, special, v)
     }
 
     fn indirect_block(&mut self) -> Block {
@@ -1082,17 +1595,80 @@ const fn intcc(cond: Cond) -> IntCC {
     }
 }
 
-/// The registers an instruction reads and the one it writes.
-fn operands(op: JOp) -> ([Option<u32>; 2], Option<u32>) {
+/// The registers an instruction reads and writes.
+#[derive(Debug, Default)]
+struct Operands {
+    /// Integer registers read.
+    x: [Option<u32>; 2],
+    /// Integer register written.
+    xw: Option<u32>,
+    /// FP registers read.
+    f: [Option<u32>; 3],
+    /// FP register written.
+    fw: Option<u32>,
+}
+
+fn operands(op: JOp) -> Operands {
+    let int = |x: [Option<u32>; 2], xw: Option<u32>| Operands {
+        x,
+        xw,
+        ..Default::default()
+    };
     match op {
-        JOp::Nop | JOp::Fence => ([None, None], None),
-        JOp::Const { rd, .. } => ([None, None], Some(rd)),
-        JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => ([Some(rs1), None], Some(rd)),
-        JOp::Alu { rd, rs1, rs2, .. } => ([Some(rs1), Some(rs2)], Some(rd)),
-        JOp::Load { rd, rs1, .. } => ([Some(rs1), None], rd),
-        JOp::Store { rs1, rs2, .. } => ([Some(rs1), Some(rs2)], None),
-        JOp::Branch { rs1, rs2, .. } => ([Some(rs1), rs2], None),
-        JOp::Jal { rd, .. } => ([None, None], (rd != 0).then_some(rd)),
-        JOp::Jalr { rd, rs1, .. } => ([Some(rs1), None], (rd != 0).then_some(rd)),
+        JOp::Nop | JOp::Fence => Operands::default(),
+        JOp::Const { rd, .. } => int([None, None], Some(rd)),
+        JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => {
+            int([Some(rs1), None], Some(rd))
+        }
+        JOp::Alu { rd, rs1, rs2, .. } => int([Some(rs1), Some(rs2)], Some(rd)),
+        JOp::Load { rd, rs1, .. } => int([Some(rs1), None], rd),
+        JOp::Store { rs1, rs2, .. } => int([Some(rs1), Some(rs2)], None),
+        JOp::Branch { rs1, rs2, .. } => int([Some(rs1), rs2], None),
+        JOp::Jal { rd, .. } => int([None, None], (rd != 0).then_some(rd)),
+        JOp::Jalr { rd, rs1, .. } => int([Some(rs1), None], (rd != 0).then_some(rd)),
+        JOp::FLoad { rd, rs1, .. } => Operands {
+            x: [Some(rs1), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FStore { rs1, rs2, .. } => Operands {
+            x: [Some(rs1), None],
+            f: [Some(rs2), None, None],
+            ..Default::default()
+        },
+        JOp::FBin { rd, rs1, rs2, .. } => Operands {
+            f: [Some(rs1), Some(rs2), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FSqrt { rd, rs1, .. } | JOp::FCvtFF { rd, rs1, .. } => Operands {
+            f: [Some(rs1), None, None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FFma {
+            rd, rs1, rs2, rs3, ..
+        } => Operands {
+            f: [Some(rs1), Some(rs2), Some(rs3)],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FCmp { rd, rs1, rs2, .. } => Operands {
+            xw: Some(rd),
+            f: [Some(rs1), Some(rs2), None],
+            ..Default::default()
+        },
+        JOp::FToInt { rd, rs1, .. } | JOp::FMvXF { rd, rs1, .. } | JOp::FClass { rd, rs1, .. } => {
+            Operands {
+                xw: Some(rd),
+                f: [Some(rs1), None, None],
+                ..Default::default()
+            }
+        }
+        JOp::IntToF { rd, rs1, .. } | JOp::FMvFX { rd, rs1, .. } => Operands {
+            x: [Some(rs1), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
     }
 }

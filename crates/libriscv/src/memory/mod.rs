@@ -90,6 +90,10 @@ pub struct Memory {
     /// Compile them on background threads (`MachineOptions::jit_background`).
     #[cfg(feature = "jit")]
     jit_background: bool,
+    /// The JIT's guest address mask, 0 for bounds checks
+    /// (`MachineOptions::jit_automatic_nbit_address_space`).
+    #[cfg(feature = "jit")]
+    jit_arena_mask: u64,
     /// Background compilations not installed yet.
     #[cfg(feature = "jit")]
     jit_pending: Vec<crate::jit::BackgroundJit>,
@@ -239,6 +243,8 @@ impl Memory {
             #[cfg(feature = "jit")]
             jit_background: options.jit_background,
             #[cfg(feature = "jit")]
+            jit_arena_mask: jit_arena_mask(options, arena_size),
+            #[cfg(feature = "jit")]
             jit_pending: Vec::new(),
             #[cfg(feature = "ext-a")]
             atomics: Default::default(),
@@ -383,7 +389,7 @@ impl Memory {
         let mut segment = DecodedSegment::new(code, vaddr, execute_only)?;
         #[cfg(feature = "jit")]
         if self.jit && !self.jit_background {
-            crate::jit::JitSegment::attach(&mut segment);
+            crate::jit::JitSegment::attach(&mut segment, self.jit_arena_mask);
         }
         let segment = Arc::new(segment);
         // The first segment becomes the main one. (C++ takes the slot before
@@ -401,8 +407,10 @@ impl Memory {
         }
         #[cfg(feature = "jit")]
         if self.jit && self.jit_background {
-            self.jit_pending
-                .push(crate::jit::BackgroundJit::spawn(&segment));
+            self.jit_pending.push(crate::jit::BackgroundJit::spawn(
+                &segment,
+                self.jit_arena_mask,
+            ));
         }
         Ok(segment)
     }
@@ -501,6 +509,25 @@ impl Memory {
             segment.set_stale(true);
         }
     }
+}
+
+/// The JIT's guest address mask for an arena of `arena_size` bytes (the
+/// N-bit address space of C++ `aj_translate.cpp`), 0 for bounds checks.
+#[cfg(feature = "jit")]
+fn jit_arena_mask(options: &MachineOptions, arena_size: u64) -> u64 {
+    if !options.jit || !options.jit_automatic_nbit_address_space || arena_size == 0 {
+        return 0;
+    }
+    if arena_size.is_power_of_two() {
+        return arena_size - 1;
+    }
+    if options.verbose_loader {
+        eprintln!(
+            "libriscv: the JIT cannot use an automatic N-bit address space for a \
+             {arena_size}-byte arena; it is not a power of two"
+        );
+    }
+    0
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ struct CliArgs {
     silent: bool,
     jit: bool,
     no_background: bool,
+    nbit: bool,
     sandbox: bool,
     proxy: bool,
     allowed_files: Vec<String>,
@@ -44,6 +45,9 @@ fn usage(name: &str) {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
         println!("  -B, --background   Compile in the background while interpreting (default)");
         println!("      --no-background Compile each segment before running it");
+        println!(
+            "      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them"
+        );
     }
 }
 
@@ -76,6 +80,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "-j" | "--jit" if cfg!(feature = "jit") => args.jit = true,
             "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
             "--no-background" if cfg!(feature = "jit") => args.no_background = true,
+            "--nbit-address-space" if cfg!(feature = "jit") => args.nbit = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
@@ -140,6 +145,7 @@ fn main() -> ExitCode {
         jit: args.jit,
         // C++ rvlinux compiles in the background by default too.
         jit_background: !args.no_background,
+        jit_automatic_nbit_address_space: args.nbit,
         ..Default::default()
     };
     let mut machine = match libriscv::Machine::new(&binary, options) {

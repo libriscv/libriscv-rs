@@ -255,8 +255,11 @@ copies the linked image into an `mmap` (`memmap2`), validates the entry
 table and the guest-memory windows against the real arena length, and
 enters code through one `transmute`d trampoline pointer. `libriscv` stays
 `forbid(unsafe_code)`. The generated code's own memory safety (the inlined
-arena bounds checks) is the trust boundary; the rt crate documents the
-contract the code generator must keep.
+arena bounds checks, or the address mask, see "N-bit address space") is
+the trust boundary; the rt crate documents the contract the code generator
+must keep. Besides other region functions, native code only calls
+Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
+`emit.rs` (only used on hosts without SSE4.1 or FMA).
 
 **Design** (mirrors `aj_translate.cpp`/`aj_emit.cpp`):
 
@@ -271,17 +274,30 @@ contract the code generator must keep.
   jumps via the entry table and `return_call_indirect`), so calls, returns
   and loops never go back through the interpreter, and the stack doesn't
   grow.
-- Guest registers live in SSA variables, loaded on function entry and stored
-  on exit; arena loads/stores are inlined with `Memory`'s exact range checks.
+- Guest registers (integer and FP, the latter as raw 64-bit patterns) live
+  in SSA variables, loaded on function entry and stored on exit; arena
+  loads/stores are inlined with `Memory`'s exact range checks.
   An access outside them leaves native code at that instruction
   (`EXIT_SLOW`): the interpreter runs it through the page table and
   finishes the (already counted) block.
 - Decoder entries at block starts that native code can be entered at get the
   `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
   Native code exits to the interpreter on anything it doesn't compile
-  (system calls, CSRs, atomics, F/D, FENCE.I, CBO, CLMUL, FUNCBLOCK
-  entries), on faults and at the instruction limit, with exactly the PC,
-  registers and counter the interpreter would have.
+  (system calls, CSRs incl. FCSR, atomics, Zfa, Zfhmin, FENCE.I, CBO,
+  CLMUL, FUNCBLOCK entries), on faults and at the instruction limit, with
+  exactly the PC, registers and counter the interpreter would have.
+- F and D (not in the `debug-checks` build, which NaN-boxes): Cranelift's
+  IEEE operations as they are, whatever is fastest. For non-NaN inputs
+  that's the interpreter's result (both round to nearest on the host, and
+  ignore the instruction's rounding mode, as C++ does without FCSR
+  emulation); which NaN comes out is the host's (NaN payloads belong to
+  FCSR emulation; C++ asmjit canonicalises in FMIN/FMAX and FCVT.S.D).
+  FMIN/FMAX with one NaN operand return the other operand (a number, as
+  C's `fmin` requires). FCVT to integers is exact:
+  the instruction's rounding mode (DYN reads FCSR.frm, which native code
+  can't change), saturation, NaN to the maximum, like C++'s helper call. A
+  single-precision write keeps the upper half of the register (no
+  NaN-boxing), like the interpreter.
 - Instruction selection follows `decode::fast_handler`, not the precise
   decoder, quirks included. `x0` is still read from the register file rather
   than assumed zero.
@@ -323,9 +339,28 @@ machine state (registers, PC, counter, memory, error) between JIT and
 interpreter for hand-written and random programs at ~50 instruction limits
 each, and the same with background compilation (where the code arrives at
 an arbitrary point); `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer
-sessions (400k programs clean on 2026-11-12). With the feature, the
-difftests run `--jit` both with background compilation and with
-`--no-background`.
+sessions (400k programs clean on 2026-11-12). FP programs are straight-line
+code with a block end after every instruction, compared exactly up to the
+first NaN in an FP register (then with any NaN matching any NaN, once);
+the integer programs also contain the FP instructions that only move bits
+(loads, stores, moves, sign injection, FCLASS, compares, integer
+conversions), compared exactly. With the feature, the difftests run
+`--jit` both with background compilation and with `--no-background`.
+
+**N-bit address space** (C++ `translate_automatic_nbit_address_space`,
+`MachineOptions::jit_automatic_nbit_address_space`, `rvlinux
+--nbit-address-space`): with a power-of-two arena, native loads and stores
+use `arena + (addr & (arena_size - 1))` without any check (a 32-bit mask
+is a zero extension), like asmjit's `arena_index`. Native code then reads
+and writes anywhere in the arena, read-only data and page 0 included, and
+addresses outside it wrap instead of going to the page table; the
+interpreter is unchanged. Other arena sizes stay checked (with a message
+under `verbose_loader`; `rvlinux`'s default 4000 MiB isn't a power of two,
+`-m 4096` is). The mask is a constant in the code; `CodeMemory` records it
+and refuses to enter code whose mask plus the widest access doesn't fit in
+the arena (which has a padding page for exactly that). Tests:
+`tests/nbit_arena.rs` (port of `nbit_arena.cpp`) and the `nbit_*` cases
+in `tests/jit.rs`.
 
 **Performance** (2026-11-12, freestanding CoreMark built from
 `../coremark/barebones`, 4000 iterations, `--accurate`, best of 3):
@@ -341,7 +376,7 @@ Execution is within ~5% of asmjit, and the JIT's instruction counts are
 exact (asmjit's are off by a few). Cranelift compiles more slowly: compiling
 the segment up front takes ~60 ms of CoreMark's 0.34 s wall time (asmjit:
 0.26 s total). Next steps: background or lazy compilation, register passing
-across tail calls, F/D, AArch64. Background compilation (added later, see
+across tail calls, AArch64 (F/D came later). Background compilation (added later, see
 Baseline for current numbers) saves ~5-10 ms on CoreMark, the same as
 asmjit's: during the compile, the interpreter only gets through ~1/7 of
 what native code would have.
@@ -394,7 +429,8 @@ what native code would have.
   exits to the interpreter at that instruction (`EXIT_SLOW`), which runs
   it through the page table and finishes the block with the interpreter's
   handlers (the block is already counted), so results and counts don't
-  depend on the JIT.
+  depend on the JIT. (With an N-bit address space, native code never
+  reaches the page table: see "JIT".)
 
 Dynamic executables: `rvlinux` loads the program's `PT_INTERP` (falling
 back to `/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1`) as the
@@ -629,9 +665,11 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Instruction fusion (`rvi_fuse.cpp`)
 - [ ] Shared execute segments across machines (`decoded_exec_segment.hpp`, `shared_rodata.cpp`)
 - [ ] Bounds-check elimination audit (`cargo asm`)
-- [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMC, Zcb, B (no CLMUL), Zicond
+- [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
-- [ ] JIT: lazy compilation, F/D, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
+- [x] JIT: F/D (FCVT to integers exact, NaNs the host's)
+- [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
+- [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features
 

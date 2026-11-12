@@ -107,10 +107,11 @@ impl Registers {
         &self.x
     }
 
-    /// All 32 integer registers, mutably, for the JIT's state block.
+    /// All 32 integer and floating-point registers, mutably, for the JIT's
+    /// state block.
     #[cfg(feature = "jit")]
-    pub(crate) const fn x_mut(&mut self) -> &mut [u64; 32] {
-        &mut self.x
+    pub(crate) const fn x_f_mut(&mut self) -> (&mut [u64; 32], &mut [u64; 32]) {
+        (&mut self.x, &mut self.f)
     }
 
     /// The raw 64 bits of floating-point register `idx` (only the low 5

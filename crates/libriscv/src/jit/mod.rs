@@ -82,22 +82,23 @@ pub(crate) enum BackgroundResult {
 }
 
 impl BackgroundJit {
-    /// Start compiling `segment` on a new thread. If no thread can be
+    /// Start compiling `segment` (with the guest address mask `mask`, see
+    /// [`JitSegment::compile`]) on a new thread. If no thread can be
     /// started, compiles synchronously instead.
-    pub(crate) fn spawn(segment: &Arc<DecodedSegment>) -> Self {
+    pub(crate) fn spawn(segment: &Arc<DecodedSegment>, mask: u64) -> Self {
         let (tx, rx) = mpsc::sync_channel(1);
         let shared = Arc::clone(segment);
         let spawned = std::thread::Builder::new()
             .name("libriscv-jit".into())
             .spawn(move || {
                 // The machine may be gone by now: then nobody listens.
-                let _ = tx.send(JitSegment::compile(&shared));
+                let _ = tx.send(JitSegment::compile(&shared, mask));
             });
         let result = match spawned {
             Ok(_) => rx,
             Err(_) => {
                 let (tx, rx) = mpsc::sync_channel(1);
-                let _ = tx.send(JitSegment::compile(segment));
+                let _ = tx.send(JitSegment::compile(segment, mask));
                 rx
             }
         };
@@ -164,17 +165,20 @@ pub(crate) enum JitExit {
 impl JitSegment {
     /// Compile `exec` and patch its decoder entries to enter the native code.
     /// Leaves `exec` untouched if nothing could be compiled.
-    pub(crate) fn attach(exec: &mut DecodedSegment) {
-        if let Some(compiled) = Self::compile(exec) {
+    pub(crate) fn attach(exec: &mut DecodedSegment, mask: u64) {
+        if let Some(compiled) = Self::compile(exec, mask) {
             Self::install(exec, compiled);
         }
     }
 
     /// Compile `exec` without changing it. Only reads the segment, so it can
     /// run on another thread while the interpreter executes the segment.
-    pub(crate) fn compile(exec: &DecodedSegment) -> Option<Compiled> {
+    /// With a non-zero `mask` (the arena size minus one, a power of two
+    /// minus one), guest addresses are masked instead of bounds-checked
+    /// (`MachineOptions::jit_automatic_nbit_address_space`).
+    pub(crate) fn compile(exec: &DecodedSegment, mask: u64) -> Option<Compiled> {
         let analysis = region::analyse(exec);
-        emit::compile(exec, &analysis)
+        emit::compile(exec, &analysis, mask)
     }
 
     /// Patch `exec`'s decoder entries to enter `compiled`.
@@ -222,9 +226,10 @@ impl JitSegment {
             m.memory.initial_rodata_end(),
             m.memory.memory_arena_write_boundary(),
         );
-        let regs = m.cpu.regs.x_mut();
+        let frm = u64::from(m.cpu.regs.fcsr().frm());
+        let (regs, fregs) = m.cpu.regs.x_f_mut();
         let arena = m.memory.arena_mut();
-        let Some(mut state) = JitState::new(regs, arena, read, write, max) else {
+        let Some(mut state) = JitState::new(regs, fregs, arena, read, write, max, frm) else {
             return JitExit::Unavailable;
         };
         if !self.code.enter(&mut state, slot, pc, counter) {
@@ -345,6 +350,130 @@ mod tests {
         let mut state = m.cpu.registers().all().to_vec();
         state.extend([m.cpu.pc(), m.instruction_counter(), m.max_instructions()]);
         (result, state)
+    }
+
+    /// F and D are compiled, apart from the formats and Zfa/Zfhmin
+    /// encodings the interpreter rejects or handles in software.
+    #[test]
+    #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+    fn fp_instructions_are_compiled() {
+        const fn fp(fpfunc: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+            (((fpfunc << 2) | fmt) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (rm << 12)
+                | (rd << 7)
+                | 0x53
+        }
+        let native = [
+            (2 << 12) | (1 << 7) | (10 << 15) | 0x07,  // flw ft1, 0(a0)
+            (3 << 12) | (1 << 7) | (10 << 15) | 0x07,  // fld ft1, 0(a0)
+            (3 << 12) | (1 << 20) | (10 << 15) | 0x27, // fsd ft1, 0(a0)
+            (3 << 27) | (1 << 25) | (2 << 20) | (1 << 15) | 0x43, // fmadd.d
+            (3 << 27) | (2 << 20) | (1 << 15) | 0x4F,  // fnmadd.s
+            fp(0x00, 1, 7, 1, 2, 3),                   // fadd.d
+            fp(0x03, 0, 0, 1, 2, 3),                   // fdiv.s
+            fp(0x04, 1, 2, 1, 2, 3),                   // fsgnjx.d
+            fp(0x05, 0, 1, 1, 2, 3),                   // fmax.s
+            fp(0x0B, 1, 0, 1, 2, 0),                   // fsqrt.d
+            fp(0x08, 0, 0, 1, 2, 1),                   // fcvt.s.d
+            fp(0x08, 1, 0, 1, 2, 0),                   // fcvt.d.s
+            fp(0x14, 1, 2, 10, 2, 3),                  // feq.d a0
+            fp(0x14, 1, 2, 0, 2, 3),                   // feq.d x0 (a NOP)
+            fp(0x18, 1, 4, 10, 2, 0),                  // fcvt.w.d a0, rmm
+            fp(0x18, 0, 7, 10, 2, 3),                  // fcvt.lu.s a0, dyn
+            fp(0x1A, 1, 0, 1, 10, 3),                  // fcvt.d.lu
+            fp(0x1C, 1, 0, 10, 2, 0),                  // fmv.x.d
+            fp(0x1C, 0, 1, 10, 2, 0),                  // fclass.s
+            fp(0x1E, 0, 0, 1, 10, 0),                  // fmv.w.x
+        ];
+        let interpreted = [
+            (1 << 12) | (1 << 7) | (10 << 15) | 0x07,     // flh (Zfhmin)
+            fp(0x00, 2, 0, 1, 2, 3),                      // fadd.h
+            fp(0x05, 1, 2, 1, 2, 3),                      // fminm.d (Zfa)
+            fp(0x08, 0, 0, 1, 2, 4),                      // fround.s (Zfa)
+            fp(0x08, 0, 0, 1, 2, 2),                      // fcvt.s.h
+            fp(0x18, 1, 1, 10, 2, 8),                     // fcvtmod.w.d (Zfa)
+            fp(0x1E, 1, 0, 1, 1, 1),                      // fli.d (Zfa)
+            (0x003 << 20) | (2 << 12) | (10 << 7) | 0x73, // frcsr a0
+        ];
+        for (words, expect) in [(&native[..], true), (&interpreted[..], false)] {
+            for &w in words {
+                let code: Vec<u8> = [w, JSELF].iter().flat_map(|w| w.to_le_bytes()).collect();
+                let mut m = Machine::new(
+                    &[],
+                    MachineOptions {
+                        memory_max: 1 << 20,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                m.init_execute_area(&code, V).unwrap();
+                let a = super::region::analyse(m.cpu.current_execute_segment());
+                let compiled = a.insns.iter().any(|i| i.pc == V);
+                assert_eq!(compiled, expect, "{w:#010x}");
+            }
+        }
+    }
+
+    /// Without SSE4.1 and FMA, rounding and FMA are calls to the helpers in
+    /// `emit`: the same results as the interpreter.
+    #[test]
+    #[cfg(all(feature = "ext-f", not(feature = "debug-checks"), target_os = "linux"))]
+    fn fp_libcalls_match_the_interpreter() {
+        use std::sync::atomic::Ordering;
+        const fn fp(fpfunc: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+            (((fpfunc << 2) | fmt) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (rm << 12)
+                | (rd << 7)
+                | 0x53
+        }
+        let mut code = Vec::new();
+        for rm in 0..8 {
+            code.push(fp(0x18, 1, rm, 10 + rm, 1, 2)); // fcvt.l.d a(rm), ft1, rm
+            code.push(fp(0x18, 0, rm, 18 + rm % 6, 2, 0)); // fcvt.w.s s(..), ft2, rm
+        }
+        code.push((3 << 27) | (1 << 25) | (2 << 20) | (1 << 15) | (4 << 7) | 0x43); // fmadd.d ft4
+        code.push((3 << 27) | (2 << 20) | (1 << 15) | (5 << 7) | 0x4B); // fnmsub.s ft5
+        code.push(JSELF);
+        let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let run = |jit: bool, a: f64, b: f32| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            if jit {
+                assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
+            }
+            m.cpu.registers_mut().set_fp_bits(1, a.to_bits());
+            m.cpu.registers_mut().set_fp_bits(2, u64::from(b.to_bits()));
+            m.cpu.registers_mut().set_fp_bits(3, 0.1f64.to_bits());
+            m.cpu.registers_mut().fcsr_mut().set_frm(3);
+            m.cpu.jump(V).unwrap();
+            let _ = m.try_simulate(100, 0);
+            (
+                m.cpu.registers().all().to_vec(),
+                m.cpu.registers().all_fp().to_vec(),
+            )
+        };
+        super::emit::BASELINE_ISA.store(true, Ordering::Relaxed);
+        for (a, b) in [
+            (2.5, -2.5f32),
+            (-3.5, 3.5),
+            (1e15 + 0.5, 0.49999997),
+            (-0.5, -1.5),
+        ] {
+            assert_eq!(run(true, a, b), run(false, a, b), "{a} {b}");
+        }
+        super::emit::BASELINE_ISA.store(false, Ordering::Relaxed);
     }
 
     #[test]
