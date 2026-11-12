@@ -1,0 +1,4 @@
+/target
+*.elf
+!crates/**/fixtures/*.elf
+perf.data*

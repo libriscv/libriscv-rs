@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/libriscv", "crates/rvlinux", "crates/testutil"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/libriscv/libriscv-rs"
+
+[workspace.dependencies]
+libriscv = { path = "crates/libriscv" }
+testutil = { path = "crates/testutil" }
+
+# The whole point of this port: no `unsafe` anywhere, in any crate.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# Emulator code does a lot of deliberate integer reinterpretation; keep these
+# visible in review but don't fail on them.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+# Catch accidental panics on guest-controlled input.
+indexing_slicing = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+inherits = "release"

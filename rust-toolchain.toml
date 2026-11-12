@@ -1,0 +1,6 @@
+# Pinned nightly: the interpreter dispatch relies on guaranteed tail calls
+# (`become`, feature `explicit_tail_calls`). Bump deliberately and re-run the
+# full test suite and benchmarks; see "Toolchain" in PORTING.md.
+[toolchain]
+channel = "nightly-2026-09-28"
+components = ["rustfmt", "clippy"]

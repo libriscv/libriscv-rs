@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # C++ libriscv commit used as the differential-testing oracle.
+  # Keep in sync with PORTING.md.
+  LIBRISCV_CPP_REF: bd7ea507fb8e4b5755386e83fb0ef7788c1aa2f2
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install RISC-V cross compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-14-riscv64-linux-gnu g++-14-riscv64-linux-gnu cmake ninja-build
+
+      - name: Cache C++ reference emulator
+        id: cache-ref
+        uses: actions/cache@v4
+        with:
+          path: libriscv-cpp/emulator/.build/rvlinux
+          key: rvlinux-${{ env.LIBRISCV_CPP_REF }}
+
+      - name: Fetch C++ libriscv
+        run: |
+          git init libriscv-cpp
+          git -C libriscv-cpp fetch --depth 1 https://github.com/libriscv/libriscv.git "$LIBRISCV_CPP_REF"
+          git -C libriscv-cpp checkout FETCH_HEAD
+
+      - name: Build C++ reference emulator
+        if: steps.cache-ref.outputs.cache-hit != 'true'
+        run: |
+          cmake -S libriscv-cpp/emulator -B libriscv-cpp/emulator/.build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DRISCV_BINARY_TRANSLATION=OFF
+          cmake --build libriscv-cpp/emulator/.build --target rvlinux
+
+      - name: Test
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+          LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          LIBRISCV_REQUIRE_TOOLCHAIN: "1"
+        run: cargo test --workspace
+
+      - name: Test without the C extension (4-byte decoder layout)
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+          LIBRISCV_CPP_EMULATOR: ${{ github.workspace }}/libriscv-cpp/emulator/.build/rvlinux
+          LIBRISCV_REQUIRE_TOOLCHAIN: "1"
+        run: cargo test -p libriscv --no-default-features
+
+  features:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - run: cargo build -p libriscv --no-default-features
+      - run: cargo build -p libriscv --all-features

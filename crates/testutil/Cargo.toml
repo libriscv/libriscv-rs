@@ -1,0 +1,12 @@
+[package]
+name = "testutil"
+description = "Test helpers: cross-compile RISC-V guests and run the C++ libriscv reference emulator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

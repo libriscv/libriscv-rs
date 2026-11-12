@@ -1,0 +1,27 @@
+[package]
+name = "libriscv"
+description = "Safe-Rust port of libriscv, a fast RISC-V userspace emulator for sandboxing and scripting"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# RV64 only: the port does not support RV32 or RV128.
+default = ["ext-a", "ext-c", "ext-f", "ext-v"]
+ext-a = []
+ext-c = []
+ext-f = []
+ext-v = []
+# Software FCSR rounding-mode/flags emulation (C++: RISCV_FCSR).
+fcsr = []
+# Extra runtime checks (C++: RISCV_DEBUG).
+debug-checks = []
+
+[dependencies]
+
+[dev-dependencies]
+testutil.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+# Tests may panic/unwrap freely; production code must not panic on guest input.
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true

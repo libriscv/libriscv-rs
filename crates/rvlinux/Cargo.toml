@@ -1,0 +1,17 @@
+[package]
+name = "rvlinux"
+description = "Command-line RISC-V Linux userspace emulator built on libriscv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+libriscv.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+testutil.workspace = true
