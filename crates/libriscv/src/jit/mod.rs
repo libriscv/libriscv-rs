@@ -10,11 +10,16 @@
 //! compile, a fault or the instruction limit. Then the interpreter resumes
 //! with exactly the PC, registers and instruction count it would have had.
 //!
+//! The code compiled for a segment can be saved and used again by later
+//! runs, linked into the program or loaded from a shared object; see
+//! [`cache`].
+//!
 //! This module has no `unsafe` code: placing the code in executable memory
 //! and entering it is done by `libriscv-jit-rt`.
 //!
 //! [`jit_enter`]: crate::dispatch::jit_enter
 
+pub(crate) mod cache;
 mod classify;
 mod emit;
 mod region;
@@ -23,6 +28,7 @@ use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
+use emit::Image;
 pub(crate) use region::block_icount;
 
 use crate::decoder_cache::DecodedSegment;
@@ -66,7 +72,11 @@ pub(crate) struct JitSegment {
 /// process-wide cache) keeps interpreting it meanwhile, and switches to the
 /// compiled copy at its next slice. If no thread can be started, compiles
 /// synchronously instead.
-pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, layout: MemoryLayout) {
+pub(crate) fn spawn_background(
+    segment: &Arc<DecodedSegment>,
+    layout: MemoryLayout,
+    save: Option<Save>,
+) {
     /// Publishes "nothing compiled" if the compilation panics, so that
     /// nobody waits for it forever. (No effect after a real result.)
     struct Finish(Arc<DecodedSegment>);
@@ -77,15 +87,24 @@ pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, layout: MemoryLayo
     }
     segment.begin_background_jit();
     let finish = Finish(Arc::clone(segment));
+    let fallback = save.clone();
     let spawned = std::thread::Builder::new()
         .name("libriscv-jit".into())
         .spawn(move || {
-            let compiled = JitSegment::compile(&finish.0, layout);
+            let compiled = JitSegment::compile_and_load(&finish.0, layout, save.as_ref());
             finish.0.finish_background_jit(compiled);
         });
     if spawned.is_err() {
-        segment.finish_background_jit(JitSegment::compile(segment, layout));
+        let compiled = JitSegment::compile_and_load(segment, layout, fallback.as_ref());
+        segment.finish_background_jit(compiled);
     }
+}
+
+/// Where to save the code compiled for a segment (`MachineOptions::jit_cache_output`).
+#[derive(Debug, Clone)]
+pub(crate) struct Save {
+    pub key: cache::CacheKey,
+    pub output: cache::JitCacheOutput,
 }
 
 /// What a call into native code ended with.
@@ -123,12 +142,26 @@ pub(crate) enum JitExit {
 }
 
 impl JitSegment {
-    /// Compile `exec` and patch its decoder entries to enter the native code.
-    /// Leaves `exec` untouched if nothing could be compiled.
-    pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout) {
-        if let Some(compiled) = Self::compile(exec, layout) {
+    /// Compile `exec` and patch its decoder entries to enter the native code
+    /// (saving the code to `save`). Leaves `exec` untouched if nothing could
+    /// be compiled.
+    pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout, save: Option<&Save>) {
+        if let Some(compiled) = Self::compile_and_load(exec, layout, save) {
             Self::install(exec, compiled);
         }
+    }
+
+    /// [`compile`](Self::compile), save the code to `save`, then map it.
+    fn compile_and_load(
+        exec: &DecodedSegment,
+        layout: MemoryLayout,
+        save: Option<&Save>,
+    ) -> Option<Compiled> {
+        let image = Self::compile(exec, layout)?;
+        if let Some(save) = save {
+            save.output.record(save.key, &image);
+        }
+        image.load()
     }
 
     /// Compile `exec` without changing it. Only reads the segment, so it can
@@ -139,7 +172,7 @@ impl JitSegment {
     /// code checks them against `layout`'s windows, which are constants in
     /// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
     /// windows don't contain them interpret the segment instead.
-    pub(crate) fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Compiled> {
+    fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
         let analysis = region::analyse(exec);
         emit::compile(exec, &analysis, layout)
     }
@@ -172,6 +205,11 @@ impl JitSegment {
     /// True if native code can be entered at decoder entry `i`.
     pub(crate) fn has_entry(&self, i: usize) -> bool {
         self.code.has_entry(i)
+    }
+
+    /// True if the code was compiled by an earlier run (see [`cache`]).
+    pub(crate) fn is_cached(&self) -> bool {
+        self.code.is_linked()
     }
 
     /// Number of decoder entries that enter native code.
@@ -436,6 +474,7 @@ mod tests {
                 m.cpu.registers().all_fp().to_vec(),
             )
         };
+        let _baseline = BASELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         super::emit::BASELINE_ISA.store(true, Ordering::Relaxed);
         for (a, b) in [
             (2.5, -2.5f32),
@@ -446,6 +485,99 @@ mod tests {
             assert_eq!(run(true, a, b), run(false, a, b), "{a} {b}");
         }
         super::emit::BASELINE_ISA.store(false, Ordering::Relaxed);
+    }
+
+    /// Serializes the tests that compile for baseline x86-64.
+    static BASELINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Saved code with libcalls (baseline x86-64: rounding and FMA are
+    /// calls) links them against the C library's `nearbyint`, `fma` and so
+    /// on, through the GOT: the same results as the interpreter.
+    #[test]
+    #[cfg(all(feature = "ext-f", not(feature = "debug-checks"), target_os = "linux"))]
+    fn saved_libcalls_match_the_interpreter() {
+        use std::sync::atomic::Ordering;
+        if !std::process::Command::new("cc")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            assert!(
+                std::env::var("LIBRISCV_REQUIRE_TOOLCHAIN").is_err(),
+                "cc is required"
+            );
+            return;
+        }
+        const fn fp(fpfunc: u32, fmt: u32, rm: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+            (((fpfunc << 2) | fmt) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (rm << 12)
+                | (rd << 7)
+                | 0x53
+        }
+        // Its own address and code: the registry is process-wide.
+        const AT: u64 = 0x30000;
+        let mut code = vec![addi(7, 7, 1)];
+        for rm in 0..5 {
+            code.push(fp(0x18, 1, rm, 10 + rm, 1, 2)); // fcvt.l.d a(rm), ft1, rm
+        }
+        code.push((3 << 27) | (1 << 25) | (2 << 20) | (1 << 15) | (4 << 7) | 0x43); // fmadd.d ft4
+        code.push(JSELF);
+        let code: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let run = |options: MachineOptions| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    ..options
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, AT).unwrap();
+            m.cpu.registers_mut().set_fp_bits(1, (-2.5f64).to_bits());
+            m.cpu.registers_mut().set_fp_bits(2, 1e15f64.to_bits());
+            m.cpu.registers_mut().set_fp_bits(3, 0.1f64.to_bits());
+            m.cpu.jump(AT).unwrap();
+            let _ = m.try_simulate(100, 0);
+            let cached = m.cpu.current_execute_segment().jit_is_cached();
+            let mut s = m.cpu.registers().all().to_vec();
+            s.extend(m.cpu.registers().all_fp());
+            (s, cached)
+        };
+        let output = super::cache::JitCacheOutput::new();
+        {
+            let _baseline = BASELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            super::emit::BASELINE_ISA.store(true, Ordering::Relaxed);
+            run(MachineOptions {
+                jit: true,
+                jit_cache_output: Some(output.clone()),
+                ..Default::default()
+            });
+            super::emit::BASELINE_ISA.store(false, Ordering::Relaxed);
+        }
+        assert_eq!(output.len(), 1);
+        let object = output.object().unwrap();
+        for name in ["nearbyint", "ceil", "fma"] {
+            let name = format!("\0{name}\0");
+            assert!(
+                object.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{name}"
+            );
+        }
+        let dir = std::env::temp_dir().join(format!("libriscv-jit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let so = dir.join("libcalls.so");
+        output.write_shared_object(&so).unwrap();
+        assert_eq!(super::cache::load_shared_object(&so).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (expected, _) = run(MachineOptions {
+            jit_cache: false,
+            ..Default::default()
+        });
+        let (got, cached) = run(MachineOptions::default());
+        assert!(cached);
+        assert_eq!(got, expected);
     }
 
     /// A loop head inside a decoder block (straight-line code runs into

@@ -305,6 +305,15 @@ impl DecodedSegment {
         }
         0
     }
+    /// True if the segment's native code was compiled by an earlier run
+    /// (`MachineOptions::jit_cache`), rather than by this process.
+    pub fn jit_is_cached(&self) -> bool {
+        #[cfg(feature = "jit")]
+        if let Some(jit) = &self.jit {
+            return jit.is_cached();
+        }
+        false
+    }
 
     /// Execute-only segments must never be rebuilt, so they never go stale.
     pub(crate) fn set_stale(&self, stale: bool) {

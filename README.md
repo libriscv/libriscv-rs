@@ -36,6 +36,22 @@ Most tests need a RISC-V cross compiler (`riscv64-linux-gnu-gcc-14`, override
 with `RCC`) and the C++ reference emulator (`../libriscv/emulator/rvlinux`,
 override with `LIBRISCV_CPP` or `LIBRISCV_CPP_EMULATOR`).
 
+## JIT code cache
+
+With the `jit` feature, the code Cranelift compiles can be saved and reused
+by later runs: a cache of the JIT's output, not a separate compiler.
+
+```sh
+rvlinux --jit-save-shared prog.so prog.elf   # run once, save the compiled code
+rvlinux --jit-load prog.so prog.elf          # later runs skip compiling
+rvlinux -Q --jit-save-object prog.o prog.elf # or save it to link into rvlinux:
+RVLINUX_JIT_EMBED=prog.o cargo build -p rvlinux --features jit
+```
+
+Saved code is only used with the same build, host CPU and memory layout it
+was compiled for. Shared objects are linked with the system `cc`. In the
+library, see `libriscv::jit_cache` and `MachineOptions::jit_cache_output`.
+
 ## License
 
 BSD-3-Clause, same as libriscv.

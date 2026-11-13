@@ -75,6 +75,15 @@ pub mod instruction;
 mod isa;
 #[cfg(feature = "jit")]
 mod jit;
+/// Saving the Cranelift JIT's code and using it again in later runs: a
+/// cache of compiled code, not a separate compiler. Code saved as an
+/// object file and linked into the program is found automatically; shared
+/// objects are loaded with [`load_shared_object`](jit_cache::load_shared_object).
+/// See [`MachineOptions::jit_cache`] and [`MachineOptions::jit_cache_output`].
+#[cfg(feature = "jit")]
+pub mod jit_cache {
+    pub use crate::jit::cache::{JitCacheOutput, load_shared_object, registered_segments};
+}
 mod linux;
 mod machine;
 pub mod memory;

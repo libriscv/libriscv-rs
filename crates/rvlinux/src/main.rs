@@ -17,6 +17,11 @@ struct CliArgs {
     jit: bool,
     no_background: bool,
     nbit: bool,
+    jit_save_object: Option<PathBuf>,
+    jit_save_shared: Option<PathBuf>,
+    jit_load: Vec<PathBuf>,
+    no_jit_cache: bool,
+    quit: bool,
     libc_fastpath: bool,
     sandbox: bool,
     proxy: bool,
@@ -44,6 +49,7 @@ fn usage(name: &str) {
     );
     println!("  -A, --allow file   Allow file to be opened by the guest");
     println!("  -c, --call func    Call a function after loading the program");
+    println!("  -Q, --quit         Quit after loading the program (to save JIT code)");
     println!(
         "      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations"
     );
@@ -53,6 +59,19 @@ fn usage(name: &str) {
         println!("      --no-background Compile each segment before running it");
         println!(
             "      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them"
+        );
+        println!(
+            "JIT code cache (Cranelift output saved for later runs; implies --jit --no-background):"
+        );
+        println!(
+            "      --jit-save-object file  Save the compiled code as an object file to link into a program"
+        );
+        println!(
+            "      --jit-save-shared file  Save the compiled code as a shared object (links with $CC or cc)"
+        );
+        println!("      --jit-load file    Load saved code from a shared object (repeatable)");
+        println!(
+            "      --no-jit-cache     Ignore saved code (loaded, or linked into this program)"
         );
     }
 }
@@ -66,6 +85,11 @@ fn parse_args() -> Result<CliArgs, String> {
             .next()
             .ok_or_else(|| format!("{flag} requires a value"))?;
         v.parse().map_err(|_| format!("Invalid number: {v}"))
+    };
+    let path = |it: &mut std::env::Args, flag: &str| -> Result<PathBuf, String> {
+        it.next()
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{flag} requires a value"))
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -87,6 +111,17 @@ fn parse_args() -> Result<CliArgs, String> {
             "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
             "--no-background" if cfg!(feature = "jit") => args.no_background = true,
             "--nbit-address-space" if cfg!(feature = "jit") => args.nbit = true,
+            "--jit-save-object" if cfg!(feature = "jit") => {
+                args.jit_save_object = Some(path(&mut it, "--jit-save-object")?);
+            }
+            "--jit-save-shared" if cfg!(feature = "jit") => {
+                args.jit_save_shared = Some(path(&mut it, "--jit-save-shared")?);
+            }
+            "--jit-load" if cfg!(feature = "jit") => {
+                args.jit_load.push(path(&mut it, "--jit-load")?);
+            }
+            "--no-jit-cache" if cfg!(feature = "jit") => args.no_jit_cache = true,
+            "-Q" | "--quit" => args.quit = true,
             "--libc-fastpath" => args.libc_fastpath = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
@@ -110,6 +145,11 @@ fn parse_args() -> Result<CliArgs, String> {
     if args.program.as_os_str().is_empty() {
         usage(&name);
         return Err("No program given".into());
+    }
+    if args.jit_save_object.is_some() || args.jit_save_shared.is_some() {
+        // Saving needs every segment compiled by the time the program ends.
+        args.jit = true;
+        args.no_background = true;
     }
     Ok(args)
 }
@@ -155,6 +195,25 @@ fn main() -> ExitCode {
         guest_args.insert(0, interp);
         is_dynamic = true;
     }
+    #[cfg(feature = "jit")]
+    for file in &args.jit_load {
+        match libriscv::jit_cache::load_shared_object(file) {
+            Ok(n) if args.verbose => {
+                println!(
+                    "* Loaded saved JIT code for {n} segments from {}",
+                    file.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Could not load {}: {e}", file.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    #[cfg(feature = "jit")]
+    let jit_cache_output = (args.jit_save_object.is_some() || args.jit_save_shared.is_some())
+        .then(libriscv::jit_cache::JitCacheOutput::new);
     let options = libriscv::MachineOptions {
         memory_max: args.memory_mib.map_or(DEFAULT_MEMORY, |m| m << 20),
         verbose_loader: args.verbose,
@@ -162,6 +221,9 @@ fn main() -> ExitCode {
         // C++ rvlinux compiles in the background by default too.
         jit_background: !args.no_background,
         jit_automatic_nbit_address_space: args.nbit,
+        jit_cache: !args.no_jit_cache,
+        #[cfg(feature = "jit")]
+        jit_cache_output: jit_cache_output.clone(),
         libc_fastpath: args.libc_fastpath,
         ..Default::default()
     };
@@ -175,6 +237,13 @@ fn main() -> ExitCode {
     if let Err(e) = setup_linux(&mut machine, &args, &guest_args, is_dynamic) {
         eprintln!("Exception: {e}");
         return ExitCode::FAILURE;
+    }
+    #[cfg(feature = "jit")]
+    let save = || save_jit_code(&args, jit_cache_output.as_ref());
+    #[cfg(not(feature = "jit"))]
+    let save = || ExitCode::SUCCESS;
+    if args.quit {
+        return save();
     }
 
     // `--fuel 0` means no limit, as in C++.
@@ -253,7 +322,42 @@ fn main() -> ExitCode {
         }
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    ExitCode::SUCCESS
+    save()
+}
+
+/// Write the code the JIT compiled to the `--jit-save-*` files.
+#[cfg(feature = "jit")]
+fn save_jit_code(args: &CliArgs, output: Option<&libriscv::jit_cache::JitCacheOutput>) -> ExitCode {
+    let Some(output) = output else {
+        return ExitCode::SUCCESS;
+    };
+    let mut status = ExitCode::SUCCESS;
+    for (file, shared) in [
+        (&args.jit_save_object, false),
+        (&args.jit_save_shared, true),
+    ] {
+        let Some(file) = file else { continue };
+        let saved = if shared {
+            output.write_shared_object(file)
+        } else {
+            output.write_object(file)
+        };
+        match saved {
+            Ok(()) if args.verbose => {
+                println!(
+                    "* Saved JIT code for {} segments to {}",
+                    output.len(),
+                    file.display()
+                );
+            }
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Could not save JIT code to {}: {e}", file.display());
+                status = ExitCode::FAILURE;
+            }
+        }
+    }
+    status
 }
 
 /// The guest environment (as in C++).

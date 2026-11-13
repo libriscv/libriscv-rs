@@ -388,17 +388,21 @@ selection, `region.rs`: segment analysis and region formation, `emit.rs`:
 Cranelift IR, linking) and `crates/libriscv-jit-rt`.
 
 **Unsafe boundary.** Generating code needs no `unsafe`; mapping it executable
-and calling it does. That lives in `libriscv-jit-rt`, a ~200-line crate with
+and calling it does. That lives in `libriscv-jit-rt`, a small crate with
 its own lint table (`unsafe_code = "deny"`, every block documented): it
-copies the linked image into an `mmap` (`memmap2`), validates the entry
+copies the linked image into an `mmap` (`memmap2`) or, for cached code,
+finds it in the program or a `dlopen`ed shared object, validates the entry
 table and the guest-memory windows against the real arena length, and
 enters code through one `transmute`d trampoline pointer. `libriscv` stays
 `forbid(unsafe_code)`. The generated code's own memory safety (the inlined
 arena bounds checks, or the address mask, see "N-bit address space") is
 the trust boundary; the rt crate documents the contract the code generator
 must keep. Besides other region functions, native code only calls
-Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
-`emit.rs` (only used on hosts without SSE4.1 or FMA).
+Cranelift's rounding and FMA libcalls (only used on hosts without SSE4.1
+or FMA). The code is position-independent (`is_pic`), so libcalls go
+through a GOT: for the JIT, a table appended to the image that points at
+plain Rust helpers in `emit.rs`; for saved code (see "Code cache"), the
+system linker's GOT, pointing at `libm`.
 
 **Design** (mirrors `aj_translate.cpp`/`aj_emit.cpp`):
 
@@ -573,6 +577,52 @@ the integer programs also contain the FP instructions that only move bits
 (loads, stores, moves, sign injection, FCLASS, compares, integer
 conversions), compared exactly. With the feature, the difftests run
 `--jit` both with background compilation and with `--no-background`.
+
+**Code cache** (2026-11-13; the JIT counterpart of C++'s translation
+cache and embedded translations in `tr_translate.cpp`, `jit/cache.rs`,
+`libriscv-jit-rt`'s `linked.rs`): Cranelift's output for a segment, saved
+and used again by later runs. It is a cache of what the JIT compiled, not
+an ahead-of-time compiler. Nothing else translates the code, so cached
+code behaves exactly like the JIT (and the names keep `aot` free for a
+real ahead-of-time translator, e.g. to Rust, later). A machine with
+`MachineOptions::jit_cache_output` (a `jit_cache::JitCacheOutput`) records
+the linked image of every segment it compiles (`emit::Image`: code with
+inter-function calls resolved, libcall sites left as `R_X86_64_GOTPCREL`).
+It doesn't share segments while saving, so it compiles every one.
+`JitCacheOutput::write_object` writes one ELF relocatable object (written
+by hand in `cache.rs`, no new dependency), and `write_shared_object` links
+it with `$CC`/`cc -shared -nostdlib ... -lm`. Each segment gets a record
+(magic, code and metadata as `R_X86_64_PC64` offsets, lengths) in the
+section `libriscv_jitcache`. A weak table symbol, `libriscv_jitcache_table`,
+lists the records for `dlsym`. With only PC-relative references, the
+sections are read-only and a shared object has no run-time relocations.
+`jit_cache::load_shared_object` (`rvlinux --jit-load`) `dlopen`s one, and
+objects linked into the program (`rvlinux`: `RVLINUX_JIT_EMBED=a.o:b.o` at
+build time) are found through the linker's `__start_`/`__stop_` symbols
+for that section. `libriscv-jit-rt` defines an empty record there so the
+symbols always exist. The sections carry `SHF_GNU_RETAIN` against
+`--gc-sections`. Both end up in one process-wide registry, consulted when
+a segment is created (`MachineOptions::jit_cache`, default on, works
+without `jit` too). A hit installs the code instead of compiling it
+(`CodeMemory::linked`, which keeps a shared object loaded while its code
+is in use). The key is the segment (address, length, CRC32-C and a 64-bit
+hash of the code, execute-only, libc fast path), the memory layout baked
+into the code, and a build fingerprint: libriscv version, host ISA and
+Cranelift flags, extension features, `JitState` offsets and a hash of the
+code generator's sources (`jit/*.rs`, `decoder_cache.rs`, `decode.rs`,
+`bytecode.rs`). So code from another build, CPU or arena size is skipped,
+not run (`verbose_loader` reports hits and misses). That protects against
+accidents, not malice: loading a shared object or linking an object runs
+its code, like any native library. Segments with breakpoints are never
+cached. Loading a static glibc C++ program's 20 MB of code takes 0.14 s,
+against 12 s to compile it (debug build). Tests: `libriscv`'s
+`tests/jit_cache.rs` (two segments, library API), the
+`saved_libcalls_match_the_interpreter` unit test (baseline x86-64, libcalls
+through `libm`), and `rvlinux`'s `tests/jit_cache.rs` (static executable,
+`-Q`, bad files; ignored because slow: the dynamic executable (~20 s, it
+compiles `libc.so`) and the embedded object (builds `rvlinux` again in
+`target/jit-embed`)). Not yet: saving code that came from the cache
+(a machine saving code compiles everything instead), AArch64.
 
 **N-bit address space** (C++ `translate_automatic_nbit_address_space`,
 `MachineOptions::jit_automatic_nbit_address_space`, `rvlinux
@@ -1165,6 +1215,7 @@ no references into guest memory, so:
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
 - [x] JIT: F/D (FCVT to integers exact, NaNs the host's)
+- [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
 - [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
 - [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
@@ -1233,6 +1284,7 @@ phase starts; names below are the intended targets.
 | `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | ✅ C++ containers (`guest_rust_*.hpp`: not yet) |
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
+| `tr_translate.cpp` (translation cache, embedded translations) | `jit/cache.rs`, `libriscv-jit-rt/src/linked.rs` | 4 | ✅ replaced: caches the Cranelift JIT's code, translates nothing |
 | `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |
 | `util/crc32*.{hpp,cpp}` | `decoder_cache.rs` (`crc32c`) | 4 | ✅ CRC32-C (plain CRC32: not needed yet) |
 | `util/buffer.hpp` | `memory/helpers.rs` | 3 | ✅ `Buffer` |

@@ -55,6 +55,22 @@ pub struct MachineOptions {
     /// arenas qualify; otherwise (reported with `verbose_loader`) the
     /// accesses stay checked. The interpreter is unaffected.
     pub jit_automatic_nbit_address_space: bool,
+    /// Use JIT code compiled by an earlier run for the execute segments it
+    /// was compiled for (default on): code linked into the program, and
+    /// code from shared objects loaded with
+    /// [`jit_cache::load_shared_object`](crate::jit_cache::load_shared_object).
+    /// Such code is used instead of compiling, also without `jit`.
+    /// Results and instruction counts are the JIT's. Without the `jit`
+    /// feature, there is never any.
+    pub jit_cache: bool,
+    /// With `jit`, record the code of every segment the JIT compiles here,
+    /// to save it for later runs (see [`JitCacheOutput`]). The machine
+    /// then compiles all its segments itself, instead of using cached code
+    /// or another machine's shared segments.
+    ///
+    /// [`JitCacheOutput`]: crate::jit_cache::JitCacheOutput
+    #[cfg(feature = "jit")]
+    pub jit_cache_output: Option<crate::jit_cache::JitCacheOutput>,
     /// The ELF symbol of a program-provided function to use as the exit
     /// address of VM calls (the return address [`Machine::vmcall`] sets up)
     /// instead of the injected host code page (C++
@@ -105,6 +121,9 @@ impl Default for MachineOptions {
             jit_background: false,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
+            jit_cache: true,
+            #[cfg(feature = "jit")]
+            jit_cache_output: None,
             default_exit_function: None,
             use_shared_execute_segments: true,
             ebreak_locations: Vec::new(),

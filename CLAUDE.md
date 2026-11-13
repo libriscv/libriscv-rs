@@ -21,6 +21,7 @@ LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skippin
 cargo test -- --ignored                      # include not-yet-enabled difftests
 cargo clippy --all-targets -- -D warnings    # must be clean (also with --features libriscv/jit,rvlinux/jit)
 cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
+rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
 ```
 
 Expected durations (warm build, 32 cores): the whole suite ~25 s with the JIT

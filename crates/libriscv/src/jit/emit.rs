@@ -86,9 +86,154 @@ use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
 const FUNCTION_ALIGN: usize = 64;
 
 /// The compiled segment: code memory plus the decoder indices to patch.
+#[derive(Debug)]
 pub(crate) struct Compiled {
     pub code: CodeMemory,
     pub patch: Vec<usize>,
+}
+
+/// A compiled and linked segment that isn't in executable memory yet: the
+/// code image with its calls between functions resolved, but not its
+/// libcalls. [`Image::load`] maps it for this process; the JIT cache saves
+/// it as an object file (`jit_cache`), so that the same bytes run later.
+#[derive(Debug, Clone)]
+pub(crate) struct Image {
+    pub bytes: Vec<u8>,
+    /// Offset of the trampoline.
+    pub trampoline: usize,
+    /// Per decoder entry, the offset of the function entered there, or
+    /// [`CodeMemory::NO_ENTRY`].
+    pub entries: Vec<u32>,
+    /// The decoder entries to patch: block starts with an entry.
+    pub patch: Vec<usize>,
+    /// The libcalls, each a 32-bit PC-relative reference to a GOT slot
+    /// holding the helper's address (the code is position-independent).
+    pub libcalls: Vec<LibcallSite>,
+    pub layout: MemoryLayout,
+}
+
+/// A reference to the GOT slot of a libcall (`X86GOTPCRel4`): the 4 bytes
+/// at `offset` are `slot + addend - offset`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LibcallSite {
+    pub offset: usize,
+    pub addend: i64,
+    pub call: LibCall,
+}
+
+impl Image {
+    /// Copy the image into executable memory, with a GOT for its libcalls
+    /// appended, pointing at this process's helpers.
+    pub(crate) fn load(self) -> Option<Compiled> {
+        let mut image = self.bytes;
+        if !self.libcalls.is_empty() {
+            let mut slots: Vec<(LibCall, usize)> = Vec::new();
+            image.resize(image.len().next_multiple_of(8), 0);
+            for site in &self.libcalls {
+                let slot = match slots.iter().find(|(c, _)| *c == site.call) {
+                    Some(&(_, slot)) => slot,
+                    None => {
+                        let slot = image.len();
+                        image.extend_from_slice(&libcall_address(site.call)?.to_le_bytes());
+                        slots.push((site.call, slot));
+                        slot
+                    }
+                };
+                let value = i64::try_from(slot)
+                    .ok()?
+                    .checked_add(site.addend)?
+                    .checked_sub(i64::try_from(site.offset).ok()?)?;
+                let value = i32::try_from(value).ok()?;
+                image
+                    .get_mut(site.offset..site.offset + 4)?
+                    .copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let code = CodeMemory::new(&image, self.trampoline, &self.entries, self.layout).ok()?;
+        Some(Compiled {
+            code,
+            patch: self.patch,
+        })
+    }
+}
+
+/// The C library function implementing `call` (the names `cranelift-module`
+/// uses), for saved code: see [`Image::libcalls`].
+pub(crate) fn libcall_symbol(call: LibCall) -> Option<&'static str> {
+    Some(match call {
+        LibCall::CeilF32 => "ceilf",
+        LibCall::CeilF64 => "ceil",
+        LibCall::FloorF32 => "floorf",
+        LibCall::FloorF64 => "floor",
+        LibCall::TruncF32 => "truncf",
+        LibCall::TruncF64 => "trunc",
+        LibCall::NearestF32 => "nearbyintf",
+        LibCall::NearestF64 => "nearbyint",
+        LibCall::FmaF32 => "fmaf",
+        LibCall::FmaF64 => "fma",
+        _ => return None,
+    })
+}
+
+/// Everything about this build that the code generated for a segment
+/// depends on besides the segment and the memory layout: the host ISA and
+/// its features, the libriscv version, its extension features, the layout
+/// of the state block, and the source of the code generator itself.
+/// Cached code (`jit_cache`) is only used by builds with the same
+/// fingerprint.
+pub(crate) fn build_fingerprint() -> Option<u64> {
+    static FINGERPRINT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *FINGERPRINT.get_or_init(|| {
+        let isa = host_isa()?;
+        let mut text = format!(
+            "libriscv {} {} {} {:?} {:?}",
+            env!("CARGO_PKG_VERSION"),
+            isa.triple(),
+            isa.flags(),
+            isa.isa_flags()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                cfg!(feature = "ext-a"),
+                cfg!(feature = "ext-c"),
+                cfg!(feature = "ext-f"),
+                cfg!(feature = "ext-v"),
+                cfg!(feature = "debug-checks"),
+            ],
+        );
+        for offset in [
+            JitState::OFFSET_REGS,
+            JitState::OFFSET_FREGS,
+            JitState::OFFSET_ARENA,
+            JitState::OFFSET_TABLE,
+            JitState::OFFSET_TABLE_LEN,
+            JitState::OFFSET_MAX,
+            JitState::OFFSET_FRM,
+            JitState::OFFSET_COUNTER,
+            JitState::OFFSET_EXIT_PC,
+            JitState::OFFSET_EXIT_KIND,
+        ] {
+            text.push_str(&format!(" {offset}"));
+        }
+        // What decides the generated code. A change to any of them may
+        // change what a segment compiles to, also without a version bump.
+        for source in [
+            include_str!("emit.rs"),
+            include_str!("region.rs"),
+            include_str!("classify.rs"),
+            include_str!("mod.rs"),
+            include_str!("../decoder_cache.rs"),
+            include_str!("../decode.rs"),
+            include_str!("../bytecode.rs"),
+        ] {
+            text.push_str(&format!(
+                " {:016x}",
+                super::cache::hash64(source.as_bytes())
+            ));
+        }
+        Some(super::cache::hash64(text.as_bytes()))
+    })
 }
 
 /// The host ISA, or `None` where the JIT isn't supported. Only x86-64 is
@@ -100,7 +245,9 @@ fn host_isa() -> Option<OwnedTargetIsa> {
     }
     let mut flags = settings::builder();
     flags.set("opt_level", "speed").ok()?;
-    flags.set("is_pic", "false").ok()?;
+    // Position-independent code (libcalls through a GOT), so that the same
+    // code can also be saved and linked elsewhere (`jit_cache`).
+    flags.set("is_pic", "true").ok()?;
     // Cranelift's x64 tail calls rely on frame pointers.
     flags.set("preserve_frame_pointers", "true").ok()?;
     flags
@@ -141,8 +288,8 @@ fn tail_signature() -> Signature {
 enum Target {
     /// Another function of the image.
     Function(usize),
-    /// A host function, by absolute address.
-    Host(u64),
+    /// A host helper (through the GOT).
+    LibCall(LibCall),
 }
 
 /// One function's machine code and the calls in it that need linking.
@@ -221,7 +368,8 @@ fn compile_function(ctx: &mut Context, isa: &OwnedTargetIsa) -> Option<Object> {
                 Target::Function(ctx.func.params.user_named_funcs().get(*name)?.index as usize)
             }
             RelocTarget::ExternalName(ExternalName::LibCall(call)) => {
-                Target::Host(libcall_address(*call)?)
+                libcall_address(*call)?;
+                Target::LibCall(*call)
             }
             _ => return None,
         };
@@ -239,12 +387,6 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
             let v = i32::try_from(pcrel).ok()?;
             image.get_mut(at..at + 4)?.copy_from_slice(&v.to_le_bytes());
         }
-        // An absolute host address (`what` is one already).
-        Reloc::Abs8 => {
-            image
-                .get_mut(at..at + 8)?
-                .copy_from_slice(&what.to_le_bytes());
-        }
         Reloc::Arm64Call => {
             let diff = pcrel >> 2;
             if !(-(1 << 25)..(1 << 25)).contains(&diff) {
@@ -260,13 +402,9 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
     Some(())
 }
 
-/// Compile every region of `a`, link them and map the result executable.
+/// Compile every region of `a` and link them into an [`Image`].
 /// `layout`: see [`JitSegment::compile`](super::JitSegment::compile).
-pub(crate) fn compile(
-    exec: &DecodedSegment,
-    a: &Analysis,
-    layout: MemoryLayout,
-) -> Option<Compiled> {
+pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, layout: MemoryLayout) -> Option<Image> {
     if a.regions.is_empty() {
         return None;
     }
@@ -286,7 +424,9 @@ pub(crate) fn compile(
     ctx.func = trampoline(&isa, &mut fctx);
     objects.push(compile_function(&mut ctx, &isa)?);
 
-    // Link: lay out the functions, then resolve the direct calls.
+    // Link: lay out the functions, then resolve the direct calls. Libcalls
+    // stay unresolved: they go through a GOT, which whoever places the
+    // image provides.
     let mut image = Vec::new();
     let mut offsets = Vec::with_capacity(objects.len());
     for obj in &objects {
@@ -294,16 +434,23 @@ pub(crate) fn compile(
         offsets.push(image.len());
         image.extend_from_slice(&obj.bytes);
     }
+    let mut libcalls = Vec::new();
     for (obj, &base) in objects.iter().zip(&offsets) {
         for &(offset, kind, addend, target) in &obj.relocs {
-            let what = match (target, kind) {
-                (Target::Function(f), _) if kind != Reloc::Abs8 => {
-                    i64::try_from(*offsets.get(f)?).ok()?
+            match target {
+                Target::Function(f) => {
+                    let what = i64::try_from(*offsets.get(f)?).ok()?;
+                    relocate(&mut image, base + offset, kind, what.checked_add(addend)?)?;
                 }
-                (Target::Host(address), Reloc::Abs8) => address as i64,
-                _ => return None,
-            };
-            relocate(&mut image, base + offset, kind, what.checked_add(addend)?)?;
+                Target::LibCall(call) if kind == Reloc::X86GOTPCRel4 => {
+                    libcalls.push(LibcallSite {
+                        offset: base + offset,
+                        addend,
+                        call,
+                    });
+                }
+                Target::LibCall(_) => return None,
+            }
         }
     }
 
@@ -315,14 +462,20 @@ pub(crate) fn compile(
         }
     }
     let trampoline = *offsets.last()?;
-    let code = CodeMemory::new(&image, trampoline, &entries, layout).ok()?;
     let patch = a
         .block_starts
         .iter()
         .copied()
-        .filter(|&i| code.has_entry(i))
+        .filter(|&i| entries.get(i).is_some_and(|&e| e != CodeMemory::NO_ENTRY))
         .collect();
-    Some(Compiled { code, patch })
+    Some(Image {
+        bytes: image,
+        trampoline,
+        entries,
+        patch,
+        libcalls,
+        layout,
+    })
 }
 
 fn trampoline(isa: &OwnedTargetIsa, fctx: &mut FunctionBuilderContext) -> Function {

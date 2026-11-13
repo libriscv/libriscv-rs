@@ -37,12 +37,30 @@
 //! * Control only moves between functions of the same [`CodeMemory`], through
 //!   direct calls or through the entry table, and every function returns to
 //!   the trampoline.
+//!
+//! # Cached code
+//!
+//! Besides code fresh from Cranelift, [`CodeMemory`] can run code that
+//! `libriscv` compiled in an earlier run and saved as an object file (see
+//! its `jit_cache` module): linked into the host program ([`embedded_units`])
+//! or into a shared object loaded at run time ([`load_shared_object`]). Such
+//! code is trusted exactly like any other native code of the process: it is
+//! not, and cannot be, verified. `libriscv` only uses it for the segment,
+//! memory layout and build it was compiled for, which keeps a stale or
+//! mismatched file from being run by accident, not a malicious one.
 
 use std::io;
 use std::marker::PhantomData;
 use std::mem::offset_of;
+use std::sync::Arc;
 
 use memmap2::Mmap;
+
+mod linked;
+pub use linked::{
+    CachedUnit, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, SharedObject, TABLE_MAGIC,
+    TABLE_SYMBOL, TABLE_WORDS, embedded_units, load_shared_object,
+};
 
 /// The largest guest memory access generated code makes, in bytes.
 pub const MAX_ACCESS: u64 = 8;
@@ -156,12 +174,29 @@ impl<'a> JitState<'a> {
     }
 }
 
+fn invalid(what: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, what)
+}
+
 /// The trampoline's signature: `(state, function, pc, counter)`.
 type Trampoline = extern "C" fn(*mut JitState<'_>, u64, u64, u64);
 
+/// Where the code of a [`CodeMemory`] lives.
+enum Backing {
+    /// Copied into an anonymous executable mapping.
+    Mapped { _map: Mmap },
+    /// Linked into the program or a loaded shared object; kept loaded by
+    /// the `Arc` if it's the latter.
+    Linked { _owner: Option<Arc<SharedObject>> },
+}
+
 /// Finished machine code in executable memory, with its entry table.
 pub struct CodeMemory {
-    map: Mmap,
+    /// Keeps the code alive (and mapped executable).
+    _backing: Backing,
+    /// Address and size of the code.
+    base: usize,
+    len: usize,
     trampoline: usize,
     /// The memory layout the code was built for.
     layout: MemoryLayout,
@@ -173,8 +208,9 @@ pub struct CodeMemory {
 impl std::fmt::Debug for CodeMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodeMemory")
-            .field("base", &self.map.as_ptr())
-            .field("len", &self.map.len())
+            .field("base", &(self.base as *const u8))
+            .field("len", &self.len)
+            .field("linked", &self.is_linked())
             .field("layout", &self.layout)
             .field("entries", &self.table.iter().filter(|&&e| e != 0).count())
             .finish()
@@ -197,24 +233,68 @@ impl CodeMemory {
         entries: &[u32],
         layout: MemoryLayout,
     ) -> io::Result<Self> {
-        let invalid = |what| io::Error::new(io::ErrorKind::InvalidInput, what);
-        if code.is_empty() || trampoline >= code.len() {
+        if code.is_empty() {
             return Err(invalid("trampoline outside the code"));
         }
         let mut map = memmap2::MmapMut::map_anon(code.len())?;
         map.copy_from_slice(code);
         let map = map.make_exec()?;
-        let base = map.as_ptr() as u64;
+        let base = map.as_ptr() as usize;
+        Self::with_backing(
+            Backing::Mapped { _map: map },
+            base,
+            code.len(),
+            trampoline,
+            entries,
+            layout,
+        )
+    }
+
+    /// Run code that is already in executable memory: compiled by an
+    /// earlier run and linked into the program or a shared object (see
+    /// [`CachedUnit`]). The other arguments are those of [`CodeMemory::new`],
+    /// relative to the start of `code`.
+    pub fn linked(
+        code: LinkedCode,
+        trampoline: usize,
+        entries: &[u32],
+        layout: MemoryLayout,
+    ) -> io::Result<Self> {
+        let (base, len) = (code.base, code.len);
+        Self::with_backing(
+            Backing::Linked { _owner: code.owner },
+            base,
+            len,
+            trampoline,
+            entries,
+            layout,
+        )
+    }
+
+    fn with_backing(
+        backing: Backing,
+        base: usize,
+        len: usize,
+        trampoline: usize,
+        entries: &[u32],
+        layout: MemoryLayout,
+    ) -> io::Result<Self> {
+        if len == 0 || trampoline >= len {
+            return Err(invalid("trampoline outside the code"));
+        }
+        let base64 = base as u64;
         let table = entries
             .iter()
             .map(|&e| match e {
                 Self::NO_ENTRY => Ok(0),
-                e if (e as usize) < code.len() => Ok(base + u64::from(e)),
+                e if (e as usize) < len => Ok(base64 + u64::from(e)),
                 _ => Err(invalid("entry outside the code")),
             })
             .collect::<io::Result<Box<[u64]>>>()?;
         Ok(Self {
-            map,
+            _backing: backing,
+            base,
+            len,
             trampoline,
             layout,
             table,
@@ -223,12 +303,18 @@ impl CodeMemory {
 
     /// Size of the code in bytes.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.len
     }
 
     /// Always false: empty code is rejected by [`CodeMemory::new`].
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len == 0
+    }
+
+    /// True if the code was linked into the program or a shared object
+    /// ([`CodeMemory::linked`]) rather than compiled by this process.
+    pub fn is_linked(&self) -> bool {
+        matches!(self._backing, Backing::Linked { .. })
     }
 
     /// True if table slot `slot` has a function.
@@ -261,11 +347,12 @@ impl CodeMemory {
         }
         state.table = self.table.as_ptr();
         state.table_len = self.table.len() as u64;
-        let code = self.map.as_ptr().wrapping_add(self.trampoline);
+        let code = (self.base + self.trampoline) as *const u8;
         // SAFETY: `code` is the start of the trampoline, a function with the
         // platform's C calling convention and the `Trampoline` signature,
-        // inside `self.map`, which is mapped executable and lives as long as
-        // `self`. Its arguments are valid for the whole call: `state` is a
+        // inside the code, which is executable and stays mapped as long as
+        // `self` (its `Backing`: our own mapping, the program itself, or a
+        // shared object that `self` keeps loaded). Its arguments are valid for the whole call: `state` is a
         // live `&mut` whose pointers come from borrows that outlive it
         // (`JitState::new`), with `table` pointing at `self.table`, and
         // `function` is a function start in the same mapping, and a masked
