@@ -17,7 +17,7 @@ one of them.
 | `forkfuzzer` | | forks and copy-on-write: run, fork, then run both; a fork must end exactly like its parent, and a fork of the fork must be unaffected by both |
 | `guestfuzzer` | | the guest C++ containers (`std::string`, `vector`, `unordered_map`, `variant`): host operations on objects whose bytes the input supplies |
 | `vmcallfuzzer` | | VM calls with host arguments, nested preemption from system calls, dyncalls, and the system call argument readers |
-| `jitdifffuzzer` | | the JIT against the interpreter (`--features jit`): registers, PC, counter, error and memory must match exactly. Inputs with NaN-producing FP arithmetic are skipped (NaN bits are the host's in the JIT). Compares only on x86-64, the JIT's only host so far |
+| `jitdifffuzzer` | | the JIT against the interpreter (`--features jit`): registers, PC, counter, error and memory must match exactly. Inputs where the JIT may legitimately differ are skipped: NaN-producing FP arithmetic (NaN bits are the host's) and dyncall words (a fault is reported at the dyncall, not at its block). Compares only on x86-64, the JIT's only host so far |
 
 The ELF-based targets put the code at 0x10000 and a zero-filled read-write
 segment at 0x200000, with some argument registers pointing into it.
@@ -56,9 +56,10 @@ and forwards arguments after `--` to libFuzzer:
 
 - `-s none`: no sanitizer. The library is safe Rust, so AddressSanitizer
   finds nothing a bounds check doesn't already turn into a panic, and costs
-  throughput. With the `jit` feature (which brings
-  `libriscv-jit-rt`'s unsafe code along) use `FUZZ_FLAGS="-s address -a
-  --features jit"` instead.
+  throughput. (`-s address` doesn't build: LLVM can't instrument the
+  dispatcher's `preserve_none` functions, "Stack realignment in presence
+  of dynamic allocas is not supported with this calling convention", so
+  `libriscv-jit-rt`'s unsafe code goes unsanitized too.)
 - `-a`: debug assertions and overflow checks. An arithmetic overflow on
   guest-controlled values is a bug even where release builds would wrap.
 

@@ -17,8 +17,8 @@
 # Environment:
 #   JOBS          worker processes in total (default: number of cores)
 #   FUZZ_FLAGS    cargo-fuzz flags (default "-s none -a"; jitdifffuzzer adds
-#                 --features jit). For the JIT's unsafe runtime, consider
-#                 FUZZ_FLAGS="-s address -a" on an x86-64 host.
+#                 --features jit). AddressSanitizer (-s address) doesn't
+#                 build, see README.md.
 #   LIBRISCV_CPP  C++ libriscv checkout, for the elffuzzer seeds
 #   NO_JIT=1      skip jitdifffuzzer (it only compares anything on x86-64)
 set -e
