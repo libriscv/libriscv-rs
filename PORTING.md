@@ -323,41 +323,56 @@ JIT before 10 s), the JITs compile up front, and every run must validate.
 `COREMARK_ELFS` adds prebuilt ELFs as columns. The difftests keep the
 deterministic fixed-iteration builds above.
 
-The prebuilt RV64 ELFs in `../coremark` are built the same way. CoreMark's
-own Iterations/Sec, one run each, same date and C++ builds:
+The prebuilt RV64 ELFs in `../coremark` are built the same way (passed
+with absolute paths: the bench runs in `crates/rvlinux`). Measured at
+`0d31d48` on 2026-11-13 against upstream `e806d460`, on an otherwise idle
+machine. CoreMark's own Iterations/Sec, one bench run; the first two rows
+are the bench's own builds:
 
 | ELF | Rust interpreter | C++ threaded | C++ tailcall | Rust JIT | C++ asmjit |
 |---|---:|---:|---:|---:|---:|
-| coremark-rv64g | 2354 | 2555 | 2377 | 14682 | 18559 |
-| coremark-rv64gc | 2159 | 2279 | 2220 | 15038 | 19336 |
-| coremark-rv64g_b | 2608 | 2704 | 2532 | 15194 | 20103 |
-| coremark.rv64gb.gcc14.2.elf | 2690 | 2884 | 2549 | 15581 | 19022 |
-| coremark-rv64g_zba_zbb | 2543 | 2727 | 2540 | 15848 | 19451 |
+| rv64imafdc | 2425 | 2440 | 2197 | 19076 | 19326 |
+| rv64imafdc_zba_zbb_zbs | 2777 | 2442 | 2290 | 19778 | 19640 |
+| coremark-rv64g | 2492 | 2680 | 2380 | 18412 | 18836 |
+| coremark-rv64gc | 2416 | 2330 | 2255 | 18700 | 19479 |
+| coremark-rv64g_b | 2744 | 2716 | 2618 | 20839 | 20095 |
+| coremark.rv64gb.gcc14.2.elf | 2809 | 2863 | 2596 | 17893 | 19131 |
+| coremark-rv64g_zba_zbb | 2655 | 2779 | 2496 | 19559 | 19445 |
 
-The Rust interpreter is 4-8% behind C++ threaded on every ELF (level with
-tailcall), the Rust JIT was 18-24% behind asmjit (see below for the
-numbers after "Bounds checks and register pressure"). With background compilation
-the JIT can arrive after CoreMark has calibrated on the interpreter, which
-then picks too few iterations and fails the 10-second rule; the Rust JIT
-column is up front where that happened (rv64gc, rv64g_zba_zbb; same score).
+Two more interleaved rounds under `perf stat`, as the Rust variant's speed
+relative to C++ by cycles per iteration (corrected as described below):
 
-After the JIT changes in "Bounds checks and register pressure" (JIT
-section), 2026-11-13, Rust JIT up front against C++ asmjit up front,
-interleaved runs (`perf stat` cycles per CoreMark iteration are steadier
-than the score while other work loads the machine):
+| ELF | Rust interpreter vs C++ threaded | Rust JIT vs C++ asmjit |
+|---|---:|---:|
+| coremark-rv64g | −8.6% | −2.2% |
+| coremark-rv64gc | +2.2% | −3.2% |
+| coremark-rv64g_b | −2.1% | +3.3% |
+| coremark.rv64gb.gcc14.2.elf | −3.9% | −5.6% |
+| coremark-rv64g_zba_zbb | −2.7% | 0.0% |
 
-| ELF | Rust JIT | C++ asmjit | |
-|---|---:|---:|---:|
-| coremark-rv64g | 18015 | 18658 | −3.4% |
-| coremark-rv64gc | 18046 | 19276 | −6.4% |
-| coremark-rv64g_b | 19365-19822 | 19816-19823 | −2% to 0% |
-| coremark.rv64gb.gcc14.2.elf | 17723 | 18931 | −6.4% |
-| coremark-rv64g_zba_zbb | 19522 | 19411 | +0.6% |
+The Rust interpreter is within 2-4% of C++ threaded on most ELFs, ahead on
+rv64gc and on the Zbs build (+14%), 9% behind on rv64g, and ahead of C++
+tailcall everywhere. It runs ~40% more host instructions per iteration
+(6.5-7.0M against 4.6-5.0M) at a higher IPC. The Rust JIT is within −6% to
++3% of asmjit: level or ahead on rv64g_b, rv64g_zba_zbb and the Zbs build,
+furthest behind on the gcc14.2 ELF, where it runs more host instructions
+than asmjit. Compiling up front costs the Rust JIT ~8x asmjit's time:
+250-340 ms against 30-40 ms on most ELFs, ~1.4-1.5 s against ~170-185 ms
+on rv64gc and rv64g_zba_zbb (outside CoreMark's timed region). Compiled in
+the background, the JIT can arrive after CoreMark has calibrated on the
+interpreter, which then picks too few iterations and fails the 10-second
+rule.
 
-On rv64g_b the Rust JIT now runs 6% fewer host instructions per iteration
-than asmjit (1.56M vs 1.67M) at 1-3% more cycles; on rv64gc and the
-gcc14.2 ELF it still runs more instructions than asmjit (not yet looked
-at). The remaining difference elsewhere is mostly register allocation:
+Measuring with `perf stat`: with `ITERATIONS=0` CoreMark first runs batches
+of 10, 100, … iterations until one batch N takes ≥ 1 s, then the reported
+N·(1 + 10/⌊secs⌋). Divide cycles by the reported count plus
+10 + 100 + … + N (11110 more for the interpreters, 111110 for the JITs),
+not by the reported count alone: that overstates by 25-37%, by a different
+amount when two variants land on different counts (rv64g: Rust 30000,
+C++ 40000). For the JITs also subtract the up-front compile, measured by
+the same command with `--fuel 1`. With both, cycle ratios matched the score
+ratios to within 0.2% on every ELF. The remaining JIT difference is mostly
+register allocation:
 guest registers live across a whole region (loaded at entry, stored at
 every exit, as in asmjit), and in high-pressure loops regalloc2 keeps
 loop-carried ones in spill slots. Guest calls are still tail calls with
