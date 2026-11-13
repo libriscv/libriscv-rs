@@ -1,20 +1,31 @@
 # libriscv-rs
 
-A port of [libriscv](https://github.com/libriscv/libriscv) — a fast, sandboxed
-RISC-V userspace emulator for embedding and scripting — to 100% safe Rust.
+A port of [libriscv](https://github.com/libriscv/libriscv), a fast, sandboxed
+RISC-V userspace emulator for embedding and scripting. The codebase uses
+forbid unsafe, except for the optional Cranelift JIT. The port is modelled on
+libriscv's architecture and internals, making it easy to compare the two
+codebases for differences, with exception for the JIT backend.
 
-RV64 only.
+Currently RV64GCB only.
 
-**Status:** early. RV64IMC (+Zcb) freestanding guests run on the tail-call
-interpreter and match the C++ emulator's output and instruction counts;
-Linux userspace support is next. See [PORTING.md](PORTING.md) for scope,
-design and progress.
+## Benchmarks
+
+| ELF | Rust interpreter | C++ threaded | C++ tailcall | Rust JIT | C++ asmjit |
+|---|---:|---:|---:|---:|---:|
+| rv64imafdc | 2425 | 2440 | 2197 | 19076 | 19326 |
+| rv64imafdc_zba_zbb_zbs | 2777 | 2442 | 2290 | 19778 | 19640 |
+| coremark-rv64g | 2492 | 2680 | 2380 | 18412 | 18836 |
+| coremark-rv64gc | 2416 | 2330 | 2255 | 18700 | 19479 |
+| coremark-rv64g_b | 2744 | 2716 | 2618 | 20839 | 20095 |
+| coremark.rv64gb.gcc14.2.elf | 2809 | 2863 | 2596 | 17893 | 19131 |
+| coremark-rv64g_zba_zbb | 2655 | 2779 | 2496 | 19559 | 19445 |
+
+Note that this is with instruction counting and bounds-checked memory (~50% native with JIT).
 
 ## Building and testing
 
-Requires the nightly toolchain pinned in `rust-toolchain.toml` (rustup picks
-it up automatically). Instruction dispatch uses guaranteed tail calls
-(`become`), which are not yet stable.
+Requires the nightly toolchain pinned in `rust-toolchain.toml`. Instruction
+dispatch uses guaranteed tail calls (`become`), which are not yet stable.
 
 ```sh
 cargo build
@@ -23,8 +34,7 @@ cargo test
 
 Most tests need a RISC-V cross compiler (`riscv64-linux-gnu-gcc-14`, override
 with `RCC`) and the C++ reference emulator (`../libriscv/emulator/rvlinux`,
-override with `LIBRISCV_CPP` or `LIBRISCV_CPP_EMULATOR`). Without them, those
-tests are skipped; set `LIBRISCV_REQUIRE_TOOLCHAIN=1` to make them fail instead.
+override with `LIBRISCV_CPP` or `LIBRISCV_CPP_EMULATOR`).
 
 ## License
 
