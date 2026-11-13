@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/libriscv", "crates/libriscv-jit-rt", "crates/rvlinux", "crates/testutil"]
+# cargo-fuzz harnesses: a separate workspace (see fuzz/README.md).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -637,7 +637,7 @@ Phase 5) and `insert_non_owned_memory`.
 | Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits) |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
-| Fuzz | `fuzz/` (Phase 5, `cargo fuzz`, nightly) | Port of `../libriscv/fuzz/fuzz.cpp`; any panic is a bug |
+| Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `syshelperfuzzer` (system call memory helpers). Built with debug assertions and overflow checks; any panic is a bug. `FUZZ_NAT` waits for the native heap |
 
 Prebuilt guests (Rust, Go, Zig, newlib, tinycc) live in
 `../libriscv/tests/unit/elf`; use `testutil::cpp_fixture(name)`.
@@ -1007,7 +1007,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging" (page caches included)
 - [ ] Memory traps (`RISCV_MEMORY_TRAPS`)
 - [ ] Sockets, epoll, poll, select (`posix/socket_calls.cpp`, `linux/syscalls_{epoll,poll,select}.cpp`)
-- [ ] Fuzzing harness
+- [x] Fuzzing harness (`fuzz/`; `FUZZ_NAT` waits for the native heap)
 
 ## File mapping
 

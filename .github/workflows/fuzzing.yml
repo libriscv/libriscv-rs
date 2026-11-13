@@ -1,0 +1,79 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Seconds to fuzz per target'
+        required: false
+        default: '30'
+
+env:
+  CARGO_TERM_COLOR: always
+  # Seconds spent on each fuzzer target.
+  FUZZ_SECONDS: ${{ github.event.inputs.seconds || '30' }}
+  # llvm-symbolizer's debuginfod client can hang, which makes libFuzzer block
+  # forever with no output. See fuzz/README.md.
+  DEBUGINFOD_URLS: ''
+  # C++ libriscv commit whose tests/unit/elf binaries seed elffuzzer.
+  # Same as LIBRISCV_CPP_REF in ci.yml.
+  LIBRISCV_CPP_REF: 6b81381257f00826da357c40e7288a0e5e523274
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Lint the fuzz crate
+        working-directory: fuzz
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Build the fuzzers
+        working-directory: fuzz
+        run: cargo fuzz build -s none -a
+
+      # elffuzzer spends the whole run failing ELF header validation from an
+      # empty corpus; do_fuzz.sh seeds it with the RV64 binaries here.
+      - name: Fetch ELF seeds (C++ libriscv)
+        run: |
+          git init libriscv-cpp
+          git -C libriscv-cpp fetch --depth 1 https://github.com/libriscv/libriscv.git "$LIBRISCV_CPP_REF"
+          git -C libriscv-cpp checkout FETCH_HEAD -- tests/unit/elf
+
+      - name: Fuzz
+        working-directory: fuzz
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+        run: |
+          status=0
+          for target in vmfuzzer elffuzzer syshelperfuzzer; do
+            echo "::group::$target (${FUZZ_SECONDS}s)"
+            ./do_fuzz.sh "$target" -- \
+              -max_total_time="$FUZZ_SECONDS" \
+              -print_final_stats=1 \
+              || { echo "::error::$target found a crash"; status=1; }
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

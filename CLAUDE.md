@@ -32,6 +32,7 @@ cargo fmt --all
 scripts/difftest.sh prog.elf [args...]       # diff one ELF against the C++ emulator
 scripts/build-cpp-reference.sh               # C++ threaded/tailcall/switch builds -> target/cpp-ref/
 cargo bench -p rvlinux --features jit --bench coremark   # CoreMark: Rust interpreter/JIT vs C++
+fuzz/do_fuzz.sh vmfuzzer -- -max_total_time=300   # libFuzzer (vmfuzzer/elffuzzer/syshelperfuzzer); needs cargo-fuzz
 ```
 
 Toolchain: pinned nightly (`rust-toolchain.toml`) for `become`. Don't bump it

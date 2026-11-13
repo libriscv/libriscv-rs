@@ -1,0 +1,53 @@
+[package]
+name = "libriscv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "BSD-3-Clause"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# Run the targets with the Cranelift JIT (`MachineOptions::jit`).
+jit = ["libriscv/jit"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+libriscv = { path = "../crates/libriscv" }
+
+# Not part of the main workspace: cargo-fuzz needs nightly sanitizer flags
+# and libFuzzer, which `cargo test` shouldn't build.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "vmfuzzer"
+path = "fuzz_targets/vmfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elffuzzer"
+path = "fuzz_targets/elffuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syshelperfuzzer"
+path = "fuzz_targets/syshelperfuzzer.rs"
+test = false
+doc = false
+bench = false
