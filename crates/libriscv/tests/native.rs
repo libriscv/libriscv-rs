@@ -2012,3 +2012,87 @@ fn vm_calls_with_a_custom_hash_function() {
     }
     assert_eq!(live_allocs(m), allocs_before);
 }
+
+/// A map whose guest memory is all zeros has a zero maximum load factor,
+/// so the bucket count it needs is infinite. That used to overflow (a
+/// panic with overflow checks); found by `guestfuzzer`.
+#[test]
+fn zero_load_factor_map_does_not_overflow() {
+    const MAP: u64 = 0x1000;
+    let mut m = bare_machine();
+    m.copy_to_guest(MAP, &[0u8; 64]).unwrap();
+    let map = GuestPtr::<CppMap<u64, u64>>::new(MAP);
+    // Errors are fine (the guest's map is nonsense); panics are not.
+    let _ = map.insert_or_assign(&mut m, &1u64, &2u64);
+    m.copy_to_guest(MAP, &[0u8; 64]).unwrap();
+    let _ = map.reserve(&mut m, 10);
+    m.copy_to_guest(MAP, &[0u8; 64]).unwrap();
+    let _ = map.rehash(&mut m, 10);
+}
+
+/// Run `f` on a thread and fail if it doesn't finish within 10 seconds
+/// (instead of hanging the test run).
+fn within_seconds(f: impl FnOnce() + Send + 'static) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("did not finish: a walk over a cyclic node list never ends");
+}
+
+/// A `std::unordered_map<u64, u64>` at `MAP` with one bucket and one node
+/// whose `_M_nxt` points to itself, claiming `count` elements.
+fn cyclic_map(count: u64) -> (Machine, GuestPtr<CppMap<u64, u64>>) {
+    const MAP: u64 = 0x1000;
+    const NODE: u64 = 0x2000;
+    let mut m = bare_machine();
+    let mut map = Vec::new();
+    for field in [
+        MAP + 48,    // buckets: the single bucket
+        1,           // bucket count
+        NODE,        // before_begin._M_nxt
+        count,       // element count
+        0x3f80_0000, // max load factor 1.0 (and padding)
+        u64::MAX,    // next resize: never
+        MAP + 16,    // the single bucket: before_begin
+    ] {
+        map.extend_from_slice(&field.to_le_bytes());
+    }
+    m.copy_to_guest(MAP, &map).unwrap();
+    // Node: next (itself), key 7, value 8
+    let node: Vec<u8> = [NODE, 7, 8].iter().flat_map(|v| v.to_le_bytes()).collect();
+    m.copy_to_guest(NODE, &node).unwrap();
+    (m, GuestPtr::new(MAP))
+}
+
+/// Every walk over a cyclic node list must end with an error, however many
+/// elements the map claims to have; bounding the walks by that count kept
+/// the host busy collecting entries until it ran out of memory. Found by
+/// `guestfuzzer`. (C++ loops forever here.)
+#[test]
+fn cyclic_node_lists_are_rejected() {
+    for count in [1, 2, 1000, u64::MAX] {
+        within_seconds(move || {
+            let corrupt = |r: libriscv::Result<()>| {
+                assert_eq!(
+                    r.unwrap_err().message,
+                    "Guest std::unordered_map: corrupt node list",
+                    "{count} elements"
+                );
+            };
+            let (m, map) = cyclic_map(count);
+            corrupt(map.entries(&m).map(drop));
+            corrupt(map.to_map(&m).map(drop));
+            // Looking for a key that isn't there walks the bucket.
+            corrupt(map.find(&m, &9u64).map(drop));
+            let (mut m, map) = cyclic_map(count);
+            corrupt(map.clear(&mut m));
+            let (mut m, map) = cyclic_map(count);
+            corrupt(map.free(&mut m));
+            let (mut m, map) = cyclic_map(count);
+            corrupt(map.rehash(&mut m, 100));
+        });
+    }
+}
