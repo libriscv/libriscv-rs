@@ -7,13 +7,18 @@
 //!   `CPU::decode`). It drives the precise interpreter and the dispatcher's
 //!   generic `function`/`funcblock` handlers.
 //! * [`fast_handler`] picks the tail-call handler stored in the decoder cache
-//!   (C++ `computed_index_for` + `threaded_rewrite`). Where C++ has a
-//!   dedicated bytecode, so does this; where C++ falls back to
-//!   `RV32I_BC_FUNCTION`, this uses `function::<O>` with the precise handler.
-//!   Both choices matter for parity: only block-ending and FUNCTION
-//!   handlers check for stale segments, and some encodings are only
-//!   rejected by one of the two decoders.
+//!   and re-encodes the instruction's operands for it (C++
+//!   `computed_index_for` + `threaded_rewrite`). Where C++ has a dedicated
+//!   bytecode, so does this (the handlers are in `bytecode.rs`); where C++
+//!   falls back to `RV32I_BC_FUNCTION`, this uses `function::<O>` with the
+//!   precise handler and the original bits. Both choices matter for parity:
+//!   only block-ending and FUNCTION handlers check for stale segments, and
+//!   some encodings are only rejected by one of the two decoders. The few
+//!   places that pick a bytecode where C++ uses a FUNCTION slow path that
+//!   behaves the same (C.SUB and friends, C.SRAI, C.LUI) are
+//!   marked; [`cpp_entry_bits`] still follows C++ exactly.
 
+use crate::bytecode::{self, FasterImmediate, FasterItype, FasterJtype, FasterMove, FasterOpType};
 use crate::decoder_cache::COMPRESSED;
 use crate::dispatch::{self, Handler};
 use crate::instruction::{CInstr, Instr, ci_code};
@@ -515,15 +520,15 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
                 B::Invalid
             }
         }
-        // C.FLD, C.LW, C.LD (C.LD takes the slow path in C++)
+        // C.FLD, C.LW, C.LD
         x if x == ci_code(0b001, 0b00)
             || x == ci_code(0b010, 0b00)
             || x == ci_code(0b011, 0b00) =>
         {
-            if ci.funct3() == 0x2 {
-                B::Ldw
-            } else {
-                B::Function
+            match ci.funct3() {
+                0x2 => B::Ldw,
+                0x3 => B::Ldd,
+                _ => B::Function, // C.FLD
             }
         }
         x if x == ci_code(0b101, 0b00)
@@ -619,54 +624,94 @@ fn compressed_bytecode(ci: CInstr) -> CBytecode {
     }
 }
 
-/// The compressed half of `fast_handler`: the handler for `ci`'s bytecode,
-/// with `threaded_rewrite`'s target checks. `None` is `RV32I_BC_INVALID`.
+/// The compressed half of `fast_handler`: the bytecode handler for `ci` and
+/// its re-encoded bits (`threaded_rewrite`), with the rewriter's target
+/// checks. `None` is `RV32I_BC_INVALID`.
 fn compressed_fast_handler(
     ci: CInstr,
     i: Instr,
     within: impl Fn(u64, u64) -> bool,
     pc: u64,
-) -> Option<Handler> {
+) -> Option<(Handler, u32)> {
     use CBytecode as B;
-    use dispatch::cseq;
+    use bytecode as bc;
+    let itype = FasterItype::encode;
     // Branches and jumps out of the execute segment, or to misaligned
     // addresses, become invalid instructions.
     let target_ok = |offset: i32, len: u64| {
         let addr = pc.wrapping_add(offset as i64 as u64);
         within(addr, len) && addr.is_multiple_of(2)
     };
+    let (rd, rs2) = (ci.rd(), ci.rs2());
+    let (srd, srs1) = (ci.srd_lo() + 8, ci.srs1_hi() + 8);
     let quadrant0 = ci.quadrant() == 0;
     Some(match compressed_bytecode(ci) {
         B::Invalid => return None,
-        B::Function => decode(i).cfunction,
-        B::Addi if ci.opcode() == ci_code(0b000, 0b00) => cseq::<CAddi4spn>,
-        B::Addi if ci.opcode() == ci_code(0b011, 0b01) => cseq::<CAddi16sp>,
-        B::Addi => cseq::<CAddi>,
-        // C++ runs C.LI as C.ADDI rd, x0, imm; x0 is always zero, so the
-        // precise C.LI is equivalent.
-        B::Li => cseq::<CLi>,
-        B::Mv => cseq::<CMv>,
-        B::Slli => cseq::<CSlli>,
-        B::Srli => cseq::<CSrli>,
-        B::Andi => cseq::<CAndi>,
-        B::Add => cseq::<CAdd>,
-        B::Xor => cseq::<CXor>,
-        B::Or => cseq::<COr>,
+        // C1_ALU_OPS and C.LUI that C++ leaves to RV32C_BC_FUNCTION.
+        B::Function if ci.opcode() == ci_code(0b100, 0b01) => {
+            let handler: Handler = match ci.ca_funct6() & 0x3 {
+                1 => bc::c_srai,
+                3 => match ci.ca_funct2() | (ci.ca_funct6() & 0x4) {
+                    0 => bc::c_op::<Sub>,
+                    3 => bc::c_op::<And>,
+                    4 => bc::c_op::<Subw>,
+                    5 => bc::c_op::<Addw>,
+                    6 => bc::c_op::<Mul>,
+                    // Zcb unary ops
+                    _ => return Some((decode(i).cfunction, i.whole())),
+                },
+                _ => return Some((decode(i).cfunction, i.whole())),
+            };
+            if ci.ca_funct6() & 0x3 == 1 {
+                (handler, itype(srs1, 0, (ci.cab_shamt() & 63) as i32))
+            } else {
+                (handler, itype(srs1, srd, 0))
+            }
+        }
+        B::Function
+            if ci.opcode() == ci_code(0b011, 0b01)
+                && rd != 0
+                && rd != 2
+                && ci.ci_upper_imm() != 0 =>
+        {
+            (
+                bc::c_lui,
+                FasterJtype::encode((ci.ci_upper_imm() as u32) >> 8, rd),
+            )
+        }
+        B::Function => (decode(i).cfunction, i.whole()),
+        B::Addi if ci.opcode() == ci_code(0b000, 0b00) => {
+            (bc::c_addi, itype(srd, REG_SP, ci.ciw_offset() as i32))
+        }
+        B::Addi if ci.opcode() == ci_code(0b011, 0b01) => {
+            (bc::c_addi, itype(REG_SP, REG_SP, ci.ci16_imm()))
+        }
+        B::Addi => (bc::c_addi, itype(rd, rd, ci.ci_imm())),
+        // C++ runs C.LI as C.ADDI rd, x0, imm.
+        B::Li => (bc::c_addi, itype(rd, 0, ci.ci_imm())),
+        B::Mv => (bc::c_mv, FasterMove::encode(rd, rs2)),
+        B::Slli => (bc::c_slli, itype(rd, 0, ci.ci_shamt() as i32)),
+        B::Srli => (bc::c_srli, itype(srs1, 0, ci.cab_shamt() as i32)),
+        B::Andi => (bc::c_andi, itype(srs1, 0, ci.cab_imm())),
+        B::Add => (bc::c_add, itype(rd, rs2, 0)),
+        B::Xor => (bc::c_xor, itype(srs1, srd, 0)),
+        B::Or => (bc::c_or, itype(srs1, srd, 0)),
         B::Beqz | B::Bnez if !target_ok(ci.cb_imm(), 2) => return None,
-        B::Beqz => dispatch::c_beqz,
-        B::Bnez => dispatch::c_bnez,
+        B::Beqz => (bc::c_beqz, itype(srs1, 0, ci.cb_imm())),
+        B::Bnez => (bc::c_bnez, itype(srs1, 0, ci.cb_imm())),
         B::Jmp if !target_ok(ci.cj_imm(), 4) => return None,
-        B::Jmp => dispatch::c_jmp,
-        B::Addiw => cseq::<CAddiw>,
-        B::Jr => dispatch::c_jr,
-        B::Jalr => dispatch::c_jalr,
-        B::Ldd => cseq::<CLdsp>,
-        B::Std if quadrant0 => cseq::<CSd>,
-        B::Std => cseq::<CSdsp>,
-        B::Ldw if quadrant0 => cseq::<CLw>,
-        B::Ldw => cseq::<CLwsp>,
-        B::Stw if quadrant0 => cseq::<CSw>,
-        B::Stw => cseq::<CSwsp>,
+        B::Jmp => (bc::c_jmp, ci.cj_imm() as u32),
+        B::Addiw => (bc::c_addiw, itype(rd, rd, ci.ci_imm())),
+        B::Jr => (bc::c_jr, rd),
+        B::Jalr => (bc::c_jalr, rd),
+        B::Ldd if quadrant0 => (bc::c_ldd, itype(srd, srs1, ci.csd_offset() as i32)),
+        B::Ldd => (bc::c_ldd, itype(rd, REG_SP, ci.cifld_offset() as i32)),
+        B::Std if quadrant0 => (bc::c_std, itype(srs1, srd, ci.csd_offset() as i32)),
+        B::Std => (bc::c_std, itype(REG_SP, rs2, ci.csfsd_offset() as i32)),
+        B::Ldw if quadrant0 => (bc::c_ldw, itype(srd, srs1, ci.cl_offset() as i32)),
+        B::Ldw => (bc::c_ldw, itype(rd, REG_SP, ci.ci2_offset() as i32)),
+        B::Stw if quadrant0 => (bc::c_stw, itype(srs1, srd, ci.cl_offset() as i32)),
+        B::Stw => (bc::c_stw, itype(REG_SP, rs2, ci.css_offset4() as i32)),
     })
 }
 
@@ -697,6 +742,7 @@ fn compressed_entry_bits(ci: CInstr, original: u32) -> u32 {
         B::Beqz | B::Bnez => itype(srs1, 0, ci.cb_imm()),
         B::Jmp => ci.cj_imm() as u32,
         B::Jr | B::Jalr => rd,
+        B::Ldd if quadrant0 => itype(srd, srs1, ci.csd_offset() as i32),
         B::Ldd => itype(rd, REG_SP, ci.cifld_offset() as i32),
         B::Std if quadrant0 => itype(srs1, srd, ci.csd_offset() as i32),
         B::Std => itype(REG_SP, rs2, ci.csfsd_offset() as i32),
@@ -707,18 +753,24 @@ fn compressed_entry_bits(ci: CInstr, original: u32) -> u32 {
     }
 }
 
-/// Port of `CPU::computed_index_for` plus the target checks in
-/// `threaded_rewrite`. `None` means the C++ `RV32I_BC_INVALID` bytecode.
-/// `pc` is the instruction's address and `[begin, end)` the execute segment
-/// being decoded.
-pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Handler> {
-    use dispatch::seq;
+/// Port of `CPU::computed_index_for` (`decode_bytecodes.cpp`) plus
+/// `threaded_rewrite` (`threaded_rewriter.cpp`): the bytecode handler for
+/// an instruction and the bits stored in its decoder entry, which the
+/// handler gets as its `ins` argument. Fast bytecodes get their operands
+/// re-encoded into one of the `bytecode::Faster*` formats; slow-path ones
+/// (`function::<O>` etc.) keep the original instruction. `None` means the
+/// C++ `RV32I_BC_INVALID` bytecode. `pc` is the instruction's address and
+/// `[begin, end)` the execute segment being decoded.
+pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<(Handler, u32)> {
+    use bytecode as bc;
 
     let within = |addr: u64, len: u64| {
         addr.checked_add(len)
             .is_some_and(|e| addr >= begin && e <= end)
     };
     const PCAL: u64 = if COMPRESSED { 2 } else { 4 };
+    let itype = FasterItype::encode;
+    let optype = FasterOpType::encode;
 
     if i.is_compressed() {
         if COMPRESSED {
@@ -729,45 +781,53 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
         if i.half0() == 0 {
             return None;
         }
-        return Some(decode(i).function);
+        return Some((decode(i).function, i.whole()));
     }
+    let original = i.whole();
     let it = i.itype();
-    let function = || Some(decode(i).function);
+    let (rd, rs1, imm) = (it.rd(), it.rs1(), it.signed_imm());
+    let function = || Some((decode(i).function, original));
     match i.opcode() {
         LOAD => {
-            if it.rd() == 0 {
+            if rd == 0 {
                 return function();
             }
-            match it.funct3() {
-                0x0 => Some(seq::<LoadI8>),
-                0x1 => Some(seq::<LoadI16>),
-                0x2 => Some(seq::<LoadI32>),
-                0x3 => Some(seq::<LoadI64>),
-                0x4 => Some(seq::<LoadU8>),
-                0x5 => Some(seq::<LoadU16>),
-                0x6 => Some(seq::<LoadU32>),
-                _ => None,
-            }
+            let handler: Handler = match it.funct3() {
+                0x0 => bc::ldb,
+                0x1 => bc::ldh,
+                0x2 => bc::ldw,
+                0x3 => bc::ldd,
+                0x4 => bc::ldbu,
+                0x5 => bc::ldhu,
+                0x6 => bc::ldwu,
+                _ => return None,
+            };
+            Some((handler, itype(rd, rs1, imm)))
         }
-        STORE => match i.stype().funct3() {
-            0x0 => Some(seq::<StoreI8>),
-            0x1 => Some(seq::<StoreI16>),
-            0x2 => Some(seq::<StoreI32>),
-            0x3 => Some(seq::<StoreI64>),
-            _ => None,
-        },
+        STORE => {
+            let st = i.stype();
+            let handler: Handler = match st.funct3() {
+                0x0 => bc::stb,
+                0x1 => bc::sth,
+                0x2 => bc::stw,
+                0x3 => bc::std,
+                _ => return None,
+            };
+            Some((handler, itype(st.rs1(), st.rs2(), st.signed_imm())))
+        }
         BRANCH => {
-            let imm = i.btype().signed_imm();
-            let handler: Handler = match i.btype().funct3() {
+            let bt = i.btype();
+            let imm = bt.signed_imm();
+            let handler: Handler = match bt.funct3() {
                 // Forward branches skip the instruction counter check.
-                0x0 if imm > 0 => dispatch::beq_fw,
-                0x0 => dispatch::beq,
-                0x1 if imm > 0 => dispatch::bne_fw,
-                0x1 => dispatch::bne,
-                0x4 => dispatch::blt,
-                0x5 => dispatch::bge,
-                0x6 => dispatch::bltu,
-                0x7 => dispatch::bgeu,
+                0x0 if imm > 0 => bc::beq_fw,
+                0x0 => bc::beq,
+                0x1 if imm > 0 => bc::bne_fw,
+                0x1 => bc::bne,
+                0x4 => bc::blt,
+                0x5 => bc::bge,
+                0x6 => bc::bltu,
+                0x7 => bc::bgeu,
                 _ => return None,
             };
             // Branches out of the execute segment, or to misaligned
@@ -776,152 +836,168 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
             if !within(addr, 4) || !addr.is_multiple_of(PCAL) {
                 return None;
             }
-            Some(handler)
+            Some((handler, itype(bt.rs1(), bt.rs2(), imm)))
         }
-        LUI => {
-            if i.utype().rd() == 0 {
+        LUI | AUIPC => {
+            if rd == 0 {
                 return function();
             }
-            Some(seq::<Lui>)
-        }
-        AUIPC => {
-            if i.utype().rd() == 0 {
-                return function();
-            }
-            Some(dispatch::auipc)
+            let handler: Handler = if i.opcode() == LUI {
+                bc::lui
+            } else {
+                bc::auipc
+            };
+            Some((handler, FasterJtype::encode(i.utype().imm() << 4, rd)))
         }
         JAL => {
             // The destination must be inside the current execute segment.
-            let addr = pc.wrapping_add(i.jtype().jump_offset() as i64 as u64);
+            let offset = i.jtype().jump_offset();
+            let addr = pc.wrapping_add(offset as i64 as u64);
             if within(addr, 4) && addr.is_multiple_of(PCAL) {
                 return Some(match i.jtype().rd() {
-                    0 => dispatch::fast_jal,
-                    crate::registers::REG_RA => dispatch::fast_call,
-                    _ => dispatch::jal,
+                    0 => (bc::fast_jal as Handler, offset as u32),
+                    crate::registers::REG_RA => (bc::fast_call, offset as u32),
+                    jrd => (bc::jal, FasterJtype::encode(offset as u32, jrd)),
                 });
             }
             None
         }
-        JALR => Some(dispatch::jalr),
+        JALR => Some((bc::jalr, itype(rd, rs1, imm))),
         OP_IMM => {
-            if it.rd() == 0 {
+            if rd == 0 {
                 return function();
             }
-            match it.funct3() {
-                0x0 if it.rs1() == 0 => Some(seq::<Li>),
-                // ADDI and MV
-                0x0 => Some(seq::<Addi>),
-                0x1 if it.high_bits() == 0 => Some(seq::<Slli>),
-                0x2 => Some(seq::<Slti>),
-                0x3 => Some(seq::<Sltiu>),
-                0x4 => Some(seq::<Xori>),
-                0x5 if it.high_bits() == 0 => Some(seq::<Srli>),
-                0x5 if it.is_srai() => Some(seq::<Srai>),
-                0x6 => Some(seq::<Ori>),
-                0x7 => Some(seq::<Andi>),
-                0x1 if it.imm() == 0b0110_0000_0100 => Some(seq::<SextB>),
-                0x1 if it.imm() == 0b0110_0000_0101 => Some(seq::<SextH>),
-                0x1 if it.high_bits() == 0x280 => Some(seq::<Bseti>),
-                0x5 if it.high_bits() == 0x480 => Some(seq::<Bexti>),
+            let shamt = (it.imm() & 63) as i32;
+            Some(match it.funct3() {
+                0x0 if rs1 == 0 => (bc::li as Handler, FasterImmediate::encode(rd, imm)),
+                0x0 if imm == 0 => (bc::mv, FasterMove::encode(rd, rs1)),
+                0x0 => (bc::addi, itype(rd, rs1, imm)),
+                0x1 if it.high_bits() == 0 => (bc::slli, itype(rd, rs1, shamt)),
+                0x2 => (bc::slti, itype(rd, rs1, imm)),
+                0x3 => (bc::sltiu, itype(rd, rs1, imm)),
+                0x4 => (bc::xori, itype(rd, rs1, imm)),
+                0x5 if it.high_bits() == 0 => (bc::srli, itype(rd, rs1, shamt)),
+                0x5 if it.is_srai() => (bc::srai, itype(rd, rs1, shamt)),
+                0x6 => (bc::ori, itype(rd, rs1, imm)),
+                0x7 => (bc::andi, itype(rd, rs1, imm)),
+                0x1 if it.imm() == 0b0110_0000_0100 => (bc::sext_b, itype(rd, rs1, imm)),
+                0x1 if it.imm() == 0b0110_0000_0101 => (bc::sext_h, itype(rd, rs1, imm)),
+                0x1 if it.high_bits() == 0x280 => (bc::bseti, itype(rd, rs1, shamt)),
+                0x5 if it.high_bits() == 0x480 => (bc::bexti, itype(rd, rs1, shamt)),
                 // CLZ, RORI, REV8 and the rest
-                _ => function(),
-            }
+                _ => return function(),
+            })
         }
         OP => {
-            if i.rtype().rd() == 0 {
+            let rt = i.rtype();
+            if rt.rd() == 0 {
                 return function();
             }
-            match i.rtype().jumptable_friendly_op() {
-                0x0 => Some(seq::<Add>),
-                0x200 => Some(seq::<Sub>),
-                0x1 => Some(seq::<Sll>),
-                0x2 => Some(seq::<Slt>),
-                0x3 => Some(seq::<Sltu>),
-                0x4 => Some(seq::<Xor>),
-                0x5 => Some(seq::<Srl>),
-                0x6 => Some(seq::<Or>),
-                0x7 => Some(seq::<And>),
-                0x10 => Some(seq::<Mul>),
-                0x14 => Some(seq::<Div>),
-                0x15 => Some(seq::<Divu>),
-                0x16 => Some(seq::<Rem>),
-                0x17 => Some(seq::<Remu>),
-                0x205 => Some(seq::<Sra>),
-                0x102 => Some(seq::<Sh1add>),
-                0x104 => Some(seq::<Sh2add>),
-                0x106 => Some(seq::<Sh3add>),
+            let handler: Handler = match rt.jumptable_friendly_op() {
+                0x0 => bc::op::<Add>,
+                0x200 => bc::op::<Sub>,
+                0x1 => bc::op::<Sll>,
+                0x2 => bc::op::<Slt>,
+                0x3 => bc::op::<Sltu>,
+                0x4 => bc::op::<Xor>,
+                0x5 => bc::op::<Srl>,
+                0x6 => bc::op::<Or>,
+                0x7 => bc::op::<And>,
+                0x10 => bc::op::<Mul>,
+                0x14 => bc::op::<Div>,
+                0x15 => bc::op::<Divu>,
+                0x16 => bc::op::<Rem>,
+                0x17 => bc::op::<Remu>,
+                0x205 => bc::op::<Sra>,
+                0x102 => bc::op::<Sh1add>,
+                0x104 => bc::op::<Sh2add>,
+                0x106 => bc::op::<Sh3add>,
                 // MULH*, PACK, MIN/MAX, CZERO.*, BSET, ROL and the rest
-                _ => function(),
-            }
+                _ => return function(),
+            };
+            Some((handler, optype(rt.rd(), rt.rs1(), rt.rs2())))
         }
         // Unlike the other ALU opcodes, C++ picks the OP-32 bytecodes before
         // looking at rd; `threaded_rewrite` then turns those with rd == x0
         // into `LI x0, 0`, a no-op that is still a sequential bytecode (not
         // the FUNCTION slow path).
         OP32 => {
-            let handler: Handler = match i.rtype().jumptable_friendly_op() {
-                0x0 => seq::<Addw>,
-                0x200 => seq::<Subw>,
-                0x10 => seq::<Mulw>,
-                0x40 => seq::<AddUw>,
-                0x44 if i.rtype().rs2() == 0 => seq::<ZextH>,
+            let rt = i.rtype();
+            let handler: Handler = match rt.jumptable_friendly_op() {
+                0x0 => bc::op::<Addw>,
+                0x200 => bc::op::<Subw>,
+                0x10 => bc::op::<Mulw>,
+                0x40 => bc::op::<AddUw>,
+                0x44 if rt.rs2() == 0 => bc::op::<ZextH>,
                 // SH*ADD.UW, PACKW, ROLW and the rest
                 _ => return function(),
             };
-            Some(if i.rtype().rd() == 0 {
-                seq::<Nop>
+            Some(if rt.rd() == 0 {
+                (bc::li, 0)
             } else {
-                handler
+                (handler, optype(rt.rd(), rt.rs1(), rt.rs2()))
             })
         }
         OP_IMM32 => {
-            if it.rd() == 0 {
+            if rd == 0 {
                 return function();
             }
             let shamt_ok = it.imm() & 0x20 == 0;
-            match it.funct3() {
-                0x0 => Some(seq::<Addiw>),
-                0x1 if it.high_bits() == 0 && shamt_ok => Some(seq::<Slliw>),
-                0x5 if it.high_bits() == 0 && shamt_ok => Some(seq::<Srliw>),
-                // SRAIW and SLLI.UW take the slow path in C++ too
-                _ => function(),
-            }
+            let shamt = (it.imm() & 31) as i32;
+            Some(match it.funct3() {
+                0x0 => (bc::addiw as Handler, itype(rd, rs1, imm)),
+                0x1 if it.high_bits() == 0 && shamt_ok => (bc::slliw, itype(rd, rs1, shamt)),
+                0x5 if it.high_bits() == 0 && shamt_ok => (bc::srliw, itype(rd, rs1, shamt)),
+                0x5 if it.high_bits() == 0x400 && shamt_ok => (bc::sraiw, itype(rd, rs1, shamt)),
+                // SLLI.UW and the rest
+                _ => return function(),
+            })
         }
         SYSTEM => {
             if it.funct3() == 0 {
                 match it.imm() {
-                    0 => return Some(dispatch::syscall),
+                    0 => return Some((dispatch::syscall, original)),
                     // WFI and STOP
-                    0x105 | 0x7FF => return Some(dispatch::stop),
+                    0x105 | 0x7FF => return Some((dispatch::stop, original)),
                     _ => {}
                 }
             }
-            Some(dispatch::system)
+            Some((dispatch::system, original))
         }
         #[cfg(feature = "ext-f")]
         LOAD_FP => match it.funct3() {
-            0x2 => Some(seq::<Flw>),
-            0x3 => Some(seq::<Fld>),
+            0x2 => Some((bc::flw, itype(rd, rs1, imm))),
+            0x3 => Some((bc::fld, itype(rd, rs1, imm))),
             // FLH, and the vector loads (illegal here)
             _ => function(),
         },
         #[cfg(feature = "ext-f")]
-        STORE_FP => match it.funct3() {
-            0x2 => Some(seq::<Fsw>),
-            0x3 => Some(seq::<Fsd>),
-            _ => function(),
-        },
-        // C++ picks RV32F_BC_FMADD for every format; it ignores H and Q.
+        STORE_FP => {
+            let st = i.stype();
+            let fs = itype(st.rs1(), st.rs2(), st.signed_imm());
+            match st.funct3() {
+                0x2 => Some((bc::fsw, fs)),
+                0x3 => Some((bc::fsd, fs)),
+                _ => function(),
+            }
+        }
+        // C++ picks RV32F_BC_FMADD for every format; it ignores H and Q. It
+        // keeps the original instruction.
         #[cfg(feature = "ext-f")]
-        FMADD => Some(seq::<FMaddFast>),
+        FMADD => Some((dispatch::seq::<FMaddFast>, original)),
         #[cfg(feature = "ext-f")]
-        FPFUNC if FInstr(i.whole()).funct2() < 2 => match i.fpfunc() {
-            0b00000 => Some(seq::<FAdd>),
-            0b00001 => Some(seq::<FSub>),
-            0b00010 => Some(seq::<FMul>),
-            0b00011 => Some(seq::<FDiv>),
-            _ => function(),
-        },
+        FPFUNC if FInstr(i.whole()).funct2() < 2 => {
+            let rt = i.rtype();
+            let bits =
+                bytecode::FasterFloatType::encode(rt.funct7() & 3, rt.rd(), rt.rs1(), rt.rs2());
+            match i.fpfunc() {
+                0b00000 => Some((bc::fadd, bits)),
+                0b00001 => Some((bc::fsub, bits)),
+                0b00010 => Some((bc::fmul, bits)),
+                0b00011 => Some((bc::fdiv, bits)),
+                _ => function(),
+            }
+        }
         // FENCE, FMSUB/FNMADD/FNMSUB and the other FP functions, A (always
         // RV32I_BC_FUNCTION in C++), V and unknown opcodes (custom-handled)
         _ => function(),
@@ -929,10 +1005,11 @@ pub(crate) fn fast_handler(i: Instr, pc: u64, begin: u64, end: u64) -> Option<Ha
 }
 
 /// The instruction bits C++ keeps in a decoder entry after
-/// `threaded_rewrite` re-encodes them for its bytecode. The interpreter here
-/// doesn't use re-encoded bits (until Phase 4), but they are observable: they
-/// are the data of the ILLEGAL_OPCODE fault raised when the decoder
-/// force-ends a block at the end of an execute segment.
+/// `threaded_rewrite` re-encodes them for its bytecode. They are observable:
+/// they are the data of the ILLEGAL_OPCODE fault raised when the decoder
+/// force-ends a block at the end of an execute segment. Mostly the same bits
+/// as [`fast_handler`]'s, but this follows C++'s bytecode selection exactly,
+/// also where `fast_handler` picks a bytecode for one of C++'s slow paths.
 ///
 /// C++ leaves some bytes of the LI and MV encodings uninitialised; they are
 /// zero here.
@@ -1012,6 +1089,8 @@ pub(crate) fn cpp_entry_bits(i: Instr, pc: u64, begin: u64, end: u64) -> u32 {
             match it.funct3() {
                 0 => itype(rd, rs1, imm),
                 1 | 5 if it.high_bits() == 0 && shamt_ok => itype(rd, rs1, (it.imm() & 31) as i32),
+                // SRAIW
+                5 if it.high_bits() == 0x400 && shamt_ok => itype(rd, rs1, (it.imm() & 31) as i32),
                 _ => original,
             }
         }

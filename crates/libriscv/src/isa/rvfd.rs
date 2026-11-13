@@ -98,7 +98,7 @@ fn unboxed(m: &Machine, r: u32) -> bool {
 }
 /// `load_u32`: the low word, plus the box if NaN-boxing.
 #[inline(always)]
-fn load_u32(m: &mut Machine, r: u32, v: u32) {
+pub(crate) fn load_u32(m: &mut Machine, r: u32, v: u32) {
     let upper = if NANBOXING {
         0xFFFF_FFFF_0000_0000
     } else {

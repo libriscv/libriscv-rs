@@ -668,7 +668,7 @@ fn itype_alu<T: ItypeAlu>(m: &mut Machine, i: Instr) -> Result<()> {
 }
 
 /// Register-register ALU operations with a dedicated fast-path handler.
-trait RtypeAlu {
+pub(crate) trait RtypeAlu {
     fn compute(a: u64, b: u64) -> u64;
 }
 macro_rules! rtype_alu {

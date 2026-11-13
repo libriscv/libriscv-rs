@@ -109,36 +109,20 @@ macro_rules! read_write {
         /// table.
         #[inline(always)]
         pub fn $read(&self, addr: u64) -> Result<$t> {
-            const N: usize = size_of::<$t>();
-            if addr.wrapping_sub(RWREAD_BEGIN) < self.read_boundary {
-                // In bounds thanks to the padding page; `get` can't fail.
-                if let Some(b) = usize::try_from(addr)
-                    .ok()
-                    .and_then(|a| self.arena.get(a..))
-                    .and_then(|s| s.first_chunk::<N>())
-                {
-                    return Ok(<$t>::from_le_bytes(*b));
-                }
+            match self.arena_read::<{ size_of::<$t>() }>(addr) {
+                Some(b) => Ok(<$t>::from_le_bytes(b)),
+                None => self.read_slow(addr).map(<$t>::from_le_bytes),
             }
-            self.read_slow::<N>(addr).map(<$t>::from_le_bytes)
         }
 
         /// Write a little-endian value (C++ `write<T>`): the arena, or the
         /// page table.
         #[inline(always)]
         pub fn $write(&mut self, addr: u64, value: $t) -> Result<()> {
-            const N: usize = size_of::<$t>();
-            if addr.wrapping_sub(self.initial_rodata_end) < self.write_boundary {
-                if let Some(b) = usize::try_from(addr)
-                    .ok()
-                    .and_then(|a| self.arena.get_mut(a..))
-                    .and_then(|s| s.first_chunk_mut::<N>())
-                {
-                    *b = value.to_le_bytes();
-                    return Ok(());
-                }
+            if self.arena_write(addr, value.to_le_bytes()) {
+                return Ok(());
             }
-            self.write_slow::<N>(addr, value.to_le_bytes())
+            self.write_slow(addr, value.to_le_bytes())
         }
     )*};
 }
@@ -265,6 +249,37 @@ impl Memory {
         read_u16, write_u16, u16;
         read_u32, write_u32, u32;
         read_u64, write_u64, u64;
+    }
+
+    /// The flat-arena fast path of `read<T>`: `N` bytes at `addr` if it is
+    /// below the read boundary, else `None` (then the page table decides,
+    /// see [`Memory::read_slow`]). Never fails, so the dispatcher's fast
+    /// bytecodes inline it without carrying a `Result`.
+    #[inline(always)]
+    pub(crate) fn arena_read<const N: usize>(&self, addr: u64) -> Option<[u8; N]> {
+        if addr.wrapping_sub(RWREAD_BEGIN) < self.read_boundary {
+            // In bounds thanks to the padding page; `get` can't fail.
+            let a = usize::try_from(addr).ok()?;
+            return self.arena.get(a..a.wrapping_add(N))?.first_chunk().copied();
+        }
+        None
+    }
+
+    /// The flat-arena fast path of `write<T>`: true if `addr` is below the
+    /// write boundary and the value was written, else false (then the page
+    /// table decides, see [`Memory::write_slow`]).
+    #[inline(always)]
+    pub(crate) fn arena_write<const N: usize>(&mut self, addr: u64, value: [u8; N]) -> bool {
+        if addr.wrapping_sub(self.initial_rodata_end) < self.write_boundary
+            && let Some(b) = usize::try_from(addr)
+                .ok()
+                .and_then(|a| self.arena.get_mut(a..a.wrapping_add(N)))
+                .and_then(|b| b.first_chunk_mut())
+        {
+            *b = value;
+            return true;
+        }
+        false
     }
 
     #[cfg(feature = "ext-a")]

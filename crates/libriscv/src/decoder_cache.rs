@@ -4,8 +4,9 @@
 //! An execute segment is a copy of a range of executable guest code plus a
 //! decoder cache with one entry per 2 bytes (per 4 without the C extension).
 //! Each entry holds the tail-call handler for the instruction starting there,
-//! the raw instruction bits, and the block bookkeeping used for instruction
-//! counting:
+//! its instruction bits (re-encoded for the handler by the threaded rewriter,
+//! see `decode::fast_handler`, or the original instruction for slow paths),
+//! and the block bookkeeping used for instruction counting:
 //!
 //! * `idxend`: distance in entries from this entry to the last instruction of
 //!   its block (the branch, jump or system instruction that ends it).
@@ -15,8 +16,8 @@
 //! and advances its `pc` to the last instruction of the block (C++
 //! `BEGIN_BLOCK`). Counter checks happen only at block ends.
 //!
-//! Not ported yet: shared segments and CRC32-C keys (Phase 4), bytecode
-//! specialisation (Phase 4), EBREAK locations and the libc fast path.
+//! Not ported yet: shared segments and CRC32-C keys (Phase 4), EBREAK
+//! locations and the libc fast path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -219,7 +220,7 @@ impl DecodedSegment {
     }
 
     /// Port of `read_instruction` (safe_instr_loader.hpp): never reads past `end`.
-    fn read_instruction(&self, pc: u64, end_pc: u64) -> Instr {
+    pub(crate) fn read_instruction(&self, pc: u64, end_pc: u64) -> Instr {
         if pc.wrapping_add(4) <= end_pc {
             Instr(self.read_u32(pc))
         } else if pc.wrapping_add(2) <= end_pc {
@@ -290,9 +291,9 @@ impl DecodedSegment {
             let instruction = self.read_instruction(dst, end);
             let new_entry = if !COMPRESSED || was_full_instruction {
                 match decode::fast_handler(instruction, dst, begin, end) {
-                    Some(handler) => DecoderEntry {
+                    Some((handler, instr)) => DecoderEntry {
                         handler,
-                        instr: instruction.0,
+                        instr,
                         idxend: 0,
                         icount: 0,
                         invalid: false,
@@ -323,11 +324,17 @@ impl DecodedSegment {
 
     /// Turns an entry into a block-ending invalid instruction. C++ sets the
     /// bytecode and handler to zero but leaves the (re-encoded) instruction
-    /// bits, which become the fault's data.
+    /// bits, which become the fault's data. Those are C++'s bits exactly,
+    /// which differ from this entry's where this port picks a different
+    /// bytecode than C++ (see `decode::cpp_entry_bits`).
     fn force_invalid(&mut self, i: usize) {
         let (pc, begin, end) = (self.address_of(i), self.begin, self.end);
+        let original = self.read_instruction(pc, end);
         if let Some(e) = self.cache.get_mut(i) {
-            e.instr = decode::cpp_entry_bits(Instr(e.instr), pc, begin, end);
+            // Entries inside a 4-byte instruction have no bits.
+            if !(e.invalid && e.instr == 0) {
+                e.instr = decode::cpp_entry_bits(original, pc, begin, end);
+            }
             e.handler = dispatch::execute_invalid;
             e.invalid = true;
         }

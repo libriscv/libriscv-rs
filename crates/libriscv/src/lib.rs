@@ -59,8 +59,10 @@
 // Guaranteed tail calls for threaded dispatch (see PORTING.md, "Dispatch").
 // Still marked incomplete upstream; the difftests are our safety net.
 #![feature(explicit_tail_calls)]
+#![feature(rust_preserve_none_cc)]
 #![allow(incomplete_features)]
 
+mod bytecode;
 mod cpu;
 mod decode;
 mod decoder_cache;

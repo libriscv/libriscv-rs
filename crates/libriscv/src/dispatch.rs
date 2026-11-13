@@ -1,5 +1,6 @@
-//! Port of `tailcall_dispatch.cpp` and the RV64I/M/C handlers of
-//! `bytecode_impl.cpp`.
+//! Port of `tailcall_dispatch.cpp` and the slow-path and system handlers of
+//! `bytecode_impl.cpp` (`RV32I_BC_FUNCTION`, `FUNCBLOCK`, `SYSCALL`, ...).
+//! The fast-path bytecodes are in `bytecode.rs`.
 //!
 //! Every decoder cache entry stores a handler with the [`Handler`]
 //! signature. A handler executes its instruction and then tail-calls the
@@ -7,6 +8,12 @@
 //! indirect branch and the chain never grows the stack. The chain ends by
 //! returning an [`Exit`] when the instruction counter overflows, the machine
 //! stops, execution leaves the current execute segment, or a fault occurs.
+//!
+//! Handlers use the `preserve_none` calling convention (as in C++), so they
+//! save no registers, and get their entry's instruction bits as an argument
+//! (C++ reads `d->instr`), so they don't look up their own entry. Exits are
+//! tail calls too (`halt_exit` etc.): a handler that makes no calls needs no
+//! stack frame.
 //!
 //! As in C++, `pc` is not tracked per instruction. On entering a block
 //! (`BEGIN_BLOCK`) `pc` is advanced to the block's last instruction and the
@@ -24,17 +31,28 @@
 use std::sync::Arc;
 
 use crate::decode;
-use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
+use crate::decoder_cache::{COMPRESSED, DecodedSegment, DecoderEntry};
 use crate::error::{ExceptionKind, MachineError, Result};
-use crate::instruction::{CInstr, Instr};
+use crate::instruction::Instr;
 use crate::isa::Op;
 use crate::machine::Machine;
-use crate::registers::{REG_ECALL, REG_RA};
+use crate::registers::REG_ECALL;
 
-/// The signature shared by all handlers: the current execute segment, the
+/// The signature shared by all handlers: the current execute segment, its
+/// decoder cache (in registers, which saves two loads per instruction), the
 /// index of this handler's decoder entry, the machine, the dispatcher's
-/// `pc` (the last instruction of the current block) and the counters.
-pub(crate) type Handler = fn(&DecodedSegment, usize, &mut Machine, u64, Counter) -> Exit;
+/// `pc` (the last instruction of the current block), the counters, and the
+/// entry's instruction bits (re-encoded by the rewriter for fast bytecodes,
+/// the original instruction otherwise).
+pub(crate) type Handler = extern "rust-preserve-none" fn(
+    &DecodedSegment,
+    &[DecoderEntry],
+    usize,
+    &mut Machine,
+    u64,
+    Counter,
+    u32,
+) -> Exit;
 
 /// The instruction counter and limit, kept in registers while dispatching
 /// (C++ `InstrCounter`).
@@ -46,7 +64,7 @@ pub(crate) struct Counter {
 
 impl Counter {
     #[inline(always)]
-    const fn overflowed(self) -> bool {
+    pub(crate) const fn overflowed(self) -> bool {
         self.value >= self.max
     }
 }
@@ -108,11 +126,11 @@ impl DispatchState {
 }
 
 /// Decoder entries per 4-byte instruction (C++ `NEXT_INSTR`).
-const STEP: usize = if COMPRESSED { 2 } else { 1 };
+pub(crate) const STEP: usize = if COMPRESSED { 2 } else { 1 };
 
 #[cold]
 #[inline(never)]
-fn halt(m: &mut Machine, pc: u64, c: Counter) -> Exit {
+pub(crate) fn halt(m: &mut Machine, pc: u64, c: Counter) -> Exit {
     m.dispatch.pc = pc;
     m.dispatch.counter = c;
     Exit::Halt
@@ -120,7 +138,7 @@ fn halt(m: &mut Machine, pc: u64, c: Counter) -> Exit {
 
 #[cold]
 #[inline(never)]
-fn leave_segment(m: &mut Machine, pc: u64, c: Counter) -> Exit {
+pub(crate) fn leave_segment(m: &mut Machine, pc: u64, c: Counter) -> Exit {
     m.dispatch.pc = pc;
     m.dispatch.counter = c;
     Exit::Jump
@@ -128,7 +146,7 @@ fn leave_segment(m: &mut Machine, pc: u64, c: Counter) -> Exit {
 
 #[cold]
 #[inline(never)]
-fn fault(m: &mut Machine, error: MachineError) -> Exit {
+pub(crate) fn fault(m: &mut Machine, error: MachineError) -> Exit {
     m.dispatch.error = Some(error);
     Exit::Fault
 }
@@ -137,154 +155,212 @@ fn fault(m: &mut Machine, error: MachineError) -> Exit {
 /// can't happen; it is handled anyway rather than trusted.
 #[cold]
 #[inline(never)]
-fn bad_entry(m: &mut Machine, pc: u64) -> Exit {
+pub(crate) fn bad_entry(m: &mut Machine, pc: u64) -> Exit {
     fault(
         m,
         MachineError::trigger(ExceptionKind::ExecutionSpaceProtectionFault, pc),
     )
 }
 
+/// [`halt`] as a handler, for tail calls from handlers: a plain call would
+/// make the caller set up a stack frame.
+#[cold]
+#[inline(never)]
+pub(crate) extern "rust-preserve-none" fn halt_exit(
+    _exec: &DecodedSegment,
+    _cache: &[DecoderEntry],
+    _i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+    _ins: u32,
+) -> Exit {
+    halt(m, pc, c)
+}
+
+/// [`leave_segment`] as a handler (see [`halt_exit`]).
+#[cold]
+#[inline(never)]
+pub(crate) extern "rust-preserve-none" fn leave_exit(
+    _exec: &DecodedSegment,
+    _cache: &[DecoderEntry],
+    _i: usize,
+    m: &mut Machine,
+    pc: u64,
+    c: Counter,
+    _ins: u32,
+) -> Exit {
+    leave_segment(m, pc, c)
+}
+
+/// [`bad_entry`] as a handler (see [`halt_exit`]).
+#[cold]
+#[inline(never)]
+pub(crate) extern "rust-preserve-none" fn bad_entry_exit(
+    _exec: &DecodedSegment,
+    _cache: &[DecoderEntry],
+    _i: usize,
+    m: &mut Machine,
+    pc: u64,
+    _c: Counter,
+    _ins: u32,
+) -> Exit {
+    bad_entry(m, pc)
+}
+
 /// The entry at index `$i`, or return a fault.
 macro_rules! entry {
-    ($exec:ident, $i:expr, $m:ident, $pc:expr) => {
-        match $exec.cache.get($i) {
+    ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {
+        match $cache.get($i) {
             Some(e) => e,
-            None => return bad_entry($m, $pc),
+            None => become $crate::dispatch::bad_entry_exit($exec, $cache, 0, $m, $pc, $c, 0),
         }
     };
 }
+pub(crate) use entry;
 
-/// C++ `EXECUTE_CURRENT`: tail-call the handler of entry `$i`.
+/// C++ `EXECUTE_CURRENT`: tail-call the handler of entry `$i`, handing it
+/// the entry's (re-encoded) instruction bits.
 macro_rules! execute {
-    ($exec:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {{
+    ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {{
         let i: usize = $i;
-        let e = entry!($exec, i, $m, $pc);
-        become (e.handler)($exec, i, $m, $pc, $c)
+        let e = $crate::dispatch::entry!($exec, $cache, i, $m, $pc, $c);
+        become (e.handler)($exec, $cache, i, $m, $pc, $c, e.instr)
     }};
 }
+pub(crate) use execute;
 
 /// C++ `BEGIN_BLOCK` + `EXECUTE_CURRENT`: enter the block at entry `$i`.
 macro_rules! begin_block {
-    ($exec:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {{
+    ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr) => {{
         let i: usize = $i;
-        let c: Counter = $c;
-        let e = entry!($exec, i, $m, $pc);
+        let c: $crate::dispatch::Counter = $c;
+        let e = $crate::dispatch::entry!($exec, $cache, i, $m, $pc, c);
         let pc: u64 = ($pc).wrapping_add(e.block_bytes());
-        let c = Counter {
+        let c = $crate::dispatch::Counter {
             value: c.value.wrapping_add(e.instruction_count()),
             max: c.max,
         };
-        become (e.handler)($exec, i, $m, pc, c)
+        become (e.handler)($exec, $cache, i, $m, pc, c, e.instr)
     }};
 }
+pub(crate) use begin_block;
 
 /// C++ `NEXT_BLOCK(len, OF)` (and `PERFORM_BRANCH`, which is
 /// `NEXT_BLOCK(imm, true)`): continue `$len` bytes from the current block's
 /// last instruction, checking the counter first if `$of`.
 macro_rules! next_block {
-    ($exec:ident, $i:expr, $m:ident, $pc:expr, $c:expr, $len:expr, $of:expr) => {{
+    ($exec:ident, $cache:ident, $i:expr, $m:ident, $pc:expr, $c:expr, $len:expr, $of:expr) => {{
         let len: i64 = $len;
-        let c: Counter = $c;
+        let c: $crate::dispatch::Counter = $c;
         let pc: u64 = ($pc).wrapping_add_signed(len);
-        let i: usize = ($i).wrapping_add_signed((len >> SHIFT) as isize);
+        let i: usize = ($i).wrapping_add_signed((len >> $crate::decoder_cache::SHIFT) as isize);
         if $of && c.overflowed() {
-            return halt($m, pc, c);
+            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, pc, c, 0);
         }
-        begin_block!($exec, i, $m, pc, c)
+        $crate::dispatch::begin_block!($exec, $cache, i, $m, pc, c)
     }};
 }
+pub(crate) use next_block;
 
 /// C++ `UNCHECKED_JUMP` (with its `QUICK_EXEC_CHECK`): continue at `$pc`,
 /// leaving the chain if it is outside the current segment.
 macro_rules! unchecked_jump {
-    ($exec:ident, $m:ident, $pc:expr, $c:expr) => {{
+    ($exec:ident, $cache:ident, $m:ident, $pc:expr, $c:expr) => {{
         let pc: u64 = $pc;
-        let c: Counter = $c;
+        let c: $crate::dispatch::Counter = $c;
         if !(pc >= $exec.exec_begin() && pc < $exec.exec_end()) {
-            return leave_segment($m, pc, c);
+            become $crate::dispatch::leave_exit($exec, $cache, 0, $m, pc, c, 0);
         }
-        begin_block!($exec, $exec.index(pc), $m, pc, c)
+        $crate::dispatch::begin_block!($exec, $cache, $exec.index(pc), $m, pc, c)
     }};
 }
+pub(crate) use unchecked_jump;
 
 /// C++ `OVERFLOW_CHECKED_JUMP`.
 macro_rules! overflow_checked_jump {
-    ($exec:ident, $m:ident, $pc:expr, $c:expr) => {{
+    ($exec:ident, $cache:ident, $m:ident, $pc:expr, $c:expr) => {{
         let pc: u64 = $pc;
-        let c: Counter = $c;
+        let c: $crate::dispatch::Counter = $c;
         if c.overflowed() {
-            return halt($m, pc, c);
+            become $crate::dispatch::halt_exit($exec, $cache, 0, $m, pc, c, 0);
         }
-        unchecked_jump!($exec, $m, pc, c)
+        $crate::dispatch::unchecked_jump!($exec, $cache, $m, pc, c)
     }};
 }
+pub(crate) use overflow_checked_jump;
 
-/// An instruction with a dedicated fast-path bytecode in C++: execute it and
-/// continue with the next entry.
-pub(crate) fn seq<O: Op>(
+/// An instruction executed through its precise handler, continuing with the
+/// next entry. Used for C++ bytecodes whose handler does the same, without
+/// FUNCTION's stale-segment check (FMADD). The entry holds the original
+/// instruction bits.
+pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
-    let e = entry!(exec, i, m, pc);
-    if let Err(err) = O::exec(m, Instr(e.instr)) {
+    if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
     }
-    execute!(exec, i + STEP, m, pc, c)
+    execute!(exec, cache, i + STEP, m, pc, c)
 }
 
-/// A compressed instruction executed through its handler, continuing with
-/// the next entry (C++ `NEXT_C_INSTR`). Used both for compressed bytecodes
-/// with a dedicated handler in C++ and for `RV32C_BC_FUNCTION`, which unlike
-/// `RV32I_BC_FUNCTION` doesn't check for a stale segment afterwards.
-pub(crate) fn cseq<O: Op>(
+/// C++ `RV32C_BC_FUNCTION`: a compressed instruction executed through its
+/// precise handler, continuing with the next entry. Unlike
+/// `RV32I_BC_FUNCTION` it doesn't check for a stale segment afterwards.
+pub(crate) extern "rust-preserve-none" fn cseq<O: Op>(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
-    let e = entry!(exec, i, m, pc);
-    if let Err(err) = O::exec(m, Instr(e.instr)) {
+    if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
     }
-    execute!(exec, i + 1, m, pc, c)
+    execute!(exec, cache, i + 1, m, pc, c)
 }
 
 /// C++ `RV32I_BC_FUNCTION`: a slow-path instruction in the middle of a
 /// block. Like C++ it re-checks the segment afterwards, since the
 /// instruction may have made it stale (FENCE.I).
-pub(crate) fn function<O: Op>(
+pub(crate) extern "rust-preserve-none" fn function<O: Op>(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
-    let e = entry!(exec, i, m, pc);
-    if let Err(err) = O::exec(m, Instr(e.instr)) {
+    if let Err(err) = O::exec(m, Instr(ins)) {
         return fault(m, err);
     }
     if exec.is_stale() {
         // C++ ENTER_NEW_EXECUTE_SEGMENT
         return leave_segment(m, exec.address_of(i).wrapping_add(4), c);
     }
-    execute!(exec, i + STEP, m, pc, c)
+    execute!(exec, cache, i + STEP, m, pc, c)
 }
 
 /// C++ `RV32I_BC_FUNCBLOCK`: the last instruction of an over-long block,
 /// executed precisely (with `pc` visible to it).
-pub(crate) fn funcblock<O: Op>(
+pub(crate) extern "rust-preserve-none" fn funcblock<O: Op>(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
-    let e = entry!(exec, i, m, pc);
-    let instr = Instr(e.instr);
+    let instr = Instr(ins);
     m.cpu.regs.pc = exec.address_of(i);
     if let Err(err) = O::exec(m, instr) {
         return fault(m, err);
@@ -293,167 +369,18 @@ pub(crate) fn funcblock<O: Op>(
     if exec.is_stale() {
         return leave_segment(m, exec.address_of(i).wrapping_add_signed(len), c);
     }
-    next_block!(exec, i, m, pc, c, len, true)
-}
-
-macro_rules! branch {
-    ($($(#[$attr:meta])* $name:ident, forward: $fw:expr, |$a:ident, $b:ident| $cond:expr;)*) => {$(
-        $(#[$attr])*
-        pub(crate) fn $name(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-            let bt = Instr(entry!(exec, i, m, pc).instr).btype();
-            let $a = m.cpu.regs.get(bt.rs1());
-            let $b = m.cpu.regs.get(bt.rs2());
-            if $cond {
-                // Forward branches can't loop, so they skip the counter check.
-                next_block!(exec, i, m, pc, c, i64::from(bt.signed_imm()), !$fw)
-            }
-            next_block!(exec, i, m, pc, c, 4, false)
-        }
-    )*};
-}
-
-branch! {
-    beq, forward: false, |a, b| a == b;
-    bne, forward: false, |a, b| a != b;
-    /// BEQ with a positive offset (C++ `RV32I_BC_BEQ_FW`).
-    beq_fw, forward: true, |a, b| a == b;
-    /// BNE with a positive offset (C++ `RV32I_BC_BNE_FW`).
-    bne_fw, forward: true, |a, b| a != b;
-    blt, forward: false, |a, b| (a as i64) < (b as i64);
-    bge, forward: false, |a, b| (a as i64) >= (b as i64);
-    bltu, forward: false, |a, b| a < b;
-    bgeu, forward: false, |a, b| a >= b;
-}
-
-/// JAL with a link register other than `x0`/`ra`.
-pub(crate) fn jal(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-    let jt = Instr(entry!(exec, i, m, pc).instr).jtype();
-    m.cpu.regs.set(jt.rd(), pc.wrapping_add(4));
-    next_block!(exec, i, m, pc, c, i64::from(jt.jump_offset()), true)
-}
-
-/// JAL with `rd = x0` (C++ `RV32I_BC_FAST_JAL`).
-pub(crate) fn fast_jal(
-    exec: &DecodedSegment,
-    i: usize,
-    m: &mut Machine,
-    pc: u64,
-    c: Counter,
-) -> Exit {
-    let jt = Instr(entry!(exec, i, m, pc).instr).jtype();
-    next_block!(exec, i, m, pc, c, i64::from(jt.jump_offset()), true)
-}
-
-/// JAL with `rd = ra` (C++ `RV32I_BC_FAST_CALL`).
-pub(crate) fn fast_call(
-    exec: &DecodedSegment,
-    i: usize,
-    m: &mut Machine,
-    pc: u64,
-    c: Counter,
-) -> Exit {
-    let jt = Instr(entry!(exec, i, m, pc).instr).jtype();
-    m.cpu.regs.set(REG_RA, pc.wrapping_add(4));
-    next_block!(exec, i, m, pc, c, i64::from(jt.jump_offset()), true)
-}
-
-pub(crate) fn jalr(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-    let it = Instr(entry!(exec, i, m, pc).instr).itype();
-    // If rs1 == rd, avoid the clobber by computing the address first.
-    let address = m
-        .cpu
-        .regs
-        .get(it.rs1())
-        .wrapping_add(it.signed_imm() as i64 as u64);
-    if it.rd() != 0 {
-        m.cpu.regs.set(it.rd(), pc.wrapping_add(4));
-    }
-    let target = address & !1;
-    if !COMPRESSED && target & 0x3 != 0 {
-        return fault(
-            m,
-            MachineError::trigger(ExceptionKind::MisalignedInstruction, target),
-        );
-    }
-    overflow_checked_jump!(exec, m, target, c)
-}
-
-/// C.BEQZ (C++ `rv32c_beqz`). Unlike the 4-byte branches, C++ checks the
-/// counter on forward branches too (`PERFORM_BRANCH`).
-pub(crate) fn c_beqz(
-    exec: &DecodedSegment,
-    i: usize,
-    m: &mut Machine,
-    pc: u64,
-    c: Counter,
-) -> Exit {
-    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
-    if m.cpu.regs.get(ci.srs1_hi() + 8) == 0 {
-        next_block!(exec, i, m, pc, c, i64::from(ci.cb_imm()), true)
-    }
-    next_block!(exec, i, m, pc, c, 2, false)
-}
-
-/// C.BNEZ (C++ `rv32c_bnez`).
-pub(crate) fn c_bnez(
-    exec: &DecodedSegment,
-    i: usize,
-    m: &mut Machine,
-    pc: u64,
-    c: Counter,
-) -> Exit {
-    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
-    if m.cpu.regs.get(ci.srs1_hi() + 8) != 0 {
-        next_block!(exec, i, m, pc, c, i64::from(ci.cb_imm()), true)
-    }
-    next_block!(exec, i, m, pc, c, 2, false)
-}
-
-/// C.J (C++ `rv32c_jmp`).
-pub(crate) fn c_jmp(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
-    next_block!(exec, i, m, pc, c, i64::from(ci.cj_imm()), true)
-}
-
-/// C.JR (C++ `rv32c_jr`).
-pub(crate) fn c_jr(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
-    let target = m.cpu.regs.get(ci.rd()) & !1;
-    overflow_checked_jump!(exec, m, target, c)
-}
-
-/// C.JALR (C++ `rv32c_jalr`). Reads the target before writing RA.
-pub(crate) fn c_jalr(
-    exec: &DecodedSegment,
-    i: usize,
-    m: &mut Machine,
-    pc: u64,
-    c: Counter,
-) -> Exit {
-    let ci = CInstr::from(Instr(entry!(exec, i, m, pc).instr));
-    let target = m.cpu.regs.get(ci.rd());
-    m.cpu.regs.set(REG_RA, pc.wrapping_add(2));
-    overflow_checked_jump!(exec, m, target & !1, c)
-}
-
-/// AUIPC reconstructs its address from the block end (C++ `rv32i_auipc`).
-pub(crate) fn auipc(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, c: Counter) -> Exit {
-    let e = entry!(exec, i, m, pc);
-    let ut = Instr(e.instr).utype();
-    let value = pc
-        .wrapping_sub(e.block_bytes())
-        .wrapping_add(ut.upper_imm() as i64 as u64);
-    m.cpu.regs.set(ut.rd(), value);
-    execute!(exec, i + STEP, m, pc, c)
+    next_block!(exec, cache, i, m, pc, c, len, true)
 }
 
 /// ECALL (C++ `rv32i_syscall`).
-pub(crate) fn syscall(
+pub(crate) extern "rust-preserve-none" fn syscall(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    _ins: u32,
 ) -> Exit {
     // Make the current PC and the counters visible to the handler.
     m.cpu.regs.pc = pc;
@@ -471,18 +398,20 @@ pub(crate) fn syscall(
     // always full-length instructions, so execution resumes after PC.
     if c.overflowed() || m.cpu.regs.pc != pc {
         let new_pc = m.cpu.regs.pc.wrapping_add(4);
-        overflow_checked_jump!(exec, m, new_pc, c)
+        overflow_checked_jump!(exec, cache, m, new_pc, c)
     }
-    next_block!(exec, i, m, pc, c, 4, false)
+    next_block!(exec, cache, i, m, pc, c, 4, false)
 }
 
 /// WFI and the STOP instruction (C++ `rv32i_stop`).
-pub(crate) fn stop(
+pub(crate) extern "rust-preserve-none" fn stop(
     _exec: &DecodedSegment,
+    _cache: &[DecoderEntry],
     _i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    _ins: u32,
 ) -> Exit {
     // Complete the STOP instruction, and stop.
     halt(
@@ -496,14 +425,16 @@ pub(crate) fn stop(
 }
 
 /// Other SYSTEM instructions: EBREAK, CSRs (C++ `rv32i_system`).
-pub(crate) fn system(
+pub(crate) extern "rust-preserve-none" fn system(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
-    let instr = Instr(entry!(exec, i, m, pc).instr);
+    let instr = Instr(ins);
     m.cpu.regs.pc = pc;
     m.counter = c.value;
     m.max_counter = m.dispatch.visible_max(c.max);
@@ -517,25 +448,26 @@ pub(crate) fn system(
     // Stopped, or PC changed: continue *at* PC (so a stopped machine
     // resumes at this instruction).
     if c.overflowed() || m.cpu.regs.pc != pc {
-        overflow_checked_jump!(exec, m, m.cpu.regs.pc, c)
+        overflow_checked_jump!(exec, cache, m, m.cpu.regs.pc, c)
     }
-    next_block!(exec, i, m, pc, c, 4, true)
+    next_block!(exec, cache, i, m, pc, c, 4, true)
 }
 
 /// C++ `execute_invalid`: an entry that can't be executed from the cache.
 /// Entries without instruction bits (the middle of a 4-byte instruction)
 /// are executed precisely from the segment's code instead.
-pub(crate) fn execute_invalid(
+pub(crate) extern "rust-preserve-none" fn execute_invalid(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     _pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
     // The current PC, mid block.
     let pc = exec.address_of(i);
-    let e = entry!(exec, i, m, pc);
-    if e.instr == 0 && exec.is_within(pc, 2) {
+    if ins == 0 && exec.is_within(pc, 2) {
         m.counter = c.value;
         m.max_counter = m.dispatch.visible_max(c.max);
         let pc = match simulate_undecoded(m, exec, pc) {
@@ -552,13 +484,13 @@ pub(crate) fn execute_invalid(
         if exec.is_stale() {
             return leave_segment(m, pc, c);
         }
-        unchecked_jump!(exec, m, pc, c)
+        unchecked_jump!(exec, cache, m, pc, c)
     }
     m.counter = c.value;
     m.cpu.regs.pc = pc;
     fault(
         m,
-        MachineError::trigger(ExceptionKind::IllegalOpcode, u64::from(e.instr)),
+        MachineError::trigger(ExceptionKind::IllegalOpcode, u64::from(ins)),
     )
 }
 
@@ -567,16 +499,18 @@ pub(crate) fn execute_invalid(
 /// at block starts, which are only reached through `BEGIN_BLOCK`, so the
 /// counter already includes this block; native code counts it itself.
 #[cfg(feature = "jit")]
-pub(crate) fn jit_enter(
+pub(crate) extern "rust-preserve-none" fn jit_enter(
     exec: &DecodedSegment,
+    cache: &[DecoderEntry],
     i: usize,
     m: &mut Machine,
     pc: u64,
     c: Counter,
+    ins: u32,
 ) -> Exit {
     use crate::jit::JitExit;
 
-    let e = entry!(exec, i, m, pc);
+    let e = entry!(exec, cache, i, m, pc, c);
     let start = exec.address_of(i);
     let Some(jit) = exec.jit.as_ref() else {
         return bad_entry(m, start);
@@ -586,7 +520,7 @@ pub(crate) fn jit_enter(
     // code runs can make the segment stale, so checking once is enough.)
     if exec.is_stale() {
         return match jit.original_handler(i) {
-            Some(handler) => become handler(exec, i, m, pc, c),
+            Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
             None => bad_entry(m, start),
         };
     }
@@ -602,6 +536,7 @@ pub(crate) fn jit_enter(
         ),
         JitExit::Jump { pc, counter } => begin_block!(
             exec,
+            cache,
             exec.index(pc),
             m,
             pc,
@@ -612,6 +547,7 @@ pub(crate) fn jit_enter(
         ),
         JitExit::Indirect { pc, counter } => unchecked_jump!(
             exec,
+            cache,
             m,
             pc,
             Counter {
@@ -623,11 +559,12 @@ pub(crate) fn jit_enter(
             // Continue the chain at that instruction with the interpreter's
             // own handler (the block is counted already).
             let si = exec.index(pc);
-            let e = entry!(exec, si, m, pc);
+            let e = entry!(exec, cache, si, m, pc, c);
             let handler = jit.original_handler(si).unwrap_or(e.handler);
             let block_pc = pc.wrapping_add(e.block_bytes());
             become handler(
                 exec,
+                cache,
                 si,
                 m,
                 block_pc,
@@ -635,11 +572,12 @@ pub(crate) fn jit_enter(
                     value: counter,
                     max: c.max,
                 },
+                e.instr,
             )
         }
         JitExit::Fault(err) => fault(m, err),
         JitExit::Unavailable => match jit.original_handler(i) {
-            Some(handler) => become handler(exec, i, m, pc, c),
+            Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
             None => bad_entry(m, start),
         },
     }
@@ -779,7 +717,7 @@ impl Machine {
             // BEGIN_BLOCK
             let block_pc = pc.wrapping_add(e.block_bytes());
             c.value = c.value.wrapping_add(e.instruction_count());
-            match (e.handler)(&exec, i, self, block_pc, c) {
+            match (e.handler)(&exec, &exec.cache, i, self, block_pc, c, e.instr) {
                 Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {
                     c = self.dispatch.counter;

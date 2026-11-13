@@ -14,7 +14,6 @@ use std::collections::BTreeSet;
 
 use super::classify::{JOp, classify};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
-use crate::instruction::Instr;
 
 /// The most instructions in one region. Bounds the size of a single
 /// Cranelift function, which keeps compile time roughly linear.
@@ -106,7 +105,8 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
         let op = if entry.invalid {
             None
         } else {
-            classify(Instr(entry.instr), pc)
+            // The entry holds the rewriter's bits; classify the original.
+            classify(exec.read_instruction(pc, end), pc)
         };
         // Block-ending entries that aren't control flow are FUNCBLOCK
         // entries (over-long blocks): they keep the precise handler, so they

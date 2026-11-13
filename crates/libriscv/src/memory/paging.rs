@@ -446,7 +446,7 @@ impl Memory {
     /// `cached_readable_page`).
     #[cold]
     #[inline(never)]
-    pub(super) fn read_slow<const N: usize>(&self, addr: u64) -> Result<[u8; N]> {
+    pub(crate) fn read_slow<const N: usize>(&self, addr: u64) -> Result<[u8; N]> {
         let pageno = addr / PAGE_SIZE;
         let off = (addr & PAGE_MASK) as usize;
         let data = self.get_readable_pageno(pageno)?;
@@ -476,7 +476,7 @@ impl Memory {
     /// Guest store outside the arena's write window (C++ `write<T>`).
     #[cold]
     #[inline(never)]
-    pub(super) fn write_slow<const N: usize>(&mut self, addr: u64, value: [u8; N]) -> Result<()> {
+    pub(crate) fn write_slow<const N: usize>(&mut self, addr: u64, value: [u8; N]) -> Result<()> {
         let pageno = addr / PAGE_SIZE;
         let off = (addr & PAGE_MASK) as usize;
         let data = self.writable_page(pageno)?;

@@ -293,39 +293,6 @@ ops! {
         Ok(())
     }
     CEbreak = |m, i| { m.ebreak() }
-
-    // Dispatcher-only versions of the compressed bytecodes C++ rewrites
-    // (`threaded_rewrite`), where they are cheaper than the precise
-    // handler or behave differently from it.
-
-    /// C.SRLI (C++ `RV32C_BC_SRLI`).
-    CSrli = |m, i| {
-        let ci = c(i);
-        let v = cireg(m, ci.srs1_hi()) >> ci.cab_shamt();
-        set_cireg(m, ci.srs1_hi(), v);
-        Ok(())
-    }
-    /// C.ANDI (C++ `RV32C_BC_ANDI`).
-    CAndi = |m, i| {
-        let ci = c(i);
-        let v = cireg(m, ci.srs1_hi()) & (ci.cab_imm() as i64 as u64);
-        set_cireg(m, ci.srs1_hi(), v);
-        Ok(())
-    }
-    /// C.XOR (C++ `RV32C_BC_XOR`).
-    CXor = |m, i| {
-        let ci = c(i);
-        let v = cireg(m, ci.srs1_hi()) ^ cireg(m, ci.srd_lo());
-        set_cireg(m, ci.srs1_hi(), v);
-        Ok(())
-    }
-    /// C.OR (C++ `RV32C_BC_OR`).
-    COr = |m, i| {
-        let ci = c(i);
-        let v = cireg(m, ci.srs1_hi()) | cireg(m, ci.srd_lo());
-        set_cireg(m, ci.srs1_hi(), v);
-        Ok(())
-    }
 }
 
 #[cfg(test)]

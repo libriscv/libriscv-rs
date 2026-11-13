@@ -140,10 +140,12 @@ How the C++ version maps over:
 
 | C++ (`tailcall_dispatch.cpp`) | Rust |
 |---|---|
-| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `fn name(exec: &DecodedSegment<W>, i: usize, cpu: &mut Cpu<W>, pc: W::Addr, counter: Counter) -> Exit` with one signature for all handlers |
-| `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(...)`. Store the handler `fn` in the decoder entry itself, so there's no second table lookup |
-| `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction: measure it before trying to remove it |
-| `__attribute__((preserve_none))` | `extern "rust-preserve-none" fn` (`feature(rust_preserve_none_cc)`, works on the pinned nightly). Try it in Phase 4 and keep it if benchmarks say so |
+| `INSTRUCTION(bc, name)`: `static TcoRet<W> name(DecoderData<W>* d, DecodedExecuteSegment<W>* exec, CPU<W>& cpu, addr_t pc, InstrCounter& counter)` | `extern "rust-preserve-none" fn name(exec: &DecodedSegment, i: usize, m: &mut Machine, pc: u64, counter: Counter, ins: u32) -> Exit` with one signature for all handlers |
+| `MUSTTAIL return computed_opcode<W>[bc](...)` | `become (entry.handler)(..., entry.instr)`. Store the handler `fn` in the decoder entry itself, so there's no second table lookup |
+| `VIEW_INSTR_AS(fi, FasterItype)` reading `d->instr` | The caller passes the entry's (re-encoded) bits as `ins`, so a handler never looks up its own entry |
+| `d += 1` pointer bump | index `i + 1`; read with `exec.cache.get(i)`. That's one bounds check per instruction (a compare and a predicted branch), the price of safe Rust |
+| `__attribute__((preserve_none))` | `extern "rust-preserve-none" fn` (`feature(rust_preserve_none_cc)`). Without it every handler saved and restored six callee-saved registers: it cut CoreMark's host instructions by 17% |
+| `return RETURN_VALUES()`, `next_execute_segment(...)` exits | `become halt_exit(...)` etc.: exits are tail calls to cold handlers too, so a fast handler makes no calls and needs no stack frame |
 | `BEGIN_BLOCK()` adds the block's instruction count; `OVERFLOW_CHECK()` only on branches/jumps | Same. The counting has to match exactly to keep instruction-count parity |
 | `cpu.trigger_exception()` throws | Store the `MachineError` in the machine and return `Exit::Fault`. The return value is a one-byte enum |
 | `next_execute_segment()` on out-of-segment jumps | Return `Exit::Jump`; `dispatch_simulate` switches segment and re-enters the chain with `BEGIN_BLOCK`. Returning is needed because the chain borrows the segment, and it's a slow path anyway |
@@ -171,10 +173,47 @@ Chains are unbounded, as in C++. They end on counter overflow, `stop()`, a
 syscall that needs to leave the dispatcher, or a fault. That's only safe
 because `become` is guaranteed: never write a dispatch tail call as a plain call.
 
-Phase 1 builds this dispatcher directly with a simple decoder cache (one entry
-per 2 bytes: handler + raw instruction + block length), so there's no `match`
-interpreter to throw away later. Phase 4 adds bytecode specialisation, fusion,
-shared segments and the `preserve_none` experiment.
+Phase 1 built this dispatcher directly with a simple decoder cache (one entry
+per 2 bytes: handler + instruction bits + block length), so there was no
+`match` interpreter to throw away later. Phase 4 added the bytecodes below.
+
+### Bytecodes
+
+The fast path is a port of C++'s threaded bytecodes, and that's where the
+interpreter's speed comes from:
+
+- `decode::fast_handler` is `decode_bytecodes.cpp` + `threaded_rewriter.cpp`:
+  it picks the bytecode and re-encodes the operands into the
+  `threaded_bytecodes.hpp` formats (`FasterItype`, `FasterOpType`, ...,
+  in `bytecode.rs`), doing every check that can be done at decode time:
+  `rd != x0`, branch and jump targets inside the segment and aligned, shift
+  amounts in range, forward branches (no counter check).
+- `bytecode.rs` is `bytecode_impl.cpp`: one handler per bytecode, reading
+  the pre-decoded operands. They never return a `Result`: the only fallible
+  ones, loads and stores, read the flat arena inline (`Memory::arena_read`,
+  which can't fail) and tail-call a cold `*_slow` handler for the page
+  table and faults. C++ gets the same effect from exceptions.
+- Slow paths (`RV32I_BC_FUNCTION`, `RV32C_BC_FUNCTION`, `FUNCBLOCK`) keep
+  the original instruction and run the precise handler, as in C++.
+
+Where C++ sends an instruction to a FUNCTION slow path that behaves exactly
+like a bytecode, this port uses the bytecode (results, counts and faults are
+the same; the rewriter's C++-exact bits are kept for fault data, see
+`decode::cpp_entry_bits`):
+
+- C.SUB, C.AND, C.SUBW, C.ADDW, C.MUL, C.SRAI and C.LUI: new compressed
+  bytecodes (`c_op`, `c_srai`, `c_lui`), hot in compiled code.
+
+C.LD (`RV32C_BC_LDD`) and SRAIW (`RV64I_BC_SRAIW`) used to be in this list:
+C++ had the handlers but never selected them (and its rewriter's C.LD case
+swapped the destination and base registers). C++ selects both now, with
+the swap fixed, and so does the port. C.LD's slow path alone took ~10% of
+the interpreter's time on CoreMark.
+
+`rvi_fuse.cpp` isn't ported: nothing in C++ calls `try_fuse`.
+
+`tests/bytecodes.rs` runs random programs through the bytecodes and the
+precise interpreter and compares registers, memory and faults.
 
 ### Baseline
 
@@ -204,22 +243,31 @@ LCG loop, 206.8M instructions, same machine and date:
 CoreMark (`cargo bench -p rvlinux --features jit --bench coremark`):
 freestanding, built with our port (`crates/testutil/guests/coremark`, from
 `../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
-iterations, `-O2`, wall-clock time of the whole process, best of 3, on
-2026-11-12. All runs validate, and all exact-counting variants report the
-same instruction counts (1442120574 / 1442122541 / 1272208341):
+iterations, `-O2`, wall-clock time of the whole process, best of 5, on
+2026-11-13, with the bytecodes (see "Bytecodes"). The C++ builds include
+C++'s C.LD and SRAIW bytecodes (staged in `../libriscv`, not yet committed
+there), which made C++ threaded ~12% faster. All runs validate, and all
+exact-counting variants report the same instruction counts
+(1442120574 / 1442122541 / 1272208341):
 
 | | rv64imc | rv64imafdc | rv64imafdc_zba_zbb_zbs |
 |---|---|---|---|
-| Rust interpreter | 1967 ms | 2029 ms | 1838 ms |
-| Rust JIT (up front) | 297 ms | 299 ms | 302 ms |
-| Rust JIT (background) | 292 ms | 293 ms | 296 ms |
-| C++ threaded | 1831 ms | 1816 ms | 1770 ms |
-| C++ tailcall | 1999 ms | 1987 ms | 2004 ms |
-| C++ asmjit (up front) | 301 ms | 304 ms | 770 ms* |
-| C++ asmjit (background) | 291 ms | 294 ms | 725 ms* |
+| Rust interpreter | 1692 ms | 1640 ms | 1419 ms |
+| Rust JIT (up front) | 310 ms | 311 ms | 309 ms |
+| Rust JIT (background) | 305 ms | 306 ms | 300 ms |
+| C++ threaded | 1626 ms | 1677 ms | 1703 ms |
+| C++ tailcall | 1830 ms | 1699 ms | 1652 ms |
+| C++ asmjit (up front) | 291 ms | 292 ms | 745 ms* |
+| C++ asmjit (background) | 292 ms | 291 ms | 755 ms* |
 
 \* The local `rvlinux-asmjit` binary predates the reference commit and
 doesn't compile Zba/Zbb/Zbs.
+
+Wall-clock differences of a few percent are noise on the dev machine; by
+`perf stat` (rv64imc) the Rust interpreter takes 9.26G cycles and 28.6G host
+instructions, C++ threaded 9.59G cycles and 21.6G instructions. Before the
+bytecodes, Rust took 2196 ms and 55.7G instructions here (C++ without
+C.LD/SRAIW: 1860 ms).
 
 CoreMark as a regular Linux executable (`testutil::build_coremark_linux`:
 upstream's POSIX port, static glibc, `lp64d` only; `clock()` is
@@ -228,13 +276,13 @@ exact-counting variants report 1435905543 / 1266007356 instructions:
 
 | | glibc rv64imafdc | glibc rv64imafdc_zba_zbb_zbs |
 |---|---|---|
-| Rust interpreter | 2056 ms | 1854 ms |
-| Rust JIT (up front) | 2120 ms | 2109 ms |
-| Rust JIT (background) | 1920 ms | 1850 ms |
-| C++ threaded | 1874 ms | 1804 ms |
-| C++ tailcall | 1996 ms | 1956 ms |
-| C++ asmjit (up front) | 1646 ms | 2116 ms |
-| C++ asmjit (background) | 1638 ms | 2106 ms |
+| Rust interpreter | 1681 ms | 1435 ms |
+| Rust JIT (up front) | 2155 ms | 2150 ms |
+| Rust JIT (background) | 1680 ms | 1531 ms |
+| C++ threaded | 1696 ms | 1667 ms |
+| C++ tailcall | 1747 ms | 1717 ms |
+| C++ asmjit (up front) | 1647 ms | 2104 ms |
+| C++ asmjit (background) | 1643 ms | 2062 ms |
 
 The JITs don't pay off here: the executable segment holds all of libc
 (460 KB), and compiling it takes ~1.9 s with Cranelift, after which
@@ -590,7 +638,7 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   and FLH/FMV.H.X zero-extend the half into the low word.
 - C.J is only decoded if 4 bytes at its target are inside the segment
   (C.BEQZ/C.BNEZ: 2 bytes), so a `c.j` to the segment's last halfword is an
-  illegal instruction. C.LD takes the slow path while C.LDSP has a bytecode.
+  illegal instruction.
 - The compressed slow path (`RV32C_BC_FUNCTION`) doesn't check for a stale
   segment afterwards, unlike the 4-byte one.
 - A misaligned SC fails (`rd = 1`) without faulting and, unlike an
@@ -660,9 +708,9 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 - [x] Benchmark harness: CoreMark (`crates/rvlinux/benches/coremark.rs`) vs the C++ reference, `target/cpp-ref/{threaded,tailcall}` and `rvlinux-asmjit`
 - [ ] Benchmark harness: dhrystone, STREAM
-- [ ] Specialised bytecodes (`decode_bytecodes.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`)
-- [ ] `extern "rust-preserve-none"` handlers; keep if faster
-- [ ] Instruction fusion (`rvi_fuse.cpp`)
+- [x] Specialised bytecodes (`decode_bytecodes.cpp`, `threaded_rewriter.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`); see "Bytecodes"
+- [x] `extern "rust-preserve-none"` handlers
+- [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
 - [ ] Shared execute segments across machines (`decoded_exec_segment.hpp`, `shared_rodata.cpp`)
 - [ ] Bounds-check elimination audit (`cargo asm`)
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
@@ -703,7 +751,7 @@ phase starts; names below are the intended targets.
 | `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | ✅ (no page caches) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
-| `tailcall_dispatch.cpp` | `dispatch.rs` | 1 | ✅ |
+| `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate) |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | |
@@ -713,11 +761,12 @@ phase starts; names below are the intended targets.
 | `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (copying the reservation on fork/deserialize: Phase 3) |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | ✅ F, D, Zfhmin, Zfa (RV64), NaN-boxing under `debug-checks` (FCSR emulation: not ported) |
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
-| `rvi_fuse.cpp` | `isa/fuse.rs` | 4 | |
+| `rvi_fuse.cpp` | — | — | dead code in C++ (`try_fuse` is never called) |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
 | `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | Phase 1 part ✅ (shared segments: Phase 4) |
-| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` (handler selection, target checks) | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–2 | ✅ RV64IMAFDC + Zcb + B |
-| `decode_bytecodes.cpp`, `bytecode_*.cpp`, `threaded_bytecodes.hpp`, `threaded_bytecode_array.hpp`, `threaded_rewriter.cpp` | `decoder_cache/bytecodes.rs` | 4 | |
+| `decode_bytecodes.cpp`, `threaded_rewriter.cpp` | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–4 | ✅ RV64IMAFDC + Zcb + B |
+| `bytecode_impl.cpp`, `threaded_bytecodes.hpp` | `bytecode.rs` (slow-path and system bytecodes: `dispatch.rs`) | 4 | ✅ |
+| `bytecode_dispatch.cpp`, `threaded_bytecode_array.hpp` | — | — | superseded by tail-call dispatch |
 | `shared_rodata.*` | `memory/shared.rs` | 4 | |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |
 | `linux/system_calls.cpp`, `linux/syscalls_*.cpp` | `syscalls/linux/` | 2, 5 | ✅ incl. mman, poll, select (epoll, eventfd: Phase 5) |
