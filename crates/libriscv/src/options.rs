@@ -46,14 +46,16 @@ pub struct MachineOptions {
     /// Instructions between checks for finished background compilations
     /// (at least 1). Smaller slices switch to native code sooner.
     pub jit_background_slice: u64,
-    /// With `jit`, mask guest addresses with `arena size - 1` in native code
-    /// instead of bounds-checking them (C++
+    /// With `jit` (and in translations made with `aot_output`), mask guest
+    /// addresses with `arena size - 1` in native code instead of
+    /// bounds-checking them (C++
     /// `translate_automatic_nbit_address_space`). Much cheaper loads and
     /// stores, but native code then reads and writes anywhere in the arena,
     /// read-only data and the first page included, and accesses outside it
     /// wrap around instead of going to the page table. Only power-of-two
     /// arenas qualify; otherwise (reported with `verbose_loader`) the
-    /// accesses stay checked. The interpreter is unaffected.
+    /// accesses stay checked. The interpreter is unaffected. Translations
+    /// are only used by machines with the same setting.
     pub jit_automatic_nbit_address_space: bool,
     /// Use JIT code compiled by an earlier run for the execute segments it
     /// was compiled for (default on): code linked into the program, and
@@ -71,6 +73,25 @@ pub struct MachineOptions {
     /// [`JitCacheOutput`]: crate::jit_cache::JitCacheOutput
     #[cfg(feature = "jit")]
     pub jit_cache_output: Option<crate::jit_cache::JitCacheOutput>,
+    /// Run execute segments with code translated to Rust ahead of time
+    /// (default on), where a translation for them is registered: compiled
+    /// into the program ([`aot::register`]) or loaded from a shared object
+    /// ([`aot::load_shared_object`], feature `aot-dylib`). A translation is used instead of the
+    /// interpreter and the JIT, for the segments and the memory layout it
+    /// was made for. Results and instruction counts are the interpreter's.
+    /// Without the `aot` feature, there is never any.
+    ///
+    /// [`aot::register`]: crate::aot::register
+    /// [`aot::load_shared_object`]: crate::aot::load_shared_object
+    pub aot: bool,
+    /// Translate every execute segment the machine creates to Rust and
+    /// record it here, to write it as source or a shared object for later
+    /// runs (see [`AotOutput`](crate::aot::AotOutput)). The machine then
+    /// creates all its segments itself, instead of using translations or
+    /// another machine's shared segments. It runs normally otherwise
+    /// (interpreted, or with the JIT).
+    #[cfg(feature = "aot")]
+    pub aot_output: Option<crate::aot::AotOutput>,
     /// The ELF symbol of a program-provided function to use as the exit
     /// address of VM calls (the return address [`Machine::vmcall`] sets up)
     /// instead of the injected host code page (C++
@@ -124,6 +145,9 @@ impl Default for MachineOptions {
             jit_cache: true,
             #[cfg(feature = "jit")]
             jit_cache_output: None,
+            aot: true,
+            #[cfg(feature = "aot")]
+            aot_output: None,
             default_exit_function: None,
             use_shared_execute_segments: true,
             ebreak_locations: Vec::new(),

@@ -62,7 +62,11 @@
 #![feature(rust_preserve_none_cc)]
 #![allow(incomplete_features)]
 
+#[cfg(feature = "aot")]
+pub mod aot;
 mod bytecode;
+#[cfg(any(feature = "jit", feature = "aot"))]
+mod codegen;
 mod cpu;
 mod decode;
 mod decoder_cache;
@@ -88,6 +92,7 @@ mod linux;
 mod machine;
 pub mod memory;
 mod native;
+mod native_code;
 mod options;
 pub mod registers;
 mod signals;

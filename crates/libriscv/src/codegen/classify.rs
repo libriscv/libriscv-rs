@@ -1046,3 +1046,83 @@ fn classify_compressed(ci: CInstr, pc: u64) -> Option<JOp> {
         _ => None,
     }
 }
+
+/// The registers an instruction reads and writes.
+#[derive(Debug, Default)]
+pub(crate) struct Operands {
+    /// Integer registers read.
+    pub x: [Option<u32>; 2],
+    /// Integer register written.
+    pub xw: Option<u32>,
+    /// FP registers read.
+    pub f: [Option<u32>; 3],
+    /// FP register written.
+    pub fw: Option<u32>,
+}
+
+pub(crate) fn operands(op: JOp) -> Operands {
+    let int = |x: [Option<u32>; 2], xw: Option<u32>| Operands {
+        x,
+        xw,
+        ..Default::default()
+    };
+    match op {
+        // The handler reads and writes the register file: everything the
+        // region wrote is stored on the way out, and reloaded on re-entry.
+        JOp::Nop | JOp::Fence | JOp::Dyncall => Operands::default(),
+        JOp::Const { rd, .. } => int([None, None], Some(rd)),
+        JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => {
+            int([Some(rs1), None], Some(rd))
+        }
+        JOp::Alu { rd, rs1, rs2, .. } => int([Some(rs1), Some(rs2)], Some(rd)),
+        JOp::Load { rd, rs1, .. } => int([Some(rs1), None], rd),
+        JOp::Store { rs1, rs2, .. } => int([Some(rs1), Some(rs2)], None),
+        JOp::Branch { rs1, rs2, .. } => int([Some(rs1), rs2], None),
+        JOp::Jal { rd, .. } => int([None, None], (rd != 0).then_some(rd)),
+        JOp::Jalr { rd, rs1, .. } => int([Some(rs1), None], (rd != 0).then_some(rd)),
+        JOp::FLoad { rd, rs1, .. } => Operands {
+            x: [Some(rs1), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FStore { rs1, rs2, .. } => Operands {
+            x: [Some(rs1), None],
+            f: [Some(rs2), None, None],
+            ..Default::default()
+        },
+        JOp::FBin { rd, rs1, rs2, .. } => Operands {
+            f: [Some(rs1), Some(rs2), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FSqrt { rd, rs1, .. } | JOp::FCvtFF { rd, rs1, .. } => Operands {
+            f: [Some(rs1), None, None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FFma {
+            rd, rs1, rs2, rs3, ..
+        } => Operands {
+            f: [Some(rs1), Some(rs2), Some(rs3)],
+            fw: Some(rd),
+            ..Default::default()
+        },
+        JOp::FCmp { rd, rs1, rs2, .. } => Operands {
+            xw: Some(rd),
+            f: [Some(rs1), Some(rs2), None],
+            ..Default::default()
+        },
+        JOp::FToInt { rd, rs1, .. } | JOp::FMvXF { rd, rs1, .. } | JOp::FClass { rd, rs1, .. } => {
+            Operands {
+                xw: Some(rd),
+                f: [Some(rs1), None, None],
+                ..Default::default()
+            }
+        }
+        JOp::IntToF { rd, rs1, .. } | JOp::FMvFX { rd, rs1, .. } => Operands {
+            x: [Some(rs1), None],
+            fw: Some(rd),
+            ..Default::default()
+        },
+    }
+}

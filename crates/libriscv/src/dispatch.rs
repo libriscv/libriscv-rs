@@ -495,8 +495,9 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
     )
 }
 
-/// The handler of decoder entries that begin a JIT-compiled block (C++ patches
-/// the decoder entry with the asmjit function the same way). Only installed
+/// The handler of decoder entries that begin a block with native code, from
+/// the JIT or translated ahead of time (C++ patches the decoder entry with
+/// the asmjit or binary translation function the same way). Only installed
 /// at block starts, which are only reached through `BEGIN_BLOCK`, so the
 /// counter already includes this block; native code counts it itself.
 ///
@@ -505,8 +506,7 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
 /// a decoder block, such as a loop head, which can't be patched because the
 /// interpreter falls through them. Then the entry's own handler is the
 /// interpreter's.
-#[cfg(feature = "jit")]
-pub(crate) extern "rust-preserve-none" fn jit_enter(
+pub(crate) extern "rust-preserve-none" fn native_enter(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],
     i: usize,
@@ -515,11 +515,11 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
     c: Counter,
     ins: u32,
 ) -> Exit {
-    use crate::jit::JitExit;
+    use crate::native_code::NativeExit;
 
     let e = entry!(exec, cache, i, m, pc, c);
     let start = exec.address_of(i);
-    let Some(jit) = exec.jit.as_ref() else {
+    let Some(jit) = exec.native.as_ref() else {
         return bad_entry(m, start);
     };
     // A stale segment is left at the next slow-path instruction, which
@@ -534,7 +534,7 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
     let mut c = c;
     loop {
         match jit.run(m, slot, entry_pc, before, c.max) {
-            JitExit::Halt { pc, counter } => {
+            NativeExit::Halt { pc, counter } => {
                 return halt(
                     m,
                     pc,
@@ -544,7 +544,7 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                     },
                 );
             }
-            JitExit::Jump { pc, counter } => begin_block!(
+            NativeExit::Jump { pc, counter } => begin_block!(
                 exec,
                 cache,
                 exec.index(pc),
@@ -555,7 +555,7 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                     max: c.max,
                 }
             ),
-            JitExit::Indirect { pc, counter } => unchecked_jump!(
+            NativeExit::Indirect { pc, counter } => unchecked_jump!(
                 exec,
                 cache,
                 m,
@@ -565,7 +565,7 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                     max: c.max,
                 }
             ),
-            JitExit::Slow { pc, counter } => {
+            NativeExit::Slow { pc, counter } => {
                 // Continue the chain at that instruction with the interpreter's
                 // own handler (the block is counted already).
                 let si = exec.index(pc);
@@ -585,7 +585,7 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                     e.instr,
                 )
             }
-            JitExit::Dyncall { pc, counter } => {
+            NativeExit::Dyncall { pc, counter } => {
                 // C++ asmjit `execute_counted_dyncall`: the handler sees the
                 // exact PC, the counter and the limit, and what it does to
                 // them takes effect right after it.
@@ -614,7 +614,8 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                 let retired = if ends_block {
                     c.value
                 } else {
-                    c.value.wrapping_sub(crate::jit::block_icount(exec, next))
+                    c.value
+                        .wrapping_sub(crate::native_code::block_icount(exec, next))
                 };
                 let halt_after = Counter {
                     value: retired,
@@ -660,12 +661,12 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                 let block_pc = next.wrapping_add(e.block_bytes());
                 become handler(exec, cache, si, m, block_pc, c, e.instr)
             }
-            JitExit::Fault(err) => return fault(m, err),
-            JitExit::Unavailable if slot == i => {
+            NativeExit::Fault(err) => return fault(m, err),
+            NativeExit::Unavailable if slot == i => {
                 let handler = jit.original_handler(i).unwrap_or(e.handler);
                 become handler(exec, cache, i, m, pc, c, ins)
             }
-            JitExit::Unavailable => {
+            NativeExit::Unavailable => {
                 // Re-entry after a dyncall: finish its block in the interpreter.
                 let e = entry!(exec, cache, slot, m, entry_pc, c);
                 let handler = jit.original_handler(slot).unwrap_or(e.handler);
@@ -820,19 +821,16 @@ impl Machine {
             let block_pc = pc.wrapping_add(e.block_bytes());
             c.value = c.value.wrapping_add(e.instruction_count());
             // Native code can be entered at more places than the decoder
-            // entries patched with `jit_enter`: those are only the decoder
+            // entries patched with `native_enter`: those are only the decoder
             // block starts, since the interpreter falls through the others.
             // A block beginning here at a native entry inside a decoder block
             // (resuming after a background-compilation slice or a halt, at a
             // loop head reached by a backward branch) enters native code too;
             // otherwise the interpreter would run the whole loop.
-            #[cfg(feature = "jit")]
-            let handler = match &exec.jit {
-                Some(jit) if jit.has_entry(i) && !exec.is_stale() => jit_enter,
+            let handler = match &exec.native {
+                Some(native) if native.has_entry(i) && !exec.is_stale() => native_enter,
                 _ => e.handler,
             };
-            #[cfg(not(feature = "jit"))]
-            let handler = e.handler;
             match handler(&exec, &exec.cache, i, self, block_pc, c, e.instr) {
                 Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {

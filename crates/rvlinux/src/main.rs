@@ -5,6 +5,16 @@
 //! so the two can be diffed directly.
 
 #![forbid(unsafe_code)]
+// Translations compiled in (`RVLINUX_AOT_EMBED`, see build.rs) use `become`
+// and the `preserve_none` calling convention, like libriscv's dispatch.
+#![cfg_attr(rvlinux_aot_embed, feature(explicit_tail_calls, rust_preserve_none_cc))]
+#![cfg_attr(rvlinux_aot_embed, allow(incomplete_features))]
+
+/// The translations compiled into this program (`RVLINUX_AOT_EMBED`).
+#[cfg(rvlinux_aot_embed)]
+mod aot_embed {
+    include!(concat!(env!("OUT_DIR"), "/aot_embed.rs"));
+}
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,6 +31,10 @@ struct CliArgs {
     jit_save_shared: Option<PathBuf>,
     jit_load: Vec<PathBuf>,
     no_jit_cache: bool,
+    aot_save: Option<PathBuf>,
+    aot_save_shared: Option<PathBuf>,
+    aot_load: Vec<PathBuf>,
+    no_aot: bool,
     quit: bool,
     libc_fastpath: bool,
     sandbox: bool,
@@ -49,17 +63,38 @@ fn usage(name: &str) {
     );
     println!("  -A, --allow file   Allow file to be opened by the guest");
     println!("  -c, --call func    Call a function after loading the program");
-    println!("  -Q, --quit         Quit after loading the program (to save JIT code)");
+    println!(
+        "  -Q, --quit         Quit after loading the program (to save JIT code or translations)"
+    );
     println!(
         "      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations"
     );
+    if cfg!(any(feature = "jit", feature = "aot")) {
+        println!(
+            "      --nbit-address-space  Mask arena addresses in native code instead of bounds-checking them"
+        );
+    }
+    if cfg!(feature = "aot") {
+        println!("Ahead-of-time translation to Rust:");
+        println!(
+            "      --aot-save file    Translate the program's code to Rust source (to compile into a program)"
+        );
+        println!(
+            "      --aot-save-shared file  Translate and compile into a shared object (with $RUSTC or rustc)"
+        );
+        if cfg!(feature = "aot-dylib") {
+            println!(
+                "      --aot-load file    Load a translation from a shared object (repeatable)"
+            );
+        }
+        println!(
+            "      --no-aot           Ignore translations (loaded, or compiled into this program)"
+        );
+    }
     if cfg!(feature = "jit") {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
         println!("  -B, --background   Compile in the background while interpreting (default)");
         println!("      --no-background Compile each segment before running it");
-        println!(
-            "      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them"
-        );
         println!(
             "JIT code cache (Cranelift output saved for later runs; implies --jit --no-background):"
         );
@@ -110,7 +145,19 @@ fn parse_args() -> Result<CliArgs, String> {
             "-j" | "--jit" if cfg!(feature = "jit") => args.jit = true,
             "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
             "--no-background" if cfg!(feature = "jit") => args.no_background = true,
-            "--nbit-address-space" if cfg!(feature = "jit") => args.nbit = true,
+            "--nbit-address-space" if cfg!(any(feature = "jit", feature = "aot")) => {
+                args.nbit = true;
+            }
+            "--aot-save" if cfg!(feature = "aot") => {
+                args.aot_save = Some(path(&mut it, "--aot-save")?);
+            }
+            "--aot-save-shared" if cfg!(feature = "aot") => {
+                args.aot_save_shared = Some(path(&mut it, "--aot-save-shared")?);
+            }
+            "--aot-load" if cfg!(feature = "aot-dylib") => {
+                args.aot_load.push(path(&mut it, "--aot-load")?);
+            }
+            "--no-aot" if cfg!(feature = "aot") => args.no_aot = true,
             "--jit-save-object" if cfg!(feature = "jit") => {
                 args.jit_save_object = Some(path(&mut it, "--jit-save-object")?);
             }
@@ -195,6 +242,32 @@ fn main() -> ExitCode {
         guest_args.insert(0, interp);
         is_dynamic = true;
     }
+    #[cfg(rvlinux_aot_embed)]
+    {
+        let n = aot_embed::register();
+        if args.verbose {
+            println!("* Registered {n} translated segments compiled into rvlinux");
+        }
+    }
+    #[cfg(feature = "aot-dylib")]
+    for file in &args.aot_load {
+        match libriscv::aot::load_shared_object(file) {
+            Ok(n) if args.verbose => {
+                println!(
+                    "* Loaded translations of {n} segments from {}",
+                    file.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Could not load {}: {e}", file.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    #[cfg(feature = "aot")]
+    let aot_output = (args.aot_save.is_some() || args.aot_save_shared.is_some())
+        .then(libriscv::aot::AotOutput::new);
     #[cfg(feature = "jit")]
     for file in &args.jit_load {
         match libriscv::jit_cache::load_shared_object(file) {
@@ -224,6 +297,9 @@ fn main() -> ExitCode {
         jit_cache: !args.no_jit_cache,
         #[cfg(feature = "jit")]
         jit_cache_output: jit_cache_output.clone(),
+        aot: !args.no_aot,
+        #[cfg(feature = "aot")]
+        aot_output: aot_output.clone(),
         libc_fastpath: args.libc_fastpath,
         ..Default::default()
     };
@@ -238,10 +314,19 @@ fn main() -> ExitCode {
         eprintln!("Exception: {e}");
         return ExitCode::FAILURE;
     }
-    #[cfg(feature = "jit")]
-    let save = || save_jit_code(&args, jit_cache_output.as_ref());
-    #[cfg(not(feature = "jit"))]
-    let save = || ExitCode::SUCCESS;
+    let save = || {
+        #[cfg(feature = "jit")]
+        let status = save_jit_code(&args, jit_cache_output.as_ref());
+        #[cfg(not(feature = "jit"))]
+        let status = ExitCode::SUCCESS;
+        #[cfg(feature = "aot")]
+        let status = if save_translation(&args, aot_output.as_ref()) == ExitCode::SUCCESS {
+            status
+        } else {
+            ExitCode::FAILURE
+        };
+        status
+    };
     if args.quit {
         return save();
     }
@@ -353,6 +438,38 @@ fn save_jit_code(args: &CliArgs, output: Option<&libriscv::jit_cache::JitCacheOu
             Ok(()) => {}
             Err(e) => {
                 eprintln!("Could not save JIT code to {}: {e}", file.display());
+                status = ExitCode::FAILURE;
+            }
+        }
+    }
+    status
+}
+
+/// Write the translation to the `--aot-save*` files.
+#[cfg(feature = "aot")]
+fn save_translation(args: &CliArgs, output: Option<&libriscv::aot::AotOutput>) -> ExitCode {
+    let Some(output) = output else {
+        return ExitCode::SUCCESS;
+    };
+    let mut status = ExitCode::SUCCESS;
+    for (file, shared) in [(&args.aot_save, false), (&args.aot_save_shared, true)] {
+        let Some(file) = file else { continue };
+        let saved = if shared {
+            output.write_shared_object(file)
+        } else {
+            output.write_source(file)
+        };
+        match saved {
+            Ok(()) if args.verbose => {
+                println!(
+                    "* Saved the translation of {} segments to {}",
+                    output.len(),
+                    file.display()
+                );
+            }
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Could not save the translation to {}: {e}", file.display());
                 status = ExitCode::FAILURE;
             }
         }

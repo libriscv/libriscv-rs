@@ -111,9 +111,9 @@ impl Registers {
         &self.x
     }
 
-    /// All 32 integer and floating-point registers, mutably, for the JIT's
-    /// state block.
-    #[cfg(feature = "jit")]
+    /// All 32 integer and floating-point registers, mutably, for native
+    /// code.
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) const fn x_f_mut(&mut self) -> (&mut [u64; 32], &mut [u64; 32]) {
         (&mut self.x, &mut self.f)
     }

@@ -77,10 +77,12 @@ use cranelift_codegen::{Context, RelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 
-use super::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary};
-use super::region::{Analysis, Insn, RegionId, block_icount};
-use super::{EXIT_DYNCALL, EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW};
+use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
+use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
+use crate::native_code::{
+    EXIT_DYNCALL, EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW,
+};
 
 /// Functions are placed at this alignment in the code image.
 const FUNCTION_ALIGN: usize = 64;
@@ -220,9 +222,10 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
         // change what a segment compiles to, also without a version bump.
         for source in [
             include_str!("emit.rs"),
-            include_str!("region.rs"),
-            include_str!("classify.rs"),
             include_str!("mod.rs"),
+            include_str!("../codegen/region.rs"),
+            include_str!("../codegen/classify.rs"),
+            include_str!("../native_code.rs"),
             include_str!("../decoder_cache.rs"),
             include_str!("../decode.rs"),
             include_str!("../bytecode.rs"),
@@ -403,7 +406,7 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
 }
 
 /// Compile every region of `a` and link them into an [`Image`].
-/// `layout`: see [`JitSegment::compile`](super::JitSegment::compile).
+/// `layout`: see [`compile`](super::compile).
 pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, layout: MemoryLayout) -> Option<Image> {
     if a.regions.is_empty() {
         return None;
@@ -1938,85 +1941,5 @@ const fn access(op: JOp) -> Option<(u32, i64, bool)> {
         JOp::Load { rs1, imm, .. } | JOp::FLoad { rs1, imm, .. } => Some((rs1, imm, false)),
         JOp::Store { rs1, imm, .. } | JOp::FStore { rs1, imm, .. } => Some((rs1, imm, true)),
         _ => None,
-    }
-}
-
-/// The registers an instruction reads and writes.
-#[derive(Debug, Default)]
-struct Operands {
-    /// Integer registers read.
-    x: [Option<u32>; 2],
-    /// Integer register written.
-    xw: Option<u32>,
-    /// FP registers read.
-    f: [Option<u32>; 3],
-    /// FP register written.
-    fw: Option<u32>,
-}
-
-fn operands(op: JOp) -> Operands {
-    let int = |x: [Option<u32>; 2], xw: Option<u32>| Operands {
-        x,
-        xw,
-        ..Default::default()
-    };
-    match op {
-        // The handler reads and writes the register file: everything the
-        // region wrote is stored on the way out, and reloaded on re-entry.
-        JOp::Nop | JOp::Fence | JOp::Dyncall => Operands::default(),
-        JOp::Const { rd, .. } => int([None, None], Some(rd)),
-        JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => {
-            int([Some(rs1), None], Some(rd))
-        }
-        JOp::Alu { rd, rs1, rs2, .. } => int([Some(rs1), Some(rs2)], Some(rd)),
-        JOp::Load { rd, rs1, .. } => int([Some(rs1), None], rd),
-        JOp::Store { rs1, rs2, .. } => int([Some(rs1), Some(rs2)], None),
-        JOp::Branch { rs1, rs2, .. } => int([Some(rs1), rs2], None),
-        JOp::Jal { rd, .. } => int([None, None], (rd != 0).then_some(rd)),
-        JOp::Jalr { rd, rs1, .. } => int([Some(rs1), None], (rd != 0).then_some(rd)),
-        JOp::FLoad { rd, rs1, .. } => Operands {
-            x: [Some(rs1), None],
-            fw: Some(rd),
-            ..Default::default()
-        },
-        JOp::FStore { rs1, rs2, .. } => Operands {
-            x: [Some(rs1), None],
-            f: [Some(rs2), None, None],
-            ..Default::default()
-        },
-        JOp::FBin { rd, rs1, rs2, .. } => Operands {
-            f: [Some(rs1), Some(rs2), None],
-            fw: Some(rd),
-            ..Default::default()
-        },
-        JOp::FSqrt { rd, rs1, .. } | JOp::FCvtFF { rd, rs1, .. } => Operands {
-            f: [Some(rs1), None, None],
-            fw: Some(rd),
-            ..Default::default()
-        },
-        JOp::FFma {
-            rd, rs1, rs2, rs3, ..
-        } => Operands {
-            f: [Some(rs1), Some(rs2), Some(rs3)],
-            fw: Some(rd),
-            ..Default::default()
-        },
-        JOp::FCmp { rd, rs1, rs2, .. } => Operands {
-            xw: Some(rd),
-            f: [Some(rs1), Some(rs2), None],
-            ..Default::default()
-        },
-        JOp::FToInt { rd, rs1, .. } | JOp::FMvXF { rd, rs1, .. } | JOp::FClass { rd, rs1, .. } => {
-            Operands {
-                xw: Some(rd),
-                f: [Some(rs1), None, None],
-                ..Default::default()
-            }
-        }
-        JOp::IntToF { rd, rs1, .. } | JOp::FMvFX { rd, rs1, .. } => Operands {
-            x: [Some(rs1), None],
-            fw: Some(rd),
-            ..Default::default()
-        },
     }
 }

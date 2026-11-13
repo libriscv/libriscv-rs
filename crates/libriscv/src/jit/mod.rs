@@ -3,10 +3,10 @@
 //! enabled per machine with [`MachineOptions::jit`](crate::MachineOptions::jit).
 //!
 //! When an execute segment is created, its compilable instructions are
-//! grouped into regions and compiled ([`region`], [`emit`]). Decoder entries
-//! at block starts that a region can be entered at get the [`jit_enter`]
-//! handler, so the interpreter enters native code the first time it begins
-//! such a block, and native code runs until it hits something it doesn't
+//! grouped into regions (`codegen::region`) and compiled ([`emit`]).
+//! Decoder entries at block starts that a region can be entered at get the
+//! [`native_enter`] handler, so the interpreter enters native code the
+//! first time it begins such a block, and native code runs until it hits something it doesn't
 //! compile, a fault or the instruction limit. Then the interpreter resumes
 //! with exactly the PC, registers and instruction count it would have had.
 //!
@@ -17,55 +17,24 @@
 //! This module has no `unsafe` code: placing the code in executable memory
 //! and entering it is done by `libriscv-jit-rt`.
 //!
-//! [`jit_enter`]: crate::dispatch::jit_enter
+//! [`native_enter`]: crate::dispatch::native_enter
 
 pub(crate) mod cache;
-mod classify;
 mod emit;
-mod region;
 
 use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
 use emit::Image;
-pub(crate) use region::block_icount;
 
+use crate::codegen::region;
 use crate::decoder_cache::DecodedSegment;
-use crate::dispatch::Handler;
-use crate::error::{ExceptionKind, MachineError};
 use crate::machine::Machine;
-
-/// Exit kinds written by generated code (`JitState::exit_kind`).
-/// The instruction limit was reached before jumping to `exit_pc`.
-pub(crate) const EXIT_HALT: u64 = 0;
-/// Continue in the interpreter at `exit_pc`, beginning a block there, after
-/// a direct transfer (C++ `NEXT_BLOCK`: no segment check, the decoder entry
-/// after the segment is an invalid one).
-pub(crate) const EXIT_JUMP: u64 = 1;
-/// Continue at `exit_pc` after an indirect jump (C++ `UNCHECKED_JUMP`: may
-/// leave the segment).
-pub(crate) const EXIT_INDIRECT: u64 = 4;
-/// A load or store at `exit_pc` (mid-block, block already counted) is
-/// outside the arena windows: the interpreter executes it through the page
-/// table, then finishes the block.
-pub(crate) const EXIT_SLOW: u64 = 2;
-/// A jump to the misaligned address `exit_pc` (without the C extension).
-pub(crate) const EXIT_MISALIGNED: u64 = 3;
-/// The dyncall at `exit_pc` (mid-block, block already counted): the
-/// dispatcher runs its handler, then native code continues after it.
-pub(crate) const EXIT_DYNCALL: u64 = 5;
-
-/// The native code of one execute segment.
-#[derive(Debug)]
-pub(crate) struct JitSegment {
-    code: CodeMemory,
-    /// `(decoder index, original handler)` for every patched entry, sorted.
-    original: Vec<(usize, Handler)>,
-}
+use crate::native_code::{NativeCode, NativeExit, NativeSegment};
 
 /// Compile `segment` (for the guest memory layout `layout`, see
-/// [`JitSegment::compile`]) on a new thread (`MachineOptions::jit_background`,
+/// [`compile`]) on a new thread (`MachineOptions::jit_background`,
 /// C++ `asmjit_background_callback`), which publishes the result in the
 /// segment ([`DecodedSegment::finish_background_jit`]). Every machine
 /// holding the segment (forks, and machines sharing it through the
@@ -91,11 +60,11 @@ pub(crate) fn spawn_background(
     let spawned = std::thread::Builder::new()
         .name("libriscv-jit".into())
         .spawn(move || {
-            let compiled = JitSegment::compile_and_load(&finish.0, layout, save.as_ref());
+            let compiled = compile_and_load(&finish.0, layout, save.as_ref());
             finish.0.finish_background_jit(compiled);
         });
     if spawned.is_err() {
-        let compiled = JitSegment::compile_and_load(segment, layout, fallback.as_ref());
+        let compiled = compile_and_load(segment, layout, fallback.as_ref());
         segment.finish_background_jit(compiled);
     }
 }
@@ -107,156 +76,72 @@ pub(crate) struct Save {
     pub output: cache::JitCacheOutput,
 }
 
-/// What a call into native code ended with.
-pub(crate) enum JitExit {
-    /// The instruction limit was reached; continue (later) at `pc`.
-    Halt {
-        pc: u64,
-        counter: u64,
-    },
-    /// Continue interpreting at `pc`, beginning a block there.
-    Jump {
-        pc: u64,
-        counter: u64,
-    },
-    /// Continue at `pc` after an indirect jump, possibly in another segment.
-    Indirect {
-        pc: u64,
-        counter: u64,
-    },
-    /// Interpret from the load or store at `pc` to the end of its block
-    /// (already counted): it needs the page table.
-    Slow {
-        pc: u64,
-        counter: u64,
-    },
-    /// Run the dyncall at `pc` (block already counted), then continue after
-    /// it.
-    Dyncall {
-        pc: u64,
-        counter: u64,
-    },
-    Fault(MachineError),
-    /// The JIT can't run with the current memory layout; interpret instead.
-    Unavailable,
+/// Compile `exec` and patch its decoder entries to enter the native code
+/// (saving the code to `save`). Leaves `exec` untouched if nothing could
+/// be compiled.
+pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout, save: Option<&Save>) {
+    if let Some(compiled) = compile_and_load(exec, layout, save) {
+        install(exec, compiled);
+    }
 }
 
-impl JitSegment {
-    /// Compile `exec` and patch its decoder entries to enter the native code
-    /// (saving the code to `save`). Leaves `exec` untouched if nothing could
-    /// be compiled.
-    pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout, save: Option<&Save>) {
-        if let Some(compiled) = Self::compile_and_load(exec, layout, save) {
-            Self::install(exec, compiled);
-        }
-    }
+/// Patch `exec`'s decoder entries to enter `compiled`.
+pub(crate) fn install(exec: &mut DecodedSegment, compiled: Compiled) {
+    NativeSegment::install(exec, NativeCode::Jit(compiled.code), compiled.patch);
+}
 
-    /// [`compile`](Self::compile), save the code to `save`, then map it.
-    fn compile_and_load(
-        exec: &DecodedSegment,
-        layout: MemoryLayout,
-        save: Option<&Save>,
-    ) -> Option<Compiled> {
-        let image = Self::compile(exec, layout)?;
-        if let Some(save) = save {
-            save.output.record(save.key, &image);
-        }
-        image.load()
+/// [`compile`], save the code to `save`, then map it.
+fn compile_and_load(
+    exec: &DecodedSegment,
+    layout: MemoryLayout,
+    save: Option<&Save>,
+) -> Option<Compiled> {
+    let image = compile(exec, layout)?;
+    if let Some(save) = save {
+        save.output.record(save.key, &image);
     }
+    image.load()
+}
 
-    /// Compile `exec` without changing it. Only reads the segment, so it can
-    /// run on another thread while the interpreter executes the segment.
-    /// With a non-zero `layout.mask` (the arena size minus one, a power of
-    /// two minus one), guest addresses are masked instead of bounds-checked
-    /// (`MachineOptions::jit_automatic_nbit_address_space`). Otherwise the
-    /// code checks them against `layout`'s windows, which are constants in
-    /// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
-    /// windows don't contain them interpret the segment instead.
-    fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
-        let analysis = region::analyse(exec);
-        emit::compile(exec, &analysis, layout)
-    }
+/// Compile `exec` without changing it. Only reads the segment, so it can
+/// run on another thread while the interpreter executes the segment.
+/// With a non-zero `layout.mask` (the arena size minus one, a power of
+/// two minus one), guest addresses are masked instead of bounds-checked
+/// (`MachineOptions::jit_automatic_nbit_address_space`). Otherwise the
+/// code checks them against `layout`'s windows, which are constants in
+/// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
+/// windows don't contain them interpret the segment instead.
+fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
+    let analysis = region::analyse(exec);
+    emit::compile(exec, &analysis, layout)
+}
 
-    /// Patch `exec`'s decoder entries to enter `compiled`.
-    pub(crate) fn install(exec: &mut DecodedSegment, compiled: Compiled) {
-        let mut original = Vec::with_capacity(compiled.patch.len());
-        for i in compiled.patch {
-            if let Some(e) = exec.cache.get_mut(i) {
-                original.push((i, e.handler));
-                e.handler = crate::dispatch::jit_enter;
-            }
-        }
-        original.sort_unstable_by_key(|&(i, _)| i);
-        exec.jit = Some(Self {
-            code: compiled.code,
-            original,
-        });
+/// Run the JIT code `code` of the current segment from the block starting
+/// at `pc` (decoder entry `slot`), with the counter as it was *before*
+/// beginning that block.
+pub(crate) fn run(
+    code: &CodeMemory,
+    m: &mut Machine,
+    slot: usize,
+    pc: u64,
+    counter: u64,
+    max: u64,
+) -> NativeExit {
+    let MemoryLayout { read, write, .. } = m.memory.native_layout();
+    let frm = u64::from(m.cpu.regs.fcsr().frm());
+    let (regs, fregs) = m.cpu.regs.x_f_mut();
+    let arena = m.memory.arena_mut();
+    let Some(mut state) = JitState::new(regs, fregs, arena, read, write, max, frm) else {
+        return NativeExit::Unavailable;
+    };
+    if !code.enter(&mut state, slot, pc, counter) {
+        return NativeExit::Unavailable;
     }
-
-    /// The handler entry `i` had before it was patched.
-    pub(crate) fn original_handler(&self, i: usize) -> Option<Handler> {
-        self.original
-            .binary_search_by_key(&i, |&(j, _)| j)
-            .ok()
-            .and_then(|k| self.original.get(k))
-            .map(|&(_, h)| h)
-    }
-
-    /// True if native code can be entered at decoder entry `i`.
-    pub(crate) fn has_entry(&self, i: usize) -> bool {
-        self.code.has_entry(i)
-    }
-
-    /// True if the code was compiled by an earlier run (see [`cache`]).
-    pub(crate) fn is_cached(&self) -> bool {
-        self.code.is_linked()
-    }
-
-    /// Number of decoder entries that enter native code.
-    pub(crate) fn entry_count(&self) -> usize {
-        self.original.len()
-    }
-
-    /// Run native code from the block starting at `pc` (decoder entry
-    /// `slot`), with the counter as it was *before* beginning that block.
-    pub(crate) fn run(
-        &self,
-        m: &mut Machine,
-        slot: usize,
-        pc: u64,
-        counter: u64,
-        max: u64,
-    ) -> JitExit {
-        #[cfg(test)]
-        tests::ENTRIES.with_borrow_mut(|e| e.push(pc));
-        let MemoryLayout { read, write, .. } = m.memory.jit_layout();
-        let frm = u64::from(m.cpu.regs.fcsr().frm());
-        let (regs, fregs) = m.cpu.regs.x_f_mut();
-        let arena = m.memory.arena_mut();
-        let Some(mut state) = JitState::new(regs, fregs, arena, read, write, max, frm) else {
-            return JitExit::Unavailable;
-        };
-        if !self.code.enter(&mut state, slot, pc, counter) {
-            return JitExit::Unavailable;
-        }
-        let (pc, counter) = (state.exit_pc, state.counter);
-        match state.exit_kind {
-            EXIT_HALT => JitExit::Halt { pc, counter },
-            EXIT_JUMP => JitExit::Jump { pc, counter },
-            EXIT_INDIRECT => JitExit::Indirect { pc, counter },
-            EXIT_SLOW => JitExit::Slow { pc, counter },
-            EXIT_DYNCALL => JitExit::Dyncall { pc, counter },
-            EXIT_MISALIGNED => JitExit::Fault(MachineError::trigger(
-                ExceptionKind::MisalignedInstruction,
-                pc,
-            )),
-            _ => JitExit::Fault(MachineError::trigger(ExceptionKind::UnknownException, pc)),
-        }
-    }
+    NativeExit::from_raw(state.exit_kind, state.exit_pc, state.counter)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Slicing while a background compilation is pending must not be
     //! observable: the same results, registers and counts as one
     //! uninterrupted run, and system calls see the real instruction limit.
@@ -268,7 +153,7 @@ mod tests {
 
     thread_local! {
         /// The PC of every entry into native code on this thread.
-        pub(super) static ENTRIES: std::cell::RefCell<Vec<u64>> =
+        pub(crate) static ENTRIES: std::cell::RefCell<Vec<u64>> =
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
@@ -419,7 +304,7 @@ mod tests {
                 )
                 .unwrap();
                 m.init_execute_area(&code, V).unwrap();
-                let a = super::region::analyse(m.cpu.current_execute_segment());
+                let a = crate::codegen::region::analyse(m.cpu.current_execute_segment());
                 let compiled = a.insns.iter().any(|i| i.pc == V);
                 assert_eq!(compiled, expect, "{w:#010x}");
             }

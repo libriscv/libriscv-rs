@@ -1,7 +1,7 @@
 //! Executable memory and entry into JIT-compiled code for `libriscv`.
 //!
 //! This is the only crate in the workspace that contains `unsafe` code, and it
-//! is only built with `libriscv`'s optional `jit` feature. `libriscv` itself
+//! is only built with `libriscv`'s optional `jit` (or `aot-dylib`) feature. `libriscv` itself
 //! stays `#![forbid(unsafe_code)]`: it generates machine code with Cranelift
 //! (whose API is safe), and hands the finished bytes to [`CodeMemory`], which
 //! maps them executable and enters them.
@@ -48,6 +48,12 @@
 //! not, and cannot be, verified. `libriscv` only uses it for the segment,
 //! memory layout and build it was compiled for, which keeps a stale or
 //! mismatched file from being run by accident, not a malicious one.
+//!
+//! # Translations
+//!
+//! The [`aot`] module loads `libriscv`'s ahead-of-time translations (safe
+//! Rust, compiled into a shared object) for the `aot-dylib` feature: the
+//! `dlopen` and the call across the C boundary.
 
 use std::io;
 use std::marker::PhantomData;
@@ -56,6 +62,7 @@ use std::sync::Arc;
 
 use memmap2::Mmap;
 
+pub mod aot;
 mod linked;
 pub use linked::{
     CachedUnit, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, SharedObject, TABLE_MAGIC,

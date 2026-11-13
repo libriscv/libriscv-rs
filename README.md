@@ -52,6 +52,24 @@ Saved code is only used with the same build, host CPU and memory layout it
 was compiled for. Shared objects are linked with the system `cc`. In the
 library, see `libriscv::jit_cache` and `MachineOptions::jit_cache_output`.
 
+## Ahead-of-time translation to Rust
+
+With the `aot` feature, a program's code can be translated to safe Rust
+ahead of time (the counterpart of C++ libriscv's binary translation to C),
+then compiled into the host program or into a shared object:
+
+```sh
+rvlinux -Q --aot-save prog.rs prog.elf          # translate to Rust source
+RVLINUX_AOT_EMBED=prog.rs cargo build -p rvlinux --features aot   # compile it in: no unsafe anywhere
+rvlinux -Q --aot-save-shared prog.so prog.elf   # or compile it with rustc into a shared object
+rvlinux --aot-load prog.so prog.elf             # (feature aot-dylib)
+```
+
+Translated code has the interpreter's results and instruction counts, and
+is only used for the segments and memory layout it was made for. Compiling
+needs a nightly `rustc` (`become`), like the rest of the port. In the
+library, see `libriscv::aot` and `MachineOptions::aot_output`.
+
 ## License
 
 BSD-3-Clause, same as libriscv.

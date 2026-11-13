@@ -28,6 +28,14 @@ jit = [
     "dep:cranelift-native",
     "dep:libriscv-jit-rt",
 ]
+# Ahead-of-time translation to safe Rust (the counterpart of C++'s binary
+# translation to C): `libriscv::aot`. No dependencies and no unsafe code;
+# translations compiled into the program are registered with
+# `aot::register`. See "AOT" in PORTING.md.
+aot = []
+# Loading translations compiled into shared objects
+# (`aot::load_shared_object`), through `libriscv-jit-rt`.
+aot-dylib = ["aot", "dep:libriscv-jit-rt"]
 
 [dependencies]
 cranelift-codegen = { version = "0.137.1", optional = true }

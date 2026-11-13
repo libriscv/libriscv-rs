@@ -12,7 +12,8 @@ When the C++ side moves, bump this hash and the ones in
 
 1. **Safe:** `#![forbid(unsafe_code)]` in every crate, with one exception:
    `libriscv-jit-rt`, the executable-memory runtime of the optional JIT (see
-   "JIT"). `libriscv` itself forbids unsafe code with or without the JIT.
+   "JIT"), which also loads AOT translations from shared objects (see
+   "AOT"; embedded translations need no unsafe code at all). `libriscv` itself forbids unsafe code with or without the JIT.
    Prefer zero runtime dependencies for `libriscv` (the `jit` feature adds
    Cranelift). Nightly *language features* are fine (see Toolchain); unsafe
    is not.
@@ -41,7 +42,7 @@ GDB stub.
 
 | C++ component | Files | Why |
 |---|---|---|
-| Binary translation | `tr_*.cpp`, `tr_*.hpp` | Compiles C and `dlopen`s it |
+| Binary translation to C | `tr_*.cpp`, `tr_*.hpp` | Compiles C and `dlopen`s it. Replaced by translation to safe Rust (see "AOT") |
 | libtcc JIT | `tr_tcc.cpp` | Same |
 | asmjit JIT | `asmjit/` | Replaced by the Cranelift JIT (see "JIT"), not ported |
 | Assembly dispatch | `amd64/` | Hand-written asm |
@@ -583,8 +584,8 @@ cache and embedded translations in `tr_translate.cpp`, `jit/cache.rs`,
 `libriscv-jit-rt`'s `linked.rs`): Cranelift's output for a segment, saved
 and used again by later runs. It is a cache of what the JIT compiled, not
 an ahead-of-time compiler. Nothing else translates the code, so cached
-code behaves exactly like the JIT (and the names keep `aot` free for a
-real ahead-of-time translator, e.g. to Rust, later). A machine with
+code behaves exactly like the JIT (the ahead-of-time translator, to
+Rust, is a separate thing: see "AOT"). A machine with
 `MachineOptions::jit_cache_output` (a `jit_cache::JitCacheOutput`) records
 the linked image of every segment it compiles (`emit::Image`: code with
 inter-function calls resolved, libcall sites left as `R_X86_64_GOTPCREL`).
@@ -657,6 +658,115 @@ across tail calls, AArch64 (F/D came later). Background compilation (added later
 Baseline for current numbers) saves ~5-10 ms on CoreMark, the same as
 asmjit's: during the compile, the interpreter only gets through ~1/7 of
 what native code would have.
+
+## AOT
+
+The optional `aot` feature (`libriscv::aot`, `rvlinux --aot-save`,
+`--aot-save-shared`, `--aot-load`, `RVLINUX_AOT_EMBED`) translates execute
+segments to **safe Rust** ahead of time: the counterpart of C++'s binary
+translation to C (`tr_emit.cpp`, `tr_translate.cpp`, `tr_compiler.cpp`),
+added 2026-11-13. Code: `crates/libriscv/src/aot/` (`emit.rs`: one Rust
+function per region, `structure.rs`: control flow, `mod.rs`: keys,
+registry, output). It needs no dependency and no unsafe code.
+
+**Use.** A machine with `MachineOptions::aot_output` (an `AotOutput`)
+translates every segment it creates and records it; it runs normally
+otherwise. `AotOutput::source()` is one Rust file defining `mod
+translation` with `META` (keys, entries, patches as `u64`s) and `enter`
+(std types only, so the host and the translation share no types):
+
+* **Embedded** (`include!` it, `aot::register(translation::META,
+  translation::enter)`): compiled into the program like any other code,
+  under `forbid(unsafe_code)`. `rvlinux` builds files listed in
+  `RVLINUX_AOT_EMBED` into itself (`build.rs`) with just the `aot` feature:
+  no crate in that build has unsafe code. The including crate needs
+  `feature(explicit_tail_calls, rust_preserve_none_cc)`.
+* **Shared object** (`AotOutput::write_shared_object`, `$RUSTC` or
+  `rustc`, `-C opt-level=3 -C target-cpu=native`, extra flags from
+  `$LIBRISCV_AOT_RUSTFLAGS`): the same source after a prologue with two
+  `extern "C"` exports (`libriscv_aot_meta`, `libriscv_aot_enter`), whose
+  few lines are the only unsafe code in it. Loading
+  (`aot::load_shared_object`, feature `aot-dylib`) is in
+  `libriscv-jit-rt`'s `aot` module (`dlopen`, two symbols, `RawCall`
+  built from borrows). Unlike JIT code, what runs behind the boundary is
+  safe Rust that can only touch the registers and arena it is passed.
+
+Translations are keyed like the JIT cache (segment address, length,
+CRC32-C, 64-bit hash, execute-only, libc fast path; the memory layout;
+a fingerprint of the translator's and decoder's sources and the
+extension features) in a process-wide registry consulted when a segment
+is created (`MachineOptions::aot`, default on). A hit installs the code
+instead of the JIT (`native_code::NativeSegment`, shared with the JIT,
+with `dispatch::native_enter`); with `verbose_loader`, hits and misses
+are reported. Machines translating don't share segments (like machines
+saving JIT code). The generated code doesn't depend on the host CPU.
+
+**Semantics.** Exactly the JIT's: the same instruction selection and
+regions (`codegen::{classify, region}`, moved out of `jit/`), the same
+counting (block counts on entry, mid-block exits pre-subtract), the same
+exits (`native_code::EXIT_*`: halt, jump, indirect, slow access,
+misaligned jump, dyncall) back to `native_enter`. F/D use Rust's IEEE
+operations; FMIN/FMAX, FCVT to integers and FCLASS are written out like
+the interpreter's; which NaN comes out is the host's (as for the JIT).
+
+**Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
+fn r<N>(s: &mut S, pc, counter)`. Guest registers it uses are locals,
+loaded on entry and the written ones stored at the single exit (C++
+register caching). Leaving is an `A` value: return to the host with an
+exit kind, a direct tail call to another region (`become r<M>(..)`), or an
+indirect jump through the segment's entry table (`become f(..)`, a
+`OnceLock`ed table of `fn` pointers by decoder index), so calls, returns
+and loops never go back through the interpreter (C++'s translated
+functions can't call each other: C has no guaranteed tail calls). Guest
+memory is a `&mut [u8; N]`, `N` covering the layout's windows plus the
+widest access: after the window check (the interpreter's: start address
+only) every index is provably in bounds and no second check is emitted.
+Accesses through one base register in a straight-line run share one
+check of their offset span, as in the JIT: it computes `k = base + lo -
+window`, compares `k` with the window length minus the span, and the
+accesses index `k + constant`, which LLVM proves in bounds. With an N-bit
+address space accesses are masked, without checks.
+
+**Control flow** (`aot/structure.rs`). A `loop { match pc { .. } }`
+dispatcher (what `structure::dispatch` writes) was 2.4x slower than the JIT
+on a static glibc program: LLVM doesn't thread constant `pc` assignments
+through the loop header (DFA jump threading didn't help either), so every
+transfer was an indirect jump with all registers merged at one point.
+Regions are laid out as structured code instead, after Ramsey's "Beyond
+Relooper" (ICFP 2022): forward branches `break 'b<n>` out of labeled
+blocks, back edges `continue 'l<n>` loops. Every label is an entry (a
+root `match pc`); entering a loop at the side would be irreducible, so
+such entries (and statically irreducible edges) go to a copy of the
+loop's body without its header, which enters the loop at its header;
+nested loops recursively (a copy made for an entry from inside an
+enclosing loop counts as inside it). Growth is bounded by the nesting
+depth; past 8x, or if the result isn't reducible, the region falls back
+to the dispatcher (the tests assert it never does; static glibc and
+CoreMark have no fallback).
+
+**Performance** (2026-11-13, idle box, release `rvlinux`): static glibc
+collatz 229 ms vs JIT 237 ms (interpreter 1893 ms); CoreMark 1.0 (bench
+column "Rust AOT", `cargo bench -p rvlinux --features aot-dylib,jit
+--bench coremark`) 18959 / 18141 vs JIT 19021 / 19734 and asmjit 19235 /
+19670 (rv64imafdc / +zba_zbb_zbs), before span-merged checks. Static glibc
+translates (~470 KB of code) to ~16 MB of Rust in 70 ms; `rustc` takes
+~65 s for it, CoreMark freestanding a few seconds.
+
+**Testing.** `libriscv`'s `tests/aot.rs` (feature `aot-dylib`, needs
+`rustc`): the JIT tests' programs (hand-written, 150 random integer and
+150 random FP programs, FP special values, dyncalls, merged bounds checks
+at the window edges with and without a program, layouts), each test
+translating its programs into one shared object and comparing complete
+machine state with the interpreter at many instruction limits;
+`LIBRISCV_AOT_FUZZ=<programs>[:<seed>]` for longer sessions (3000 integer
+and 2000 FP programs clean). `rvlinux`'s `tests/aot.rs`: freestanding
+CoreMark through `--aot-save-shared`/`--aot-load`, layouts, `--no-aot`,
+bad files; ignored because slow: static glibc (~1 min) and the embedded
+translation (builds `rvlinux` again in `target/aot-embed`).
+
+Not yet: lazy translation, translating only hot code, more registers
+across region transfers, saving translations of segments that came from
+the cache.
 
 ## Virtual paging
 
@@ -1217,6 +1327,7 @@ no references into guest memory, so:
 - [x] JIT: F/D (FCVT to integers exact, NaNs the host's)
 - [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
 - [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
+- [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`; see "AOT"
 - [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features
@@ -1285,9 +1396,10 @@ phase starts; names below are the intended targets.
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
 | `tr_translate.cpp` (translation cache, embedded translations) | `jit/cache.rs`, `libriscv-jit-rt/src/linked.rs` | 4 | ✅ replaced: caches the Cranelift JIT's code, translates nothing |
+| `tr_emit.cpp`, `tr_translate.cpp`, `tr_compiler.cpp`, `tr_api.cpp` (translation to C) | `aot/`, `codegen/`, `native_code.rs`, `libriscv-jit-rt/src/aot.rs` | 4 | ✅ replaced: translation to safe Rust |
 | `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |
 | `util/crc32*.{hpp,cpp}` | `decoder_cache.rs` (`crc32c`) | 4 | ✅ CRC32-C (plain CRC32: not needed yet) |
 | `util/buffer.hpp` | `memory/helpers.rs` | 3 | ✅ `Buffer` |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
 | `emulator/src/main.cpp` | `crates/rvlinux` | 0–2, 5 | ✅ static and dynamic Linux guests (`full_linux_guest`), `--call` (without the system call 500 symbol helper, which needs userdata); debugger, GDB: later |
-| `tr_*`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |
+| `tr_tcc.cpp`, `tr_emit_rvc.cpp` (RV32 C), `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

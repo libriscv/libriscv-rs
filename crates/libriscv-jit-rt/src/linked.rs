@@ -207,7 +207,7 @@ mod embedded {
 }
 
 #[cfg(target_os = "linux")]
-mod sys {
+pub(crate) mod sys {
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -244,7 +244,9 @@ mod sys {
         io::Error::other(format!("{what}: {message}"))
     }
 
-    pub(super) fn load(path: &Path) -> io::Result<Vec<CachedUnit>> {
+    /// `dlopen` the shared object at `path`. It is closed again when the
+    /// returned object (and every clone of it) is dropped.
+    pub(crate) fn open(path: &Path) -> io::Result<Arc<SharedObject>> {
         // `dlopen` searches the library path for names without a slash.
         let path = if path.components().count() == 1 {
             Path::new(".").join(path)
@@ -261,17 +263,36 @@ mod sys {
         if handle.is_null() {
             return Err(error("dlopen"));
         }
-        // Closed again when the last unit's code is dropped (or below).
-        let owner = Arc::new(SharedObject {
+        Ok(Arc::new(SharedObject {
             handle: handle as usize,
-        });
-        let symbol = CString::new(TABLE_SYMBOL).map_err(|_| error("symbol"))?;
+        }))
+    }
+
+    /// The address of `symbol` in `object`, or an error mentioning `what`.
+    pub(crate) fn symbol(
+        object: &SharedObject,
+        symbol: &str,
+        what: &str,
+    ) -> io::Result<*mut c_void> {
+        let symbol = CString::new(symbol).map_err(|_| error("symbol"))?;
         #[allow(unsafe_code)]
-        // SAFETY: `handle` is a live `dlopen` handle, `symbol` NUL-terminated.
-        let table = unsafe { dlsym(handle, symbol.as_ptr()) };
-        if table.is_null() {
-            return Err(error("no cached JIT code in the shared object"));
+        // SAFETY: `handle` is a live `dlopen` handle (`object` closes it
+        // only when dropped), `symbol` NUL-terminated.
+        let address = unsafe { dlsym(object.handle as *mut c_void, symbol.as_ptr()) };
+        if address.is_null() {
+            return Err(error(what));
         }
+        Ok(address)
+    }
+
+    pub(super) fn load(path: &Path) -> io::Result<Vec<CachedUnit>> {
+        // Closed again when the last unit's code is dropped (or below).
+        let owner = open(path)?;
+        let table = symbol(
+            &owner,
+            TABLE_SYMBOL,
+            "no cached JIT code in the shared object",
+        )?;
         #[allow(unsafe_code)]
         // SAFETY: the table symbol is `TABLE_WORDS` aligned words (the
         // format this crate's documentation describes), mapped while the

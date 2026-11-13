@@ -21,7 +21,9 @@ LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skippin
 cargo test -- --ignored                      # include not-yet-enabled difftests
 cargo clippy --all-targets -- -D warnings    # must be clean (also with --features libriscv/jit,rvlinux/jit)
 cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
+cargo test --workspace --features libriscv/jit,rvlinux/jit,libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
+rvlinux --aot-save-shared x.so prog.elf; rvlinux --aot-load x.so prog.elf   # AOT: translate to safe Rust (also --aot-save x.rs, RVLINUX_AOT_EMBED)
 ```
 
 Expected durations (warm build, 32 cores): the whole suite ~25 s with the JIT
@@ -50,8 +52,10 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 - **No `unsafe`.** Enforced by `forbid(unsafe_code)`; never work around it
   (no `allow`, no unsafe-using helper crates added to dodge it). The one
   exception is `crates/libriscv-jit-rt`, the executable-memory runtime of the
-  optional `jit` feature: keep its unsafe surface minimal and documented,
-  and keep everything else (including `libriscv/src/jit/`) unsafe-free.
+  optional `jit` feature (it also loads AOT shared objects for `aot-dylib`):
+  keep its unsafe surface minimal and documented, and keep everything else
+  (including `libriscv/src/jit/` and `aot/`) unsafe-free. Code the AOT
+  translator generates is safe Rust too.
 - **Guest input must never panic the host.** Return `MachineError`. Use
   `get`/`get_mut`, checked/wrapping arithmetic and `try_into` on anything a
   guest controls. The clippy lints `indexing_slicing`, `unwrap_used`,
@@ -76,9 +80,10 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 - Update the checkboxes/status in `PORTING.md` in the same commit as the work.
 - No new runtime dependencies in `libriscv` without asking. Dev-dependencies
   are fine.
-- Out-of-scope C++ components (binary translation, libtcc, asmjit, asm
+- Out-of-scope C++ components (binary translation to C, libtcc, asmjit, asm
   dispatch, win32, RV32, RV128, C API) are listed in `PORTING.md`; don't port
-  them. The JIT is Cranelift-based instead (see "JIT" in `PORTING.md`). The port
+  them. The JIT is Cranelift-based instead, and AOT translates to safe Rust
+  (see "JIT" and "AOT" in `PORTING.md`). The port
   is RV64 only: no width generics, no `W == 4` paths.
 - Where C++'s tailcall and threaded dispatchers disagree, follow the threaded
   one (`cpu_dispatch.cpp`): it's what the oracle runs. See "Dispatch" in

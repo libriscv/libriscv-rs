@@ -1,7 +1,7 @@
 //! Port of `asmjit/aj_translate.cpp`: segment analysis and region formation.
 //!
 //! The execute segment is walked once with the decoder's own instruction
-//! boundaries. Each instruction the JIT can compile becomes an [`Insn`];
+//! boundaries. Each instruction native code can run becomes an [`Insn`];
 //! everything else stays with the interpreter. The compilable instructions
 //! are then partitioned into non-overlapping *regions*, each compiled to one
 //! native function: a region grows from an entry point along fall-through
@@ -9,14 +9,18 @@
 //! indirect jumps, instructions it can't compile and instructions an earlier
 //! region already claimed. Control moves between regions with native tail
 //! calls, never through the interpreter.
+//!
+//! The JIT and the ahead-of-time translator share this analysis, so both
+//! run exactly the same instructions natively, with the same entries.
 
 use std::collections::BTreeSet;
 
 use super::classify::{JOp, classify, precise_rejects};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
+pub(crate) use crate::native_code::block_icount;
 
 /// The most instructions in one region. Bounds the size of a single
-/// Cranelift function, which keeps compile time roughly linear.
+/// Cranelift (or Rust) function, which keeps compile time roughly linear.
 const MAX_REGION_INSNS: usize = 2048;
 
 /// A compilable instruction.
@@ -72,17 +76,6 @@ impl Analysis {
         self.insn_at(exec, pc)
             .and_then(|i| self.region_of.get(i).copied())
     }
-}
-
-/// The instruction count the interpreter adds when it begins a block at
-/// `pc` (C++ `BEGIN_BLOCK`): the entry `begin_block!` looks up, including
-/// the padding entries past the segment end (which count one instruction in
-/// the 4-byte layout, where the count is `idxend + 1`). Zero if there's no
-/// entry (the interpreter faults there instead).
-pub(crate) fn block_icount(exec: &DecodedSegment, pc: u64) -> u64 {
-    exec.cache
-        .get(exec.index(pc))
-        .map_or(0, |e| e.instruction_count())
 }
 
 pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {

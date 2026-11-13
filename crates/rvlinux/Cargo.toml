@@ -10,6 +10,12 @@ publish = false
 [features]
 # Adds `--jit`: run with the Cranelift JIT.
 jit = ["libriscv/jit"]
+# Adds `--aot-save`/`--aot-save-shared`: translate the program to Rust ahead
+# of time, and runs translations compiled into `rvlinux`
+# (`RVLINUX_AOT_EMBED`). No unsafe code.
+aot = ["libriscv/aot"]
+# Adds `--aot-load`: run translations compiled into shared objects.
+aot-dylib = ["aot", "libriscv/aot-dylib"]
 
 [dependencies]
 libriscv.workspace = true

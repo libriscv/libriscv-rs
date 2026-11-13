@@ -142,9 +142,9 @@ pub struct DecodedSegment {
     /// it is what keeps the entry in the cache (see [`shared_segment`]).
     #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     shared: Option<Arc<SharedEntry>>,
-    /// Native code for this segment, if the JIT compiled it.
-    #[cfg(feature = "jit")]
-    pub(crate) jit: Option<crate::jit::JitSegment>,
+    /// Native code for this segment: compiled by the JIT, or translated
+    /// ahead of time.
+    pub(crate) native: Option<crate::native_code::NativeSegment>,
     /// A background compilation of this segment was started.
     #[cfg(feature = "jit")]
     jit_started: AtomicBool,
@@ -165,8 +165,7 @@ impl DecodedSegment {
             execute_only: false,
             crc32c: 0,
             shared: None,
-            #[cfg(feature = "jit")]
-            jit: None,
+            native: None,
             #[cfg(feature = "jit")]
             jit_started: AtomicBool::new(false),
             #[cfg(feature = "jit")]
@@ -179,7 +178,7 @@ impl DecodedSegment {
     /// and cache entry.
     #[cfg(feature = "jit")]
     fn duplicate(&self) -> Self {
-        let cache = match &self.jit {
+        let cache = match &self.native {
             // Undo patches from an earlier compilation.
             Some(jit) => self
                 .cache
@@ -201,7 +200,7 @@ impl DecodedSegment {
             execute_only: self.execute_only,
             crc32c: self.crc32c,
             shared: self.shared.clone(),
-            jit: None,
+            native: None,
             jit_started: AtomicBool::new(false),
             jit_done: OnceLock::new(),
         }
@@ -225,7 +224,7 @@ impl DecodedSegment {
     pub(crate) fn finish_background_jit(self: &Arc<Self>, compiled: Option<crate::jit::Compiled>) {
         let upgrade = compiled.filter(|_| !self.is_stale()).map(|compiled| {
             let mut patched = self.duplicate();
-            crate::jit::JitSegment::install(&mut patched, compiled);
+            crate::jit::install(&mut patched, compiled);
             Arc::new(patched)
         });
         if self.jit_done.set(upgrade.clone()).is_err() {
@@ -296,23 +295,21 @@ impl DecodedSegment {
     pub const fn crc32c_hash(&self) -> u32 {
         self.crc32c
     }
-    /// Number of decoder entries that enter JIT-compiled code (0 without the
-    /// JIT, or if nothing in the segment could be compiled).
+    /// Number of decoder entries that enter native code, JIT-compiled or
+    /// translated ahead of time (0 without either, or if nothing in the
+    /// segment could be compiled).
     pub fn jit_entry_count(&self) -> usize {
-        #[cfg(feature = "jit")]
-        if let Some(jit) = &self.jit {
-            return jit.entry_count();
-        }
-        0
+        self.native.as_ref().map_or(0, |n| n.entry_count())
     }
-    /// True if the segment's native code was compiled by an earlier run
-    /// (`MachineOptions::jit_cache`), rather than by this process.
+    /// True if the segment's native code was compiled by an earlier run of
+    /// the JIT (`MachineOptions::jit_cache`), rather than by this process.
     pub fn jit_is_cached(&self) -> bool {
-        #[cfg(feature = "jit")]
-        if let Some(jit) = &self.jit {
-            return jit.is_cached();
-        }
-        false
+        self.native.as_ref().is_some_and(|n| n.is_jit_cached())
+    }
+    /// True if the segment runs code translated to Rust ahead of time
+    /// (`MachineOptions::aot`).
+    pub fn is_aot(&self) -> bool {
+        self.native.as_ref().is_some_and(|n| n.is_aot())
     }
 
     /// Execute-only segments must never be rebuilt, so they never go stale.
@@ -423,8 +420,7 @@ impl DecodedSegment {
             execute_only,
             crc32c,
             shared,
-            #[cfg(feature = "jit")]
-            jit: None,
+            native: None,
             #[cfg(feature = "jit")]
             jit_started: AtomicBool::new(false),
             #[cfg(feature = "jit")]
@@ -800,6 +796,11 @@ pub(crate) struct SegmentKey {
     /// Machines that don't JIT never get native code this way.
     #[cfg(feature = "jit")]
     pub jit: Option<libriscv_jit_rt::MemoryLayout>,
+    /// `None` without translations, else the layout the machine looks
+    /// them up for (`MachineOptions::aot`). Machines that don't use
+    /// translations never get them this way.
+    #[cfg(feature = "aot")]
+    pub aot: Option<crate::native_code::MemoryLayout>,
 }
 
 /// One entry of the process-wide segment cache (C++

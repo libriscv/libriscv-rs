@@ -49,21 +49,7 @@ use super::emit::{Compiled, Image, build_fingerprint, libcall_symbol};
 /// First word of a unit's metadata ("RVJITM01").
 const META_MAGIC: u64 = u64::from_le_bytes(*b"RVJITM01");
 
-/// 64-bit FNV-1a, a word at a time. Not cryptographic: it tells segments
-/// apart, it doesn't defend against crafted collisions (cached code is
-/// trusted anyway, see `libriscv_jit_rt`).
-pub(crate) fn hash64(bytes: &[u8]) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01B3;
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-    let (words, rest) = bytes.as_chunks::<8>();
-    for &w in words {
-        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(PRIME);
-    }
-    for &b in rest {
-        h = (h ^ u64::from(b)).wrapping_mul(PRIME);
-    }
-    (h ^ bytes.len() as u64).wrapping_mul(PRIME)
-}
+pub(crate) use crate::codegen::hash64;
 
 /// What cached code is looked up by: everything the code compiled for a
 /// segment depends on.

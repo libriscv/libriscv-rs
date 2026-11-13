@@ -99,9 +99,9 @@ pub struct Memory {
     /// Compile them on background threads (`MachineOptions::jit_background`).
     #[cfg(feature = "jit")]
     jit_background: bool,
-    /// The JIT's guest address mask, 0 for bounds checks
+    /// Native code's guest address mask, 0 for bounds checks
     /// (`MachineOptions::jit_automatic_nbit_address_space`).
-    #[cfg(feature = "jit")]
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_arena_mask: u64,
     /// Use cached JIT code (`MachineOptions::jit_cache`).
     #[cfg(feature = "jit")]
@@ -109,9 +109,15 @@ pub struct Memory {
     /// Save the code the JIT compiles (`MachineOptions::jit_cache_output`).
     #[cfg(feature = "jit")]
     jit_cache_output: Option<crate::jit::cache::JitCacheOutput>,
-    /// `MachineOptions::verbose_loader`, for the JIT cache.
-    #[cfg(feature = "jit")]
+    /// `MachineOptions::verbose_loader`, for the JIT cache and translations.
+    #[cfg(any(feature = "jit", feature = "aot"))]
     jit_verbose: bool,
+    /// Use translations (`MachineOptions::aot`).
+    #[cfg(feature = "aot")]
+    aot: bool,
+    /// Translate new segments (`MachineOptions::aot_output`).
+    #[cfg(feature = "aot")]
+    aot_output: Option<crate::aot::AotOutput>,
     /// Keeps the dispatcher slicing, as if a compilation never finished
     /// (see `hold_jit_pending`).
     #[cfg(all(test, feature = "jit"))]
@@ -248,14 +254,18 @@ impl Memory {
             jit: options.jit,
             #[cfg(feature = "jit")]
             jit_background: options.jit_background,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_arena_mask: jit_arena_mask(options, arena_size),
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
             jit_cache_output: options.jit_cache_output.clone(),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
+            #[cfg(feature = "aot")]
+            aot: options.aot,
+            #[cfg(feature = "aot")]
+            aot_output: options.aot_output.clone(),
             #[cfg(all(test, feature = "jit"))]
             jit_hold: false,
             #[cfg(feature = "ext-a")]
@@ -321,14 +331,18 @@ impl Memory {
             jit: options.jit,
             #[cfg(feature = "jit")]
             jit_background: options.jit_background,
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_arena_mask: 0,
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
             jit_cache_output: options.jit_cache_output.clone(),
-            #[cfg(feature = "jit")]
+            #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
+            #[cfg(feature = "aot")]
+            aot: options.aot,
+            #[cfg(feature = "aot")]
+            aot_output: options.aot_output.clone(),
             #[cfg(all(test, feature = "jit"))]
             jit_hold: false,
             #[cfg(feature = "ext-a")]
@@ -452,20 +466,20 @@ impl Memory {
     pub const fn initial_rodata_end(&self) -> u64 {
         self.initial_rodata_end
     }
-    /// The guest memory layout JIT code is built for and run with: the
+    /// The guest memory layout native code is built for and run with: the
     /// N-bit address mask, or (mask 0) the arena windows loads and stores
     /// check against, as `read_*`/`write_*` do. The windows are final once
     /// the program is loaded, before any execute segment is created.
-    #[cfg(feature = "jit")]
-    pub(crate) const fn jit_layout(&self) -> libriscv_jit_rt::MemoryLayout {
-        libriscv_jit_rt::MemoryLayout {
+    #[cfg(any(feature = "jit", feature = "aot"))]
+    pub(crate) const fn native_layout(&self) -> crate::native_code::MemoryLayout {
+        crate::native_code::MemoryLayout {
             mask: self.jit_arena_mask,
             read: (RWREAD_BEGIN, self.read_boundary),
             write: (self.initial_rodata_end, self.write_boundary),
         }
     }
-    /// The whole arena including the padding page, for the JIT.
-    #[cfg(feature = "jit")]
+    /// The whole arena including the padding page, for native code.
+    #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) fn arena_mut(&mut self) -> &mut [u8] {
         &mut self.arena
     }
@@ -523,8 +537,24 @@ impl Memory {
         }
         let crc32c = decoder_cache::crc32c(code);
         #[cfg(feature = "jit")]
-        let (jit, background, layout) = (self.jit, self.jit_background, self.jit_layout());
+        let (jit, background) = (self.jit, self.jit_background);
+        #[cfg(any(feature = "jit", feature = "aot"))]
+        let (layout, verbose) = (self.native_layout(), self.jit_verbose);
         let (patches, binary) = (&self.patches, &self.binary);
+        let libc_fastpath = initial && patches.libc_fastpath;
+        // Translations ahead of time: segments with breakpoints are never
+        // translated or looked up (nor shared), and machines translating
+        // make every segment themselves.
+        #[cfg(feature = "aot")]
+        let (aot_key, aot_save) = {
+            let saving = self.aot_output.is_some();
+            let lookup = self.aot && !saving && crate::aot::any();
+            let key = ((saving || lookup) && patches.ebreak_locations.is_empty()).then(|| {
+                crate::aot::AotKey::new(code, vaddr, crc32c, execute_only, libc_fastpath, layout)
+            });
+            let save = self.aot_output.clone().zip(key).filter(|_| saving);
+            (key.filter(|_| lookup), save)
+        };
         // The JIT cache: segments with breakpoints are never cached (nor
         // shared), and machines saving code compile everything themselves.
         #[cfg(feature = "jit")]
@@ -537,7 +567,7 @@ impl Memory {
                     vaddr,
                     crc32c,
                     execute_only,
-                    initial && patches.libc_fastpath,
+                    libc_fastpath,
                     layout,
                 )
             } else {
@@ -552,14 +582,33 @@ impl Memory {
             };
             (key.filter(|_| lookup), save)
         };
-        #[cfg(feature = "jit")]
-        let verbose = self.jit_verbose;
         let build = |shared| {
             let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
-            // Before compiling: the JIT leaves patched entries alone.
+            // Before translating or compiling: they leave patched entries
+            // alone.
             segment.apply_patches(patches, binary, initial)?;
+            #[cfg(feature = "aot")]
+            if let Some((output, key)) = &aot_save
+                && let Some(translation) = crate::aot::translate(&segment, layout)
+            {
+                output.record(*key, translation);
+            }
+            #[cfg(feature = "aot")]
+            let translated = aot_key.is_some_and(|key| {
+                let found = crate::aot::install(&key, &mut segment);
+                if verbose {
+                    let found = if found { "Found" } else { "No" };
+                    eprintln!(
+                        "libriscv: {found} translation for the segment at 0x{vaddr:X} ({} bytes)",
+                        code.len()
+                    );
+                }
+                found
+            });
+            #[cfg(not(feature = "aot"))]
+            let translated = false;
             #[cfg(feature = "jit")]
-            let cached = match cache_key {
+            let cached = match cache_key.filter(|_| !translated) {
                 Some(key) => {
                     let compiled = crate::jit::cache::lookup(&key, segment.cache.len());
                     if verbose {
@@ -574,13 +623,15 @@ impl Memory {
                 None => None,
             };
             #[cfg(feature = "jit")]
-            let compile = cached.is_none() && jit;
+            let compile = cached.is_none() && jit && !translated;
             #[cfg(feature = "jit")]
             if let Some(compiled) = cached {
-                crate::jit::JitSegment::install(&mut segment, compiled);
+                crate::jit::install(&mut segment, compiled);
             } else if compile && !background {
-                crate::jit::JitSegment::attach(&mut segment, layout, save.as_ref());
+                crate::jit::attach(&mut segment, layout, save.as_ref());
             }
+            #[cfg(not(feature = "jit"))]
+            let _ = translated;
             let segment = Arc::new(segment);
             #[cfg(feature = "jit")]
             if compile && background {
@@ -590,21 +641,25 @@ impl Memory {
         };
         // Breakpoints aren't part of the key: segments with them aren't
         // shared. (C++ shares them anyway.)
-        // A machine saving code compiles its own segments: a shared one may
-        // have been compiled before saving started.
+        // A machine saving code compiles (or translates) its own segments:
+        // a shared one may have been compiled before saving started.
         #[cfg(feature = "jit")]
         let share = save.is_none();
         #[cfg(not(feature = "jit"))]
         let share = true;
+        #[cfg(feature = "aot")]
+        let share = share && aot_save.is_none();
         let segment = if self.use_shared_segments && share && patches.ebreak_locations.is_empty() {
             let key = decoder_cache::SegmentKey {
                 vaddr,
                 len: code.len() as u64,
                 crc32c,
                 execute_only,
-                libc_fastpath: initial && patches.libc_fastpath,
+                libc_fastpath,
                 #[cfg(feature = "jit")]
                 jit: (jit || cache_key.is_some()).then_some(layout),
+                #[cfg(feature = "aot")]
+                aot: aot_key.map(|_| layout),
             };
             decoder_cache::shared_segment(key, code, build)?
         } else {
@@ -713,11 +768,11 @@ impl Memory {
     }
 }
 
-/// The JIT's guest address mask for an arena of `arena_size` bytes (the
-/// N-bit address space of C++ `aj_translate.cpp`), 0 for bounds checks.
-#[cfg(feature = "jit")]
+/// Native code's guest address mask for an arena of `arena_size` bytes
+/// (the N-bit address space of C++ `aj_translate.cpp`), 0 for bounds checks.
+#[cfg(any(feature = "jit", feature = "aot"))]
 fn jit_arena_mask(options: &MachineOptions, arena_size: u64) -> u64 {
-    if !(options.jit || options.jit_cache)
+    if !(options.jit || options.jit_cache || options.aot)
         || !options.jit_automatic_nbit_address_space
         || arena_size == 0
     {
