@@ -434,6 +434,13 @@ struct RegionWriter<'a> {
     checked: [[Option<Check>; 32]; 2],
     /// Checks written so far (names their locals).
     checks: usize,
+    /// `[load, store][base register]`: the check made on entry to the
+    /// region for a base register the region never writes (see
+    /// [`RegionWriter::region_checks`]). A run's first access through the
+    /// register only tests its result.
+    region_checked: [[Option<Check>; 32]; 2],
+    /// The entry code of the region checks.
+    region_lines: Vec<String>,
 }
 
 /// Offsets `lo..=hi` of guest memory accesses through one base register.
@@ -510,7 +517,10 @@ impl<'a> RegionWriter<'a> {
             pos: 0,
             checked: [[None; 32]; 2],
             checks: 0,
+            region_checked: [[None; 32]; 2],
+            region_lines: Vec::new(),
         };
+        w.region_checks(&r.insns, &written)?;
         w.body(&r.insns)?;
         let entry_counts: Vec<(u64, u64)> = r
             .entries
@@ -533,6 +543,15 @@ impl<'a> RegionWriter<'a> {
             if fused.get(n).copied().unwrap_or(false) {
                 let _ = writeln!(o, "            let mut f{n} = s.f[{n}];");
             }
+        }
+        // The arena, the limit and the rounding mode in locals: read
+        // through `s`, they would be reloaded after every guest store
+        // (`s` escapes into the tail calls, so LLVM can't tell that the
+        // arena doesn't overlap it).
+        let _ = writeln!(o, "            let m = &mut *s.m;");
+        let _ = writeln!(o, "            let (max, frm) = (s.max, s.frm);");
+        for line in &w.region_lines {
+            let _ = writeln!(o, "            {line}");
         }
         let _ = writeln!(o, "            let mut c = c;");
         let _ = writeln!(o, "            let a: A = 'x: {{");
@@ -684,7 +703,7 @@ impl<'a> RegionWriter<'a> {
     /// before jumping.
     fn check_counter(&mut self, target: u64) {
         self.line(&format!(
-            "if c >= s.max {{ break 'x A::X({EXIT_HALT}, {target:#x}); }}"
+            "if c >= max {{ break 'x A::X({EXIT_HALT}, {target:#x}); }}"
         ));
     }
 
@@ -717,7 +736,7 @@ impl<'a> RegionWriter<'a> {
     /// block, as it would for that access alone.
     fn access(&mut self, rs1: u32, imm: i64, write: bool, pc: u64) -> (&'static str, String) {
         if self.layout.mask != 0 {
-            return ("", format!("s.m, {}", Self::addr(rs1, imm)));
+            return ("", format!("m, {}", Self::addr(rs1, imm)));
         }
         let reg = (rs1 & 31) as usize;
         let within = |c: Option<Check>| c.filter(|c| c.lo <= imm && imm <= c.hi);
@@ -736,9 +755,29 @@ impl<'a> RegionWriter<'a> {
         } else {
             within(check(0, self)).or_else(|| within(check(1, self)).filter(|_| stores_cover_loads))
         };
-        let c = match covered {
-            Some(c) => c,
-            None => {
+        let region = self
+            .region_checked
+            .get(usize::from(write))
+            .and_then(|k| k.get(reg))
+            .copied()
+            .flatten();
+        let c = match (covered, region) {
+            (Some(c), _) => c,
+            (None, Some(c)) => {
+                self.line(&format!(
+                    "if !o{} {{ break 'x A::X({EXIT_SLOW}, {pc:#x}); }}",
+                    c.local
+                ));
+                if let Some(slot) = self
+                    .checked
+                    .get_mut(usize::from(write))
+                    .and_then(|k| k.get_mut(reg))
+                {
+                    *slot = Some(c);
+                }
+                c
+            }
+            (None, None) => {
                 let (loads, stores) = self.check_spans(rs1);
                 let inside =
                     |span: Option<(i64, i64)>| span.is_some_and(|(lo, hi)| lo <= imm && imm <= hi);
@@ -789,7 +828,93 @@ impl<'a> RegionWriter<'a> {
             }
         };
         let d = c.base.wrapping_add(imm.wrapping_sub(c.lo) as u64);
-        ("k", format!("s.m, k{}, {d:#x}", c.local))
+        ("k", format!("m, k{}, {d:#x}", c.local))
+    }
+
+    /// Checks on entry to the region for the base registers it never
+    /// writes: such a register holds its entry value everywhere in the
+    /// region, so one check of the span of offsets of all the region's
+    /// accesses through it covers every one of them. The check's result is
+    /// a local `o<n>`; the first access of each straight-line run tests it
+    /// and leaves there when it failed, as a check of the run's own span
+    /// would (that one may pass where the region's fails: then native code
+    /// leaves early, and the interpreter runs the accesses, which is always
+    /// correct). Without them each run checks again, and LLVM hoists those
+    /// loop-invariant compares into the function's entry one by one.
+    ///
+    /// Loads within the span of the stores share their check when every
+    /// writable address is readable. Registers with fewer than two
+    /// accesses, or a span wider than `REGION_SPAN_MAX`, keep the run
+    /// checks.
+    fn region_checks(&mut self, insns: &[usize], written: &[bool; 32]) -> Option<()> {
+        const REGION_SPAN_MAX: i64 = 1 << 16;
+        if self.layout.mask != 0 {
+            return Some(());
+        }
+        // [load, store][register]: (lo, hi, count).
+        let mut spans: [[Option<(i64, i64, u32)>; 32]; 2] = [[None; 32]; 2];
+        for &i in insns {
+            if let Some((rs1, off, write)) = memory_access(self.a.insns.get(i)?.op) {
+                let reg = (rs1 & 31) as usize;
+                if reg == 0 || written.get(reg).copied().unwrap_or(true) {
+                    continue;
+                }
+                let slot = spans.get_mut(usize::from(write))?.get_mut(reg)?;
+                *slot = Some(slot.map_or((off, off, 1), |(lo, hi, n)| {
+                    (lo.min(off), hi.max(off), n.saturating_add(1))
+                }));
+            }
+        }
+        let stores_cover_loads = window_within(self.layout.write, self.layout.read);
+        for reg in 1..32usize {
+            let span = |kind: usize| spans.get(kind).and_then(|k| k.get(reg)).copied().flatten();
+            let (loads, stores) = (span(0), span(1));
+            let count = loads
+                .map_or(0, |l| l.2)
+                .saturating_add(stores.map_or(0, |s| s.2));
+            if count < 2 {
+                continue;
+            }
+            let narrow = |s: Option<(i64, i64, u32)>| {
+                s.filter(|&(lo, hi, _)| hi.wrapping_sub(lo) <= REGION_SPAN_MAX)
+            };
+            let store_check =
+                narrow(stores).map(|(lo, hi, _)| self.region_check(reg, lo, hi, true));
+            let loads_with_stores = stores_cover_loads
+                && matches!((loads, stores), (Some(l), Some(s)) if s.0 <= l.0 && l.1 <= s.1);
+            let load_check = match store_check {
+                Some(c) if loads_with_stores => Some(c),
+                _ => narrow(loads).map(|(lo, hi, _)| self.region_check(reg, lo, hi, false)),
+            };
+            *self.region_checked.get_mut(0)?.get_mut(reg)? = load_check;
+            *self.region_checked.get_mut(1)?.get_mut(reg)? = store_check;
+        }
+        Some(())
+    }
+
+    /// Write a region check of offsets `lo..=hi` through `reg` against the
+    /// store (`write`) or load window (see [`Self::access`] for the
+    /// arithmetic).
+    fn region_check(&mut self, reg: usize, lo: i64, hi: i64, write: bool) -> Check {
+        let (base, len) = if write {
+            self.layout.write
+        } else {
+            self.layout.read
+        };
+        let span = hi.wrapping_sub(lo) as u64;
+        let local = self.checks;
+        self.checks += 1;
+        self.region_lines.push(format!(
+            "let k{local} = x{reg}.wrapping_add({}); let o{local} = k{local} < {:#x};",
+            lit(lo.wrapping_sub(base as i64)),
+            len.saturating_sub(span)
+        ));
+        Check {
+            lo,
+            hi,
+            base,
+            local,
+        }
     }
 
     /// The offset spans `(lo, hi)` of the loads and of the stores through
@@ -820,14 +945,7 @@ impl<'a> RegionWriter<'a> {
             {
                 break;
             }
-            let access = match ins.op {
-                JOp::Load { rs1, imm, .. } | JOp::FLoad { rs1, imm, .. } => Some((rs1, imm, false)),
-                JOp::Store { rs1, imm, .. } | JOp::FStore { rs1, imm, .. } => {
-                    Some((rs1, imm, true))
-                }
-                _ => None,
-            };
-            if let Some((base, off, write)) = access
+            if let Some((base, off, write)) = memory_access(ins.op)
                 && base == rs1
                 && let Some(span) = spans.get_mut(usize::from(write))
             {
@@ -971,9 +1089,7 @@ impl<'a> RegionWriter<'a> {
                 }
                 // overflow_checked_jump, then the entry dispatch (or the
                 // entry table, outside this region).
-                self.line(&format!(
-                    "if c >= s.max {{ break 'x A::X({EXIT_HALT}, t); }}"
-                ));
+                self.line(&format!("if c >= max {{ break 'x A::X({EXIT_HALT}, t); }}"));
                 self.line("pc = t; continue 'e;");
                 return Some(false);
             }
@@ -1122,7 +1238,7 @@ impl<'a> RegionWriter<'a> {
                 // DYN: FCSR.frm, which native code can't change (CSR
                 // instructions are interpreted).
                 let mode = if rm == 7 {
-                    "s.frm".to_owned()
+                    "frm".to_owned()
                 } else {
                     rm.to_string()
                 };
@@ -1184,6 +1300,16 @@ impl<'a> RegionWriter<'a> {
             }
         }
         Some(true)
+    }
+}
+
+/// The base register, offset and direction (store) of a guest memory
+/// access.
+fn memory_access(op: JOp) -> Option<(u32, i64, bool)> {
+    match op {
+        JOp::Load { rs1, imm, .. } | JOp::FLoad { rs1, imm, .. } => Some((rs1, imm, false)),
+        JOp::Store { rs1, imm, .. } | JOp::FStore { rs1, imm, .. } => Some((rs1, imm, true)),
+        _ => None,
     }
 }
 

@@ -808,9 +808,10 @@ fn nbit_accesses_wrap_and_ignore_protection() {
     assert_eq!(checked, run(&mut machine(&code, false), &regs, 100));
 }
 
-/// Only power-of-two arenas are masked; others stay checked.
+/// An N-bit address space rounds the arena up to a power of two, so that
+/// masked addresses stay inside it: 3 MiB becomes 4 MiB, masked.
 #[test]
-fn nbit_needs_a_power_of_two_arena() {
+fn nbit_rounds_the_arena_up_to_a_power_of_two() {
     const ARENA: u64 = 3 << 20;
     let program = [
         itype(0x13, 0, 10, 0, 0x55), // li a0, 0x55
@@ -823,11 +824,43 @@ fn nbit_needs_a_power_of_two_arena() {
     regs[BASE as usize] = SCRATCH;
     regs[6] = (4 << 20) + SCRATCH;
     let mut m = nbit_machine(&code, ARENA);
+    assert_eq!(m.memory.memory_arena_size(), 4 << 20);
     assert!(m.cpu.current_execute_segment().jit_entry_count() > 0);
     let out = run(&mut m, &regs, 100);
-    assert_eq!(out.regs[11], 0x5A5A_5A5A_5A5A_5A5A);
+    // The store wrapped around to SCRATCH.
+    assert_eq!(out.regs[11], 0x55);
+    // Without the option, the arena keeps its size.
     let interp = machine_sized(&code, ARENA, MachineOptions::default());
-    assert_eq!(out, run(&mut { interp }, &regs, 100));
+    assert_eq!(interp.memory.memory_arena_size(), ARENA);
+}
+
+/// The default 4000 MiB rounds up to 4 GiB; rounding up by more than
+/// 256 MiB is refused.
+#[test]
+fn nbit_round_up_limit() {
+    let options = |memory_max| MachineOptions {
+        memory_max,
+        jit: true,
+        jit_automatic_nbit_address_space: true,
+        ..Default::default()
+    };
+    let m = Machine::new(&[], options(4000 << 20)).unwrap();
+    assert_eq!(m.memory.memory_arena_size(), 4 << 30);
+    // 768 MiB -> 1 GiB adds exactly 256 MiB: allowed.
+    let m = Machine::new(&[], options(768 << 20)).unwrap();
+    assert_eq!(m.memory.memory_arena_size(), 1 << 30);
+    let err = Machine::new(&[], options((768 << 20) - 4096)).unwrap_err();
+    assert_eq!(err.kind, ExceptionKind::OutOfMemory);
+    // Not a problem without the option.
+    let m = Machine::new(
+        &[],
+        MachineOptions {
+            jit_automatic_nbit_address_space: false,
+            ..options(600 << 20)
+        },
+    )
+    .unwrap();
+    assert_eq!(m.memory.memory_arena_size(), 600 << 20);
 }
 
 /// Every compiled F/D operation on the special values of the `rvlinux`

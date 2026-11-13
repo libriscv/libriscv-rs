@@ -195,7 +195,7 @@ impl Memory {
                 0,
             ));
         }
-        let pages_max = options.memory_max / PAGE_SIZE;
+        let pages_max = nbit_memory_max(options)? / PAGE_SIZE;
         // The arena length must be addressable; C++ gets a failed mmap here
         // and continues with paging alone.
         let arena_len = (pages_max * PAGE_SIZE)
@@ -768,26 +768,61 @@ impl Memory {
     }
 }
 
+/// Whether native code masks guest addresses
+/// (`MachineOptions::jit_automatic_nbit_address_space`, with something that
+/// makes native code).
+#[cfg(any(feature = "jit", feature = "aot"))]
+const fn uses_nbit_address_space(options: &MachineOptions) -> bool {
+    (options.jit || options.jit_cache || options.aot)
+        && options.jit_automatic_nbit_address_space
+        && options.use_memory_arena
+}
+
+/// The most an N-bit address space may add to `memory_max`: rounding up
+/// further than this is more likely a mistake than intended.
+#[cfg(any(feature = "jit", feature = "aot"))]
+const NBIT_ROUND_UP_MAX: u64 = 256 << 20;
+
+/// `memory_max`, rounded up to a power of two when native code masks guest
+/// addresses with `arena size - 1` (the default 4000 MiB becomes 4 GiB), so
+/// that every masked address is inside the arena. An error if that adds
+/// more than [`NBIT_ROUND_UP_MAX`]. (C++'s binary translator rounds up
+/// only its mask, past the end of the arena's mapping.)
+fn nbit_memory_max(options: &MachineOptions) -> Result<u64> {
+    #[cfg(any(feature = "jit", feature = "aot"))]
+    if uses_nbit_address_space(options) && options.memory_max >= PAGE_SIZE {
+        let size = options.memory_max / PAGE_SIZE * PAGE_SIZE;
+        let rounded = size.checked_next_power_of_two().unwrap_or(0);
+        if rounded == 0 || rounded - size > NBIT_ROUND_UP_MAX {
+            return Err(MachineError::new(
+                ExceptionKind::OutOfMemory,
+                "An N-bit address space would round max memory up by more than 256 MiB",
+                options.memory_max,
+            ));
+        }
+        if rounded != size && options.verbose_loader {
+            eprintln!(
+                "libriscv: rounding max memory up from {} to {} MiB for the N-bit address space",
+                size >> 20,
+                rounded >> 20
+            );
+        }
+        return Ok(rounded);
+    }
+    Ok(options.memory_max)
+}
+
 /// Native code's guest address mask for an arena of `arena_size` bytes
 /// (the N-bit address space of C++ `aj_translate.cpp`), 0 for bounds checks.
+/// The arena is a power of two whenever the option is on
+/// ([`nbit_memory_max`]); without an arena accesses stay checked.
 #[cfg(any(feature = "jit", feature = "aot"))]
-fn jit_arena_mask(options: &MachineOptions, arena_size: u64) -> u64 {
-    if !(options.jit || options.jit_cache || options.aot)
-        || !options.jit_automatic_nbit_address_space
-        || arena_size == 0
-    {
-        return 0;
+const fn jit_arena_mask(options: &MachineOptions, arena_size: u64) -> u64 {
+    if uses_nbit_address_space(options) && arena_size.is_power_of_two() {
+        arena_size - 1
+    } else {
+        0
     }
-    if arena_size.is_power_of_two() {
-        return arena_size - 1;
-    }
-    if options.verbose_loader {
-        eprintln!(
-            "libriscv: the JIT cannot use an automatic N-bit address space for a \
-             {arena_size}-byte arena; it is not a power of two"
-        );
-    }
-    0
 }
 
 #[cfg(test)]

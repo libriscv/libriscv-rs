@@ -632,9 +632,16 @@ use `arena + (addr & (arena_size - 1))` without any check (a 32-bit mask
 is a zero extension), like asmjit's `arena_index`. Native code then reads
 and writes anywhere in the arena, read-only data and page 0 included, and
 addresses outside it wrap instead of going to the page table; the
-interpreter is unchanged. Other arena sizes stay checked (with a message
-under `verbose_loader`; `rvlinux`'s default 4000 MiB isn't a power of two,
-`-m 4096` is). The mask is a constant in the code; `CodeMemory` records it
+interpreter is unchanged. The arena is rounded up to a power of two for
+it (`Memory::new`: `rvlinux`'s default 4000 MiB becomes 4 GiB, reported
+under `verbose_loader`), and `Machine::new` fails with `OutOfMemory` if
+that adds more than 256 MiB (more likely a mistake than intended). C++'s
+asmjit leaves other sizes checked, and its binary translator rounds up
+only the mask, so its masked accesses can run past the arena's mapping
+(a C++ bug; we grow the arena instead). With 4 GiB the mask is a 32-bit
+add (`lea r32`) and a zero extension: the JIT emits that explicitly,
+LLVM finds it from the AOT code's `& 0xffffffff`; the offset is added before truncating, so negative offsets
+wrap inside the arena. The mask is a constant in the code; `CodeMemory` records it
 and refuses to enter code whose mask plus the widest access doesn't fit in
 the arena (which has a padding page for exactly that). Tests:
 `tests/nbit_arena.rs` (port of `nbit_arena.cpp`) and the `nbit_*` cases
@@ -724,7 +731,16 @@ only) every index is provably in bounds and no second check is emitted.
 Accesses through one base register in a straight-line run share one
 check of their offset span, as in the JIT: it computes `k = base + lo -
 window`, compares `k` with the window length minus the span, and the
-accesses index `k + constant`, which LLVM proves in bounds. With an N-bit
+accesses index `k + constant`, which LLVM proves in bounds. A base
+register the region never writes gets one check of the span of all its
+accesses in the region, on entry (`RegionWriter::region_checks`), into a
+bool that the first access of each run tests: it leaves at the same
+instruction a run check would (or earlier, when only the wider span
+fails, which only costs speed), and replaces the run checks that LLVM
+otherwise hoists into the entry one by one (core_state_transition did
+eight on every call). The arena, the instruction limit and the rounding
+mode are locals: read through `s`, which escapes into the tail calls,
+they were reloaded after every guest store. With an N-bit
 address space accesses are masked, without checks.
 
 **Control flow** (`aot/structure.rs`). A `loop { match pc { .. } }`
@@ -748,7 +764,15 @@ CoreMark have no fallback).
 collatz 229 ms vs JIT 237 ms (interpreter 1893 ms); CoreMark 1.0 (bench
 column "Rust AOT", `cargo bench -p rvlinux --features aot-dylib,jit
 --bench coremark`) 18959 / 18141 vs JIT 19021 / 19734 and asmjit 19235 /
-19670 (rv64imafdc / +zba_zbb_zbs), before span-merged checks. Static glibc
+19670 (rv64imafdc / +zba_zbb_zbs), before span-merged checks.
+2026-11-13 later, freestanding CoreMark (`guests/coremark`, 30000
+iterations, wall time, rv64imafdc / +zba_zbb_zbs): JIT 1.64 / 1.60 s,
+AOT 1.48 / 1.48 s (1.50 / 1.50 s before region checks and locals), with
+`--nbit-address-space` (now 4 GiB at the default `-m`) JIT 1.45 / 1.40 s
+and AOT 1.19 / 1.23 s. Native x86-64 `-O2` CoreMark runs the same
+iterations in ~0.63 s. What the checked build still pays is the one
+compare per access in pointer-chasing loops (no shared base to merge)
+and the precise exits it needs. Static glibc
 translates (~470 KB of code) to ~16 MB of Rust in 70 ms; `rustc` takes
 ~65 s for it, CoreMark freestanding a few seconds.
 

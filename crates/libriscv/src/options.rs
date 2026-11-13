@@ -52,10 +52,12 @@ pub struct MachineOptions {
     /// `translate_automatic_nbit_address_space`). Much cheaper loads and
     /// stores, but native code then reads and writes anywhere in the arena,
     /// read-only data and the first page included, and accesses outside it
-    /// wrap around instead of going to the page table. Only power-of-two
-    /// arenas qualify; otherwise (reported with `verbose_loader`) the
-    /// accesses stay checked. The interpreter is unaffected. Translations
-    /// are only used by machines with the same setting.
+    /// wrap around instead of going to the page table. The mask needs a
+    /// power-of-two arena, so `memory_max` is rounded up to one (the
+    /// default 4000 MiB of `rvlinux` becomes 4 GiB); rounding up by more
+    /// than 256 MiB fails `Machine::new` with `OutOfMemory`. The
+    /// interpreter is otherwise unaffected. Translations are only used by
+    /// machines with the same setting.
     pub jit_automatic_nbit_address_space: bool,
     /// Use JIT code compiled by an earlier run for the execute segments it
     /// was compiled for (default on): code linked into the program, and
