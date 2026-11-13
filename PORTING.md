@@ -439,7 +439,9 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   counted), `jit_enter` runs the machine's custom instruction handler
   with the exact PC, counter and limit visible, then halts if the handler
   stopped or penalized the machine (at the next instruction, with the
-  count up to the dyncall), leaves a segment the handler made stale, or
+  count up to the dyncall; a block whose count merely crosses the limit
+  runs to its end, as in the interpreter), leaves a segment the handler
+  made stale, or
   re-enters native code at the next instruction, which region formation
   always makes an entry point. A fault is reported at the dyncall's own
   PC (the interpreter reports the block's). The interpreter runs dyncalls
@@ -450,16 +452,19 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   registers and counter the interpreter would have. FUNCBLOCK entries
   (the decoder's split of over-long blocks) are compiled: the instruction,
   then `NEXT_BLOCK`'s limit check and the next block's count, as
-  `dispatch::funcblock` does. (They used to exit, which cost ~5% of
+  `dispatch::funcblock` does, except where `funcblock`'s precise handler
+  rejects an encoding the fast path accepts (FMADD.H/.Q, a no-op in the
+  fast path), which stays interpreted. (They used to exit, which cost ~5% of
   CoreMark in `jit_enter` and the interpreter.)
 - F and D (not in the `debug-checks` build, which NaN-boxes): Cranelift's
   IEEE operations as they are, whatever is fastest. For non-NaN inputs
   that's the interpreter's result (both round to nearest on the host, and
   ignore the instruction's rounding mode, as C++ does without FCSR
   emulation); which NaN comes out is the host's (NaN payloads belong to
-  FCSR emulation; C++ asmjit canonicalises in FMIN/FMAX and FCVT.S.D).
+  FCSR emulation; C++ asmjit canonicalises in FCVT.S.D).
   FMIN/FMAX with one NaN operand return the other operand (a number, as
-  C's `fmin` requires). FCVT to integers is exact:
+  C's `fmin` requires), with two the canonical NaN, like the interpreter
+  and C++ asmjit. FCVT to integers is exact:
   the instruction's rounding mode (DYN reads FCSR.frm, which native code
   can't change), saturation, NaN to the maximum, like C++'s helper call. A
   single-precision write keeps the upper half of the register (no

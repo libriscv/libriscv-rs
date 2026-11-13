@@ -54,7 +54,8 @@
 //! non-NaN inputs are the interpreter's (both use the host's IEEE
 //! operations in round-to-nearest), but which NaN comes out follows the
 //! host (NaN payloads are FCSR emulation's business). FMIN/FMAX with one
-//! NaN operand give the other one, and FCVT to integers honours the
+//! NaN operand give the other one and with two the canonical NaN, as
+//! RISC-V defines, and FCVT to integers honours the
 //! rounding mode and saturates (NaN to the maximum), exactly like the
 //! interpreter.
 
@@ -63,7 +64,7 @@ use std::collections::HashMap;
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
-use cranelift_codegen::ir::immediates::Offset32;
+use cranelift_codegen::ir::immediates::{Ieee32, Ieee64, Offset32};
 use cranelift_codegen::ir::types::{F32, F64, I8, I16, I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, Endianness, ExtFuncData, ExternalName, FuncRef, Function,
@@ -1308,9 +1309,10 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             FBin::Div => ins.ins().fdiv(a, b),
             _ => {
                 // Cranelift's fmin/fmax order -0 below +0 like RISC-V, but
-                // propagate NaN: one NaN operand gives the other operand
-                // (IEEE minNum, C's fmin), which is a number, not a NaN
-                // detail.
+                // propagate NaN. RISC-V (and the interpreter's `rv_fmin32`
+                // & co): one NaN operand gives the other operand (IEEE
+                // minNum, C's fmin), two give the canonical NaN. Both are
+                // defined results, not NaN details left to the host.
                 let m = if op == FBin::Min {
                     ins.ins().fmin(a, b)
                 } else {
@@ -1318,8 +1320,16 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 };
                 let a_nan = ins.ins().fcmp(FloatCC::Unordered, a, a);
                 let b_nan = ins.ins().fcmp(FloatCC::Unordered, b, b);
+                let both_nan = ins.ins().band(a_nan, b_nan);
+                // `rvfd::CANONICAL_NAN_F64`/`_F32` (that module needs `ext-f`).
+                let canonical = if dbl {
+                    ins.ins().f64const(Ieee64::with_bits(0x7FF8_0000_0000_0000))
+                } else {
+                    ins.ins().f32const(Ieee32::with_bits(0x7FC0_0000))
+                };
                 let m = ins.ins().select(b_nan, a, m);
-                ins.ins().select(a_nan, b, m)
+                let m = ins.ins().select(a_nan, b, m);
+                ins.ins().select(both_nan, canonical, m)
             }
         };
         self.set_fval(rd, v);

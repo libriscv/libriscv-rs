@@ -12,7 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use super::classify::{JOp, classify};
+use super::classify::{JOp, classify, precise_rejects};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
 
 /// The most instructions in one region. Bounds the size of a single
@@ -105,27 +105,30 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
             break;
         };
         let ends_block = entry.block_bytes() == 0;
+        // The entry holds the rewriter's bits; classify the original.
+        let instr = exec.read_instruction(pc, end);
         // SYSTEM entries aren't compiled. Besides the real ones, that
         // keeps native code away from the breakpoints and hot-patched libc
         // functions (`native::libc`) that replace an entry's instruction.
         let op = if entry.invalid || entry.is_system() {
             None
         } else {
-            // The entry holds the rewriter's bits; classify the original.
-            classify(exec.read_instruction(pc, end), pc)
+            classify(instr, pc)
         };
         // Block-ending entries that aren't control flow are FUNCBLOCK
         // entries (over-long blocks). They run the precise handler, which
         // for everything `classify` accepts does what the fast one does
-        // (the fast handlers defer to it for their quirks), and then begin
-        // the next block like a jump would. The exception is the segment's
-        // last instruction in the 4-byte layout, whose block ends only
-        // because the segment does: it keeps its handler and falls through
-        // into the padding entry past the end. (With compressed
-        // instructions, the decoder force-ends it as invalid instead.)
+        // (the fast handlers defer to it for their quirks), apart from the
+        // encodings of `precise_rejects`, and then begin the next block like
+        // a jump would. The exception is the segment's last instruction in
+        // the 4-byte layout, whose block ends only because the segment
+        // does: it keeps its handler and falls through into the padding
+        // entry past the end. (With compressed instructions, the decoder
+        // force-ends it as invalid instead.)
         let op = op.filter(|op| !op.is_terminator() || ends_block);
         let last = pc.wrapping_add(len) >= end;
         let funcblock = ends_block && !last && op.is_some_and(|op| !op.is_terminator());
+        let op = op.filter(|_| !(funcblock && precise_rejects(instr)));
         if let (Some(op), Some(slot)) = (op, by_index.get_mut(index)) {
             *slot = Some(insns.len() as u32);
             insns.push(Insn {

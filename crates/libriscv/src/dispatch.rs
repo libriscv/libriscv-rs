@@ -589,13 +589,17 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                 // C++ asmjit `execute_counted_dyncall`: the handler sees the
                 // exact PC, the counter and the limit, and what it does to
                 // them takes effect right after it.
+                let visible_max = m.dispatch.visible_max(c.max);
                 m.cpu.regs.pc = pc;
                 m.counter = counter;
-                m.max_counter = m.dispatch.visible_max(c.max);
+                m.max_counter = visible_max;
                 let instr = Instr(exec.read_u32(pc));
                 if let Err(err) = crate::isa::rvi::Custom::exec(m, instr) {
                     return fault(m, err);
                 }
+                // The handler stopped the machine, penalized it or changed
+                // its limit.
+                let touched = m.counter != counter || m.max_counter != visible_max;
                 c = Counter {
                     value: m.counter,
                     max: m.dispatch.chain_max(m.max_counter),
@@ -612,20 +616,35 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                 } else {
                     c.value.wrapping_sub(crate::jit::block_icount(exec, next))
                 };
-                if c.overflowed() {
-                    return halt(
-                        m,
-                        next,
-                        Counter {
-                            value: retired,
-                            max: c.max,
-                        },
-                    );
+                let halt_after = Counter {
+                    value: retired,
+                    max: c.max,
+                };
+                // A handler that stopped or penalized the machine (or
+                // lowered its limit) takes effect right after it.
+                if touched && c.overflowed() {
+                    return halt(m, next, halt_after);
                 }
-                // The handler may have made the segment stale: leave it, like
-                // the interpreter's FUNCTION handler.
+                // Otherwise, what the interpreter's FUNCTION and FUNCBLOCK
+                // handlers do after the instruction. First, the handler may
+                // have made the segment stale: leave it.
                 if exec.is_stale() {
                     return leave_segment(m, next, c);
+                }
+                // The segment's last instruction in the 4-byte layout: its
+                // block ends only because the segment does, and FUNCTION
+                // falls through into the padding entry after it, without
+                // counting it or checking the limit. (With compressed
+                // instructions the decoder makes that instruction invalid,
+                // so it is never compiled.)
+                if ends_block && !exec.is_within(next, 2) {
+                    execute!(exec, cache, exec.index(next), m, pc, c)
+                }
+                // FUNCBLOCK checks the limit before the next block. In the
+                // middle of a block, the limit is only checked at its end, so
+                // the block's count crossing it is no reason to stop here.
+                if ends_block && c.overflowed() {
+                    return halt(m, next, halt_after);
                 }
                 let si = exec.index(next);
                 if exec.is_within(next, 2) && jit.has_entry(si) {

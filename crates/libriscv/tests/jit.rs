@@ -25,7 +25,7 @@
     clippy::indexing_slicing
 )]
 
-use libriscv::{ExceptionKind, Machine, MachineOptions};
+use libriscv::{Dyncall, ExceptionKind, Instr, Machine, MachineOptions};
 
 const V: u64 = 0x10000;
 const SCRATCH: u64 = 0x40000;
@@ -548,6 +548,127 @@ fn funcblock_entries_stay_native() {
     fuels.extend([1999, 2000, 2001, 5000]);
     let entries = compare(&words(&program), &regs, &fuels, "funcblock");
     assert!(entries > 0, "nothing was compiled");
+}
+
+/// FUNCBLOCK entries run the precise handler, which rejects FMADD with the
+/// H and Q formats (a no-op in the fast path): native code must leave such
+/// an entry to the interpreter.
+#[test]
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+fn funcblock_fmadd_hq_faults_like_the_interpreter() {
+    let nop = itype(0x13, 0, 0, 0, 0);
+    let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
+    for fmt in [2, 3] {
+        let fmadd = r4(0x43, fmt, 0, 1, 2, 3, 4);
+        // The FUNCBLOCK entry: with compressed instructions the 128th
+        // 4-byte instruction of a block (255 halfwords in), without them
+        // the one 65535 instructions before the block's end.
+        let mut program = Vec::new();
+        if cfg!(feature = "ext-c") {
+            program.extend([nop; 127]);
+            program.extend([fmadd, addi]);
+        } else {
+            program.push(fmadd);
+            program.extend(vec![addi; 65534]);
+        }
+        program.push(jtype(0, 0)); // j .
+        let code = words(&program);
+        let interpreted = run(&mut machine(&code, false), &[0; 64], 100_000);
+        assert_eq!(
+            interpreted.result,
+            Err((ExceptionKind::IllegalOperation, 0)),
+            "fmt {fmt}: not a FUNCBLOCK entry"
+        );
+        let fuels = [0, 1, 2, 100, 127, 128, 129, 130, 1000, 100_000];
+        let entries = compare(&code, &[0; 64], &fuels, &format!("fmadd fmt {fmt}"));
+        assert!(entries > 0, "nothing was compiled");
+    }
+}
+
+/// FMIN/FMAX: two NaN operands give the canonical NaN (whatever their
+/// payloads), one gives the other operand, as in the interpreter.
+#[test]
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+fn fmin_fmax_of_two_nans_is_canonical() {
+    let program = [
+        fp(0x05, 1, 0, 1, 2, 3),   // fmin.d f1, f2, f3
+        fp(0x05, 1, 1, 4, 2, 3),   // fmax.d f4, f2, f3
+        fp(0x05, 0, 0, 5, 6, 7),   // fmin.s f5, f6, f7
+        fp(0x05, 0, 1, 8, 6, 7),   // fmax.s f8, f6, f7
+        fp(0x05, 1, 0, 9, 2, 10),  // fmin.d f9, f2, f10
+        fp(0x05, 0, 1, 11, 6, 12), // fmax.s f11, f6, f12
+        jtype(0, 0),
+    ];
+    let mut regs = [0u64; 64];
+    regs[32 + 2] = 0x7FF0_0000_0000_0001; // signaling NaN
+    regs[32 + 3] = 0xFFF8_0000_0000_0002; // negative quiet NaN with a payload
+    regs[32 + 6] = 0xFFFF_FFFF_7F80_0001;
+    regs[32 + 7] = 0xFFFF_FFFF_FFC0_0002;
+    regs[32 + 10] = 1.5f64.to_bits();
+    regs[32 + 12] = 0xFFFF_FFFF_0000_0000 | u64::from((-2.5f32).to_bits());
+    let code = words(&program);
+    let mut jit = machine(&code, true);
+    assert!(jit.cpu.current_execute_segment().jit_entry_count() > 0);
+    let expected = run(&mut machine(&code, false), &regs, 100);
+    let got = run(&mut jit, &regs, 100);
+    assert_eq!(got.fregs[1], 0x7FF8_0000_0000_0000);
+    assert_eq!(got.fregs[5] as u32, 0x7FC0_0000);
+    assert_eq!(got.fregs[9], 1.5f64.to_bits());
+    assert!(got == expected, "{}", describe(&got, &expected));
+}
+
+/// The dyncall handler of [`dyncall_machine`]: leaves the counters alone.
+fn dyncall_handler(m: &mut Machine, _: Instr) -> libriscv::Result<()> {
+    let a1 = m.cpu.reg(11);
+    m.cpu.set_reg(11, a1.wrapping_mul(3).wrapping_add(1000));
+    Ok(())
+}
+
+fn dyncall_machine(code: &[u8], jit: bool) -> Machine {
+    let mut m = machine(code, jit);
+    m.set_on_unimplemented_instruction(|i| Dyncall::valid(i.whole()).then_some(dyncall_handler));
+    m
+}
+
+/// [`compare`] with [`dyncall_handler`] installed in both machines.
+fn compare_dyncalls(code: &[u8], what: &str) {
+    let mut interp = dyncall_machine(code, false);
+    let mut jit = dyncall_machine(code, true);
+    assert!(jit.cpu.current_execute_segment().jit_entry_count() > 0);
+    for fuel in fuels() {
+        let expected = run(&mut interp, &[0; 64], fuel);
+        let got = run(&mut jit, &[0; 64], fuel);
+        if got != expected {
+            panic!("{what}, fuel {fuel}:\n{}", describe(&got, &expected));
+        }
+    }
+}
+
+/// A dyncall that leaves the counters alone doesn't stop native code: a
+/// block whose count crosses the limit runs to its end, where the
+/// interpreter checks it.
+#[test]
+fn dyncalls_mid_block_check_the_limit_at_the_block_end() {
+    let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
+    let dyncall = Dyncall::encode(500, 1, 1, false);
+    let mut program = vec![itype(0x13, 0, 6, 0, 5)]; // li t1, 5
+    program.extend([addi; 3]);
+    program.push(dyncall);
+    program.extend([addi; 5]);
+    program.push(itype(0x13, 0, 6, 6, -1)); // addi t1, t1, -1
+    program.push(btype(1, 6, 0, -40)); // bnez t1, loop
+    program.push(jtype(0, 0)); // j .
+    compare_dyncalls(&words(&program), "dyncall mid-block");
+}
+
+/// A dyncall as the segment's last instruction: in the 4-byte layout the
+/// interpreter falls through into the padding entry, uncounted and without
+/// a limit check. (With compressed instructions it is invalid.)
+#[test]
+fn dyncall_at_the_segment_end_matches_the_interpreter() {
+    let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
+    let dyncall = Dyncall::encode(500, 1, 1, false);
+    compare_dyncalls(&words(&[addi, addi, dyncall]), "dyncall at the end");
 }
 
 #[test]

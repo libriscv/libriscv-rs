@@ -651,6 +651,22 @@ pub(crate) fn classify(i: Instr, pc: u64) -> Option<JOp> {
     }
 }
 
+/// True if the precise handler of `i` rejects an encoding [`classify`]
+/// accepts. `classify` follows the fast handlers, and FUNCBLOCK entries run
+/// the precise one instead, so these can't be compiled there. The only case
+/// is FMADD with the H or Q format: a no-op in the fast path
+/// (`FMaddFast`), an illegal instruction in the precise one (`FMadd`).
+#[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+pub(crate) fn precise_rejects(i: Instr) -> bool {
+    i.opcode() == FMADD && (i.whole() >> 25) & 0x3 >= 2
+}
+
+/// [`precise_rejects`] without compiled F/D: nothing else differs.
+#[cfg(not(all(feature = "ext-f", not(feature = "debug-checks"))))]
+pub(crate) const fn precise_rejects(_i: Instr) -> bool {
+    false
+}
+
 #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
 /// The F/D half of [`classify`]: the fast-path handlers of
 /// `decode::fast_handler`, then `decode_float` and the `rvfd` handlers.
