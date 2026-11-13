@@ -10,7 +10,8 @@
 #   ./do_fuzz.sh vmfuzzer -- -fork=16              # 16 worker processes
 #
 # Environment:
-#   FUZZ_FLAGS     cargo-fuzz flags (default: "-s none -a", see README.md)
+#   FUZZ_FLAGS     cargo-fuzz flags (default: "-s none -a", see README.md;
+#                  jitdifffuzzer adds --features jit)
 #   LIBRISCV_CPP   C++ libriscv checkout, for the ELF seeds (default ../../libriscv)
 set -e
 
@@ -40,5 +41,20 @@ if [ "$TARGET" = "elffuzzer" ]; then
 	CORPUS=(corpus/elffuzzer seeds/elffuzzer)
 fi
 
+FLAGS="${FUZZ_FLAGS:--s none -a}"
+if [ "$TARGET" = "jitdifffuzzer" ] && [[ "$FLAGS" != *jit* ]]; then
+	# Its own target directory: rebuilding the shared one with the JIT
+	# would switch every other target to the JIT too (fork mode re-runs
+	# the binary for each job).
+	FLAGS="$FLAGS --features jit --target-dir target/jit"
+fi
+
+# Instruction words, system call numbers, sandbox paths and guest pointers
+# the target needs (see dicts/). Passed first, so a later -dict= wins.
+DICT=()
+if [ -f "dicts/$TARGET.dict" ]; then
+	DICT=("-dict=dicts/$TARGET.dict")
+fi
+
 # shellcheck disable=SC2086
-exec cargo fuzz run ${FUZZ_FLAGS:--s none -a} "$TARGET" "${CORPUS[@]}" -- "$@"
+exec cargo fuzz run $FLAGS "$TARGET" "${CORPUS[@]}" -- "${DICT[@]}" "$@"
