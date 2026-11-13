@@ -2,10 +2,14 @@
 //! page, the guard page and the host code page).
 //!
 //! C++ pages hold a `unique_ptr<PageData>` that may be *non-owning*: arena
-//! pages point into the flat arena, and the shared pages point at static
-//! data. Here the page data is an enum instead, so no page ever aliases
-//! another: [`PageData::Arena`] means "the bytes are in the arena at this
-//! page's address", and the shared pages are `'static` arrays.
+//! pages point into the flat arena, the shared pages point at static data,
+//! and a fork's pages point at its master's. Here the page data is an enum
+//! instead: [`PageData::Arena`] means "the bytes are in the arena at this
+//! page's address", the shared pages are `'static` arrays, and a page's
+//! own bytes are reference counted, so that a fork can share them with its
+//! master until either side writes (see `Memory::fork`).
+
+use std::sync::Arc;
 
 use super::PAGE_SIZE;
 
@@ -51,7 +55,7 @@ pub struct PageAttributes {
     pub exec: bool,
     /// Writing makes a private copy first (the page is read-only until then).
     pub is_cow: bool,
-    /// Skipped when forking (Phase 3).
+    /// Not shared with forks: the page is missing in a fork.
     pub dont_fork: bool,
     /// Free for the embedder.
     pub user_defined: u8,
@@ -118,8 +122,14 @@ pub(crate) enum PageData {
     /// In the flat arena, at the page's own address (C++: a non-owning page
     /// loaned from the arena).
     Arena,
-    /// A page of its own.
-    Owned(Box<PageBytes>),
+    /// A page of its own (C++: an owning page). Forks of this machine hold
+    /// the same bytes until either side writes to them: a write to bytes
+    /// that are shared makes a private copy first (`Arc::make_mut`).
+    Owned(Arc<PageBytes>),
+    /// Another machine's page, loaned to a fork (C++: a non-owning page
+    /// pointing at the master's data). Never written in place: it becomes
+    /// `Owned` first.
+    Loaned(Arc<PageBytes>),
     /// The shared zero page (C++ `cow_page`/`guard_page` data).
     Zero,
     /// The shared host code page.
@@ -142,6 +152,11 @@ impl Page {
     /// C++ `!attr.non_owning`: the page has its own data.
     pub(crate) const fn is_owned(&self) -> bool {
         matches!(self.data, PageData::Owned(_))
+    }
+
+    /// The page shows another machine's data (a fork's loaned page).
+    pub(crate) const fn is_loaned(&self) -> bool {
+        matches!(self.data, PageData::Loaned(_))
     }
 
     /// Human-readable protections (C++ `Page::to_string`).

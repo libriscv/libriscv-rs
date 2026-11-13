@@ -19,10 +19,9 @@ mod classify;
 mod emit;
 mod region;
 
-use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-
 use libriscv_jit_rt::{CodeMemory, JitState};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub(crate) use emit::Compiled;
 
@@ -68,7 +67,9 @@ pub(crate) struct JitSegment {
 #[derive(Debug)]
 pub(crate) struct BackgroundJit {
     pub(crate) segment: Arc<DecodedSegment>,
-    result: Receiver<Option<Compiled>>,
+    /// In a mutex only to keep `Machine` `Sync`; it is never locked
+    /// (`poll` takes `&mut self`).
+    result: Mutex<Receiver<Option<Compiled>>>,
     /// Keeps a test job's channel open forever.
     #[cfg(test)]
     _never: Option<mpsc::SyncSender<Option<Compiled>>>,
@@ -104,7 +105,7 @@ impl BackgroundJit {
         };
         Self {
             segment: Arc::clone(segment),
-            result,
+            result: Mutex::new(result),
             #[cfg(test)]
             _never: None,
         }
@@ -116,17 +117,21 @@ impl BackgroundJit {
         let (tx, rx) = mpsc::sync_channel(1);
         Self {
             segment: Arc::clone(segment),
-            result: rx,
+            result: Mutex::new(rx),
             _never: Some(tx),
         }
     }
 
     /// Poll for the result, or with `wait`, block until it's there.
-    pub(crate) fn poll(&self, wait: bool) -> BackgroundResult {
+    pub(crate) fn poll(&mut self, wait: bool) -> BackgroundResult {
+        let result = self
+            .result
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
         if wait {
-            return BackgroundResult::Done(self.result.recv().ok().flatten());
+            return BackgroundResult::Done(result.recv().ok().flatten());
         }
-        match self.result.try_recv() {
+        match result.try_recv() {
             Ok(compiled) => BackgroundResult::Done(compiled),
             Err(TryRecvError::Empty) => BackgroundResult::Pending,
             Err(TryRecvError::Disconnected) => BackgroundResult::Done(None),

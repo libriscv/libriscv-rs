@@ -15,11 +15,11 @@ use std::io;
 
 /// Decides whether a path may be opened, and may rewrite it
 /// (C++ `filter_open` / `filter_readlink`).
-pub type PathFilter = Box<dyn FnMut(&mut String) -> bool + Send>;
+pub type PathFilter = Box<dyn FnMut(&mut String) -> bool + Send + Sync>;
 /// Decides whether a path may be inspected (C++ `filter_stat`).
-pub type StatFilter = Box<dyn FnMut(&str) -> bool + Send>;
+pub type StatFilter = Box<dyn FnMut(&str) -> bool + Send + Sync>;
 /// Decides whether an ioctl request is allowed (C++ `filter_ioctl`).
-pub type IoctlFilter = Box<dyn FnMut(u64) -> bool + Send>;
+pub type IoctlFilter = Box<dyn FnMut(u64) -> bool + Send + Sync>;
 
 /// An open guest file.
 #[derive(Debug)]

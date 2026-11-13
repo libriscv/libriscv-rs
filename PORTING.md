@@ -111,8 +111,9 @@ To decide at the start of the phase that needs them (recommendation given):
   disjointly. Avoid `Box<dyn Any>` downcasts on the hot path.
 - **Floating point.** Use `f32`/`f64` with explicit NaN-boxing helpers
   (`rvfd.hpp`). Rounding modes/flags only under the `fcsr` feature, like C++.
-- **Threads/fork.** No global state; `Machine` should be `Send`. Fork shares
-  read-only pages via `Arc`.
+- **Threads/fork.** No global state; `Machine` is `Send + Sync` (checked
+  at compile time), so a machine shared between threads can be forked
+  from. Fork shares pages via `Arc` (decided in Phase 3, see "Fork").
 
 ## Toolchain
 
@@ -435,15 +436,33 @@ what native code would have.
 `memory.cpp`, `memory_rw.cpp`, `memory_helpers_paging.hpp`,
 `memory_inline_pages.hpp` and `page.hpp`.
 
-- **Page table:** `BTreeMap<page number, Page>`. A `Page` is attributes
+- **Page table:** `BTreeMap<page number, slot>` into a `Vec` of slots
+  holding `(page number, Page)`; a page keeps its slot while it is in the
+  table. A `Page` is attributes
   (`PageAttributes`: read/write/exec, copy-on-write, `dont_fork`, a user
   byte) plus where its bytes are: `Arena` (C++: a non-owning page loaned
   from the arena), `Owned(Box<[u8; 4096]>)`, or one of the shared static
   pages, `Zero` (C++ `cow_page`/`guard_page`) and `Host` (C++
-  `host_page`: the exit function and signal trampoline). Pages never alias
-  each other, so there is no `unsafe` and no lifetime juggling; range
-  operations (`free_pages`, attribute changes and discards of huge ranges)
-  are `BTreeMap::range` walks.
+  `host_page`: the exit function and signal trampoline). Owned bytes are
+  an `Arc<[u8; 4096]>`, shared with forks (`Loaned` on their side) until
+  one side writes: a write goes through `Arc::make_mut`, so no write ever
+  reaches bytes another page shows, and there is no `unsafe` and no
+  lifetime juggling. Range operations (`free_pages`, attribute changes and
+  discards of huge ranges) are `BTreeMap::range` walks.
+- **Page cache** (C++ `m_rd_cache`/`m_wr_cache`, `cached_readable_page`,
+  `cached_writable_page`): 512 direct-mapped entries (`pageno % 512`),
+  each the slot of the page last looked up there, as a relaxed
+  `AtomicUsize` (filled through `&self`, like C++'s `mutable` caches,
+  while keeping `Memory` `Sync`). Every lookup tries it before the B-tree.
+  A hit checks the slot's page number, and loads/stores check the page's
+  read/write permission, so the cache can't go stale and nothing
+  invalidates it (C++ caches page pointers and invalidates them at every
+  CoW, protection change, discard and free, a recurring source of bugs).
+  C++ has one entry for reads and one for writes in front of a hash map;
+  here a miss costs a B-tree lookup, so the cache is larger, and a guest
+  can't push lookups past the B-tree's logarithm (a hash keyed by guest
+  page numbers could be flooded). Without an arena (forks), every load
+  and store takes this path; see "Fork" for numbers.
 - **Arena pages:** C++ creates an arena page table entry whenever a slow
   path first touches the page. Here only arena pages with non-default
   attributes get an entry; a bitmap (one bit per arena page) records which
@@ -491,16 +510,14 @@ jumped to. Instruction counts match the oracle exactly, also for `dlopen`.
 
 Not ported yet: custom page fault/read/write handlers and execute fault
 handlers (embedding API, Phase 3), memory traps (`RISCV_MEMORY_TRAPS`,
-Phase 5), CoW pages for `fork` (Phase 3), `insert_non_owned_memory`, and
-the read/write page caches (a C++ performance detail; the page table is
-consulted directly, and only on the slow path).
+Phase 5) and `insert_non_owned_memory`.
 
 ## Testing
 
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` and preemption (restoring, clobbering, errors, shared budget, nested under background JIT) |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
 | Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits) |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
@@ -620,6 +637,68 @@ C++ behaviour kept for parity:
   after any handler that changes PC.
 - `default_exit_function`: when the symbol exists, the host page (with
   the signal return trampoline) isn't installed.
+
+### Fork
+
+`Machine::fork_with(&self, options)` ports the forking constructor
+`Machine(const Machine&, MachineOptions)` (`fork()` uses the master's own
+options; C++'s default is `MachineOptions{}`). The fork copies the
+registers, instruction counter and limit, threads, program layout, mmap
+free list and LR/SC reservation, and shares the execute segments and the
+system call table (an `Arc`, copied when either side installs a handler;
+C++'s table is per process). Like C++, it gets the default printer, stdin
+and rdtime, no file descriptors and no signal handlers.
+
+Memory (`Memory::fork`, C++ `machine_loader`): every page except
+`dont_fork` ones is loaned. Its slot keeps its number, so the fork clones
+the page index as is and maps the slots, an `Arc` increment each;
+writable pages become copy-on-write in the fork. `minimal_fork` loans
+nothing (C++ then also has no page fault handler, expecting a custom one,
+which isn't ported; here the default handler gives zero pages). A fork
+has no arena. Forking a machine that has one with `use_memory_arena` set
+is `ILLEGAL_OPERATION`, as in C++. Without it, the fork gets copies of
+the arena pages C++ has in its page table (C++ loans them out of the
+master's arena) and, like C++, doesn't see arena pages only guest
+loads/stores touched. Machines meant for forking are created with
+`use_memory_arena: false`.
+
+Deliberate differences, all stricter than C++:
+
+- **Forks are snapshots.** The master may run, change and be dropped
+  while forks exist (C++: it must outlive its forks and mostly not
+  change); a write to bytes a fork shares copies them first, on either
+  side. Forks of forks work the same way.
+- A loaned page made writable in a fork (`mprotect`) is copy-on-write,
+  and `madvise(MADV_DONTNEED)` of a read-only loaned page zeroes a copy.
+  C++ writes the master's page in both cases.
+- Segments still compiling in the background in the master stay
+  interpreted in the fork (`wait_for_jit()` before forking avoids that).
+  JIT code compiled for the master's N-bit arena never runs in a fork
+  (`libriscv-jit-rt` refuses it, so it's interpreted).
+
+Not ported: C++'s shared execute segments (Phase 4), so an execute
+segment a fork creates (e.g. the host exit page on its first VM call,
+if the master never made one) is decoded again by every fork. Do one VM
+call on the master before forking.
+
+`crates/libriscv/benches/fork.rs` against the same scenario in C++
+(Release, threaded dispatch; master: static glibc, 637 pages), per
+operation:
+
+| | Rust | C++ |
+|---|---|---|
+| fork + drop | 6.3 µs | 15.2 µs |
+| fork + VM call writing 1 page | 6.4 µs | 14.9 µs |
+| fork + VM call writing 64 pages | 13.2 µs | 20.8 µs |
+| fork + VM call reading 2 MiB | 1.64 ms | 1.50 ms |
+| random read-modify-write over 512 pages (per iteration) | 22.9 ns | 30.3 ns |
+
+Before the page cache, the last two were 3.44 ms and 84 ns. The
+copy-on-write row depends on glibc: when a dropped fork's pages coalesce
+at the top of the heap, glibc trims it and the next fork faults them in
+again (64 pages: 36 µs), unless its dynamic trim threshold was raised
+earlier by freeing a large `mmap`ed block, as the C++ harness happens to
+do. The bench does that first (`FORK_BENCH_NO_WARMUP=1` skips it).
 
 ### Linux system calls
 
@@ -745,9 +824,9 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] `PreparedCall` (`prepared_call.hpp`)
 - [ ] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push`
 - [ ] Printer / stdin / rdtime hooks
-- [ ] Fork with CoW, `reset()` (`memory.cpp`)
+- [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
-- [ ] Ports of `tests/unit/{custom,dynamic,exceptions,examples,checksum,crc32c,pcrel,png,rvbuffer}.cpp` (`vmcall.cpp`: done except the fork case, `tests/vmcall.rs`)
+- [ ] Ports of `tests/unit/{custom,dynamic,exceptions,examples,checksum,crc32c,pcrel,png,rvbuffer}.cpp` (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
 
 ### Phase 4 — Performance
 
@@ -774,7 +853,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Disassembler (`rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp`)
 - [ ] CLI debugger (`debug.cpp`, `debug.hpp`)
 - [ ] GDB RSP server (`rsp_server.hpp`, `linux/rsp_server.hpp`)
-- [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging". Page caches (`cached_address.hpp`) not ported
+- [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging" (page caches included)
 - [ ] Memory traps (`RISCV_MEMORY_TRAPS`)
 - [ ] Sockets, epoll, poll, select (`posix/socket_calls.cpp`, `linux/syscalls_{epoll,poll,select}.cpp`)
 - [ ] Fuzzing harness
@@ -790,20 +869,21 @@ phase starts; names below are the intended targets.
 | `common.hpp` (`MachineOptions`) | `options.rs` | 0 | ✅ (interpreter subset) |
 | `rv32i_instr.hpp` | `instruction.rs` | 0 | ✅ |
 | `elf.hpp`, `memory_elf.cpp` | `elf.rs`, `memory/loader.rs` | 1 | ✅ (symbol listing/lookup for backtraces: Phase 3) |
-| `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp` | `memory/` | 1, 5 | ✅ arena + paging (fork/serialization: Phase 3) |
+| `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp` | `memory/` | 1, 3, 5 | ✅ arena + paging + fork (serialization: Phase 3) |
 | `page.hpp` | `memory/page.rs` | 5 | ✅ (memory traps: Phase 5) |
 | `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | ✅ (+ flat-arena `memdiscard`, `memstring`, `flush_execute_segments`) |
-| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `cached_address.hpp` | `memory/paging.rs` | 5 | ✅ (no page caches) |
+| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp` | `memory/paging.rs` | 3, 5 | ✅ incl. page caches and fork page tables |
+| `cached_address.hpp` (`CachedAddress`) | — | 3 | not yet (a cached `address_of`) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
-| `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate) |
+| `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅ |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | ✅ `vmcall`/`preempt` (`PreparedCall`: not yet) |
 | `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMAFDC + Zcb + B + Zfhmin/Zfa (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
 | `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1–2 | ✅ I + M + Zba/Zbb/Zbc/Zbs/Zicond/Zbkb (Zbkb's ZIP/UNZIP are RV32-only and unimplemented, as in C++) |
 | `rvc.hpp`, `rvc_instr.cpp` | `instruction.rs` (`CInstr`), `isa/rvc.rs` | 2 | ✅ RV64 C + Zcb |
-| `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (copying the reservation on fork/deserialize: Phase 3) |
+| `rva.hpp`, `rva_instr.cpp` | `isa/rva.rs` | 2 | ✅ RV64 (the reservation is copied on fork; on deserialize: Phase 3) |
 | `rvfd.hpp`, `rvfd_util.hpp`, `rvf_instr.cpp`, `fp16.hpp` | `isa/rvfd.rs` | 2 | ✅ F, D, Zfhmin, Zfa (RV64), NaN-boxing under `debug-checks` (FCSR emulation: not ported) |
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
 | `rvi_fuse.cpp` | — | — | dead code in C++ (`try_fuse` is never called) |

@@ -33,6 +33,17 @@ impl Cpu {
         }
     }
 
+    /// Port of the forking `CPU(Machine&, const Machine&, MachineOptions)`
+    /// constructor: the same registers and execute segment. (Vector
+    /// registers, and with them `preserve_vector_registers`, are Phase 5.)
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            regs: self.regs.clone(),
+            exec: Arc::clone(&self.exec),
+            stale_restart_pc: self.stale_restart_pc,
+        }
+    }
+
     pub const fn registers(&self) -> &Registers {
         &self.regs
     }

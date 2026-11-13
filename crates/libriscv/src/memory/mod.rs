@@ -78,6 +78,8 @@ pub struct Memory {
     is_dynamic: bool,
 
     binary: Arc<[u8]>,
+    /// Created by `fork` (C++ `!m_original_machine`).
+    forked: bool,
 
     main_exec: Option<Arc<DecodedSegment>>,
     /// Further execute segments. Slots can be empty after an eviction, and
@@ -220,6 +222,7 @@ impl Memory {
             brk_address: 0,
             is_dynamic: false,
             binary,
+            forked: false,
             main_exec: None,
             exec: Vec::new(),
             #[cfg(feature = "jit")]
@@ -242,6 +245,67 @@ impl Memory {
             first_segment = memory.binary_loader(options)?;
         }
         Ok((memory, first_segment))
+    }
+
+    /// Port of the forking `Memory(Machine&, const Machine&, MachineOptions)`
+    /// constructor and `machine_loader`: a memory that loans every page of
+    /// this one (see `fork_page_table`) and shares its program layout and
+    /// execute segments.
+    ///
+    /// A fork has no arena; with `options.use_memory_arena` set, forking a
+    /// memory that has one is an `ILLEGAL_OPERATION` error, as in C++.
+    /// Forks are meant to be made from machines created without an arena
+    /// (`use_memory_arena: false`), whose memory is all pages.
+    pub(crate) fn fork(&self, options: &MachineOptions) -> Result<Self> {
+        if options.use_memory_arena && self.uses_flat_memory_arena() {
+            return Err(MachineError::new(
+                ExceptionKind::IllegalOperation,
+                "Forked machines cannot use a non-empty flat memory arena",
+                self.memory_arena_size(),
+            ));
+        }
+        Ok(Self {
+            // No arena: the windows below are empty, so it is never read.
+            arena: Vec::new(),
+            arena_size: 0,
+            arena_pages: 0,
+            paging: self.fork_page_table(options.minimal_fork),
+            max_exec_pages: self.max_exec_pages,
+            read_boundary: 0,
+            write_boundary: 0,
+            initial_rodata_end: 0,
+            start_address: self.start_address,
+            stack_address: self.stack_address,
+            exit_address: self.exit_address,
+            sigreturn_address: self.sigreturn_address,
+            mmap_address: self.mmap_address,
+            mmap_cache: self.mmap_cache.clone(),
+            heap_address: self.heap_address,
+            brk_address: self.brk_address,
+            is_dynamic: self.is_dynamic,
+            binary: Arc::clone(&self.binary),
+            forked: true,
+            // The same execute segments. Segments still compiling in the
+            // background here stay interpreted in the fork.
+            main_exec: self.main_exec.clone(),
+            exec: self.exec.clone(),
+            #[cfg(feature = "jit")]
+            jit: options.jit,
+            #[cfg(feature = "jit")]
+            jit_background: options.jit_background,
+            #[cfg(feature = "jit")]
+            jit_arena_mask: 0,
+            #[cfg(feature = "jit")]
+            jit_pending: Vec::new(),
+            #[cfg(feature = "ext-a")]
+            atomics: self.atomics,
+        })
+    }
+
+    /// True if this memory was created by forking another (C++
+    /// `is_forked`).
+    pub const fn is_forked(&self) -> bool {
+        self.forked
     }
 
     read_write! {
@@ -456,7 +520,7 @@ impl Memory {
         use crate::jit::{BackgroundResult, JitSegment};
         let mut replaced = Vec::new();
         let mut still_pending = Vec::new();
-        for job in std::mem::take(&mut self.jit_pending) {
+        for mut job in std::mem::take(&mut self.jit_pending) {
             let compiled = match job.poll(wait) {
                 BackgroundResult::Pending => {
                     still_pending.push(job);

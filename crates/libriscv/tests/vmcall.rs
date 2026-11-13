@@ -3,8 +3,6 @@
 //! `default_exit_function` and nested runs under background JIT
 //! compilation.
 //!
-//! "VM function call in fork" needs fork (Phase 3); its argument-passing
-//! checks run on a plain machine here (`argument_types`).
 
 #![allow(
     clippy::panic,
@@ -263,6 +261,106 @@ fn argument_types() {
             .unwrap(),
         5
     );
+}
+
+#[test]
+fn vm_function_call_in_fork() {
+    // The global variable 'value' should get forked as value=1. We assert
+    // this, then we set value=0. New forks should continue to see value=1
+    // as they are forked from the main VM where value is still 1.
+    if !testutil::need_compiler() {
+        return;
+    }
+    let binary = build(
+        r#"
+	#include <assert.h>
+	#include <string.h>
+	extern long write(int, const void*, unsigned long);
+	static int value = 0;
+
+	__attribute__((used, retain))
+	void hello() {
+		assert(value == 1);
+		value = 0;
+		write(1, "Hello World!", 12);
+	}
+
+	__attribute__((used, retain))
+	int str(const char *arg) {
+		assert(strcmp(arg, "Hello") == 0);
+		return 1;
+	}
+
+	struct Data {
+		int val1;
+		int val2;
+		float f1;
+	};
+	__attribute__((used, retain))
+	int structs(struct Data *data) {
+		assert(data->val1 == 1);
+		assert(data->val2 == 2);
+		assert(data->f1 == 3.0f);
+		return 2;
+	}
+
+	__attribute__((used, retain))
+	int ints(long i1, long i2, long i3) {
+		assert(i1 == 123);
+		assert(i2 == 456);
+		assert(i3 == 456);
+		return 3;
+	}
+
+	__attribute__((used, retain))
+	int fps(float f1, double d1) {
+		assert(f1 == 1.0f);
+		assert(d1 == 2.0);
+		return 4;
+	}
+
+	int main() {
+		value = 1;
+		return 666;
+	}"#,
+    );
+    // The forking constructor does not support a flat arena.
+    let mut machine = machine_with(
+        &binary,
+        MachineOptions {
+            use_memory_arena: false,
+            ..Default::default()
+        },
+    );
+    machine.simulate(MAX_INSTRUCTIONS).unwrap();
+    assert_eq!(machine.return_value() as i32, 666);
+
+    // Test many forks
+    for _ in 0..10 {
+        let mut fork = machine.fork().unwrap();
+        assert!(!fork.memory.uses_flat_memory_arena());
+
+        HELLO_WORLD.set(false);
+        fork.set_printer(hello_printer);
+
+        let hello_address = fork.address_of("hello").unwrap();
+        assert_ne!(hello_address, 0);
+
+        // Execute guest function
+        fork.vmcall(hello_address, ()).unwrap();
+        assert!(hello_world());
+
+        assert_eq!(fork.vmcall("str", "Hello").unwrap(), 1);
+        assert_eq!(fork.vmcall("str", String::from("Hello")).unwrap(), 1);
+        let hello = String::from("Hello");
+        assert_eq!(fork.vmcall("str", &hello).unwrap(), 1);
+
+        assert_eq!(fork.vmcall("structs", OnStack(Data(1, 2, 3.0))).unwrap(), 2);
+
+        let intval: i64 = 456;
+        assert_eq!(fork.vmcall("ints", (123i64, intval, &intval)).unwrap(), 3);
+        assert_eq!(fork.vmcall("fps", (1.0f32, 2.0f64)).unwrap(), 4);
+    }
 }
 
 /// C++ `struct Data { int val1; int val2; float f1; }`.

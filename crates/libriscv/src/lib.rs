@@ -118,3 +118,10 @@ pub const COMPRESSED_ENABLED: bool = decoder_cache::COMPRESSED;
 /// C++ `vector_extension`: the vector register size in bytes, or 0 without
 /// the `ext-v` feature.
 pub const VECTOR_EXTENSION: u32 = if cfg!(feature = "ext-v") { 32 } else { 0 };
+
+// A machine can be moved to another thread, and shared between threads to
+// fork from (`Machine::fork` takes `&self`).
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Machine>();
+};

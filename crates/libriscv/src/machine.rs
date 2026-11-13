@@ -11,8 +11,7 @@
 //!
 //! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
 //! `signals.rs`, VM calls in `vmcall.rs`. Not ported yet: typed `sysargs`,
-//! userdata, fork and serialization (Phase 3) and the native heap
-//! (Phase 5).
+//! userdata and serialization (Phase 3) and the native heap (Phase 5).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -48,7 +47,8 @@ pub struct Machine {
     pub(crate) counter: u64,
     pub(crate) max_counter: u64,
     options: MachineOptions,
-    syscall_handlers: Box<[SyscallHandler; SYSCALLS_MAX]>,
+    /// Shared with forks until either side installs a handler.
+    syscall_handlers: Arc<[SyscallHandler; SYSCALLS_MAX]>,
     on_unhandled_syscall: UnhandledSyscall,
     on_unhandled_csr: UnhandledCsr,
     printer: Printer,
@@ -95,6 +95,11 @@ fn default_printer(_: &Machine, data: &[u8]) {
     let _ = out.flush();
 }
 
+/// Default: no input.
+const fn default_stdin(_: &Machine, _: &mut [u8]) -> i64 {
+    0
+}
+
 /// Default: monotonic time with microsecond granularity, with the low bits
 /// masked against fingerprinting (C++ `ANTI_FINGERPRINTING_MASK_MICROS`).
 fn default_rdtime(m: &Machine) -> u64 {
@@ -120,12 +125,12 @@ impl Machine {
             counter: 0,
             max_counter: 0,
             options,
-            syscall_handlers: Box::new([unknown_syscall_handler as SyscallHandler; SYSCALLS_MAX]),
+            syscall_handlers: Arc::new([unknown_syscall_handler as SyscallHandler; SYSCALLS_MAX]),
             on_unhandled_syscall: default_unknown_syscall_no,
             on_unhandled_csr: |_, _, _, _| {},
             printer: default_printer,
             rdtime: default_rdtime,
-            stdin: |_, _| 0,
+            stdin: default_stdin,
             epoch: Instant::now(),
             dispatch: DispatchState::default(),
             fds: None,
@@ -137,6 +142,71 @@ impl Machine {
         }
         machine.reset_cpu()?;
         Ok(machine)
+    }
+
+    /// Fork this machine with its own options (C++ `Machine(main)` uses
+    /// default options instead). See [`fork_with`](Self::fork_with).
+    pub fn fork(&self) -> Result<Self> {
+        self.fork_with(self.options.clone())
+    }
+
+    /// Port of the forking constructor `Machine(const Machine& main,
+    /// MachineOptions)`: a new machine that continues from this one's
+    /// state, sharing its memory copy-on-write.
+    ///
+    /// The fork loans every page of this machine (except `dont_fork`
+    /// ones; with `options.minimal_fork`, none), sharing the bytes until
+    /// either machine writes to them, and shares the execute segments and
+    /// the system call table, so forking costs about one page table entry
+    /// per page and no page copies. It starts with this machine's
+    /// registers, instruction counter and limit, and threads.
+    ///
+    /// Like C++, a fork does not get this machine's printer, stdin and
+    /// rdtime callbacks (it has the defaults), file descriptors or signal
+    /// handlers. The callbacks for unhandled system calls and CSRs are
+    /// kept (C++ has them per process).
+    ///
+    /// Unlike C++, this machine may be changed or dropped while forks
+    /// exist: a fork sees it as it was at the fork. A fork can be forked
+    /// again.
+    ///
+    /// Forks have no arena, so make the machine to fork from with
+    /// `use_memory_arena: false`. With `options.use_memory_arena` set,
+    /// forking a machine that has an arena fails with
+    /// `ILLEGAL_OPERATION`, as in C++.
+    pub fn fork_with(&self, options: MachineOptions) -> Result<Self> {
+        if options.jit && !cfg!(feature = "jit") {
+            return Err(MachineError::new(
+                ExceptionKind::FeatureDisabled,
+                "The JIT requires the `jit` feature",
+                0,
+            ));
+        }
+        let memory = self.memory.fork(&options)?;
+        Ok(Self {
+            cpu: self.cpu.fork(),
+            memory,
+            counter: self.counter,
+            max_counter: self.max_counter,
+            options,
+            syscall_handlers: Arc::clone(&self.syscall_handlers),
+            on_unhandled_syscall: self.on_unhandled_syscall,
+            on_unhandled_csr: self.on_unhandled_csr,
+            printer: default_printer,
+            rdtime: default_rdtime,
+            stdin: default_stdin,
+            epoch: self.epoch,
+            dispatch: DispatchState::default(),
+            fds: None,
+            mt: self.mt.clone(),
+            signals: None,
+        })
+    }
+
+    /// True if this machine was created by [`fork`](Self::fork) (C++
+    /// `is_forked`).
+    pub const fn is_forked(&self) -> bool {
+        self.memory.is_forked()
     }
 
     pub const fn options(&self) -> &MachineOptions {
@@ -301,7 +371,7 @@ impl Machine {
             number < SYSCALLS_MAX,
             "system call number {number} out of range"
         );
-        if let Some(slot) = self.syscall_handlers.get_mut(number) {
+        if let Some(slot) = Arc::make_mut(&mut self.syscall_handlers).get_mut(number) {
             *slot = handler;
         }
     }
