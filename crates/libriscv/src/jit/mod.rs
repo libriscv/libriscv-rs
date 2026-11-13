@@ -23,6 +23,7 @@ use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
+pub(crate) use region::block_icount;
 
 use crate::decoder_cache::DecodedSegment;
 use crate::dispatch::Handler;
@@ -45,6 +46,9 @@ pub(crate) const EXIT_INDIRECT: u64 = 4;
 pub(crate) const EXIT_SLOW: u64 = 2;
 /// A jump to the misaligned address `exit_pc` (without the C extension).
 pub(crate) const EXIT_MISALIGNED: u64 = 3;
+/// The dyncall at `exit_pc` (mid-block, block already counted): the
+/// dispatcher runs its handler, then native code continues after it.
+pub(crate) const EXIT_DYNCALL: u64 = 5;
 
 /// The native code of one execute segment.
 #[derive(Debug)]
@@ -107,6 +111,12 @@ pub(crate) enum JitExit {
         pc: u64,
         counter: u64,
     },
+    /// Run the dyncall at `pc` (block already counted), then continue after
+    /// it.
+    Dyncall {
+        pc: u64,
+        counter: u64,
+    },
     Fault(MachineError),
     /// The JIT can't run with the current memory layout; interpret instead.
     Unavailable,
@@ -159,6 +169,11 @@ impl JitSegment {
             .map(|&(_, h)| h)
     }
 
+    /// True if native code can be entered at decoder entry `i`.
+    pub(crate) fn has_entry(&self, i: usize) -> bool {
+        self.code.has_entry(i)
+    }
+
     /// Number of decoder entries that enter native code.
     pub(crate) fn entry_count(&self) -> usize {
         self.original.len()
@@ -190,6 +205,7 @@ impl JitSegment {
             EXIT_JUMP => JitExit::Jump { pc, counter },
             EXIT_INDIRECT => JitExit::Indirect { pc, counter },
             EXIT_SLOW => JitExit::Slow { pc, counter },
+            EXIT_DYNCALL => JitExit::Dyncall { pc, counter },
             EXIT_MISALIGNED => JitExit::Fault(MachineError::trigger(
                 ExceptionKind::MisalignedInstruction,
                 pc,

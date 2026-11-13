@@ -525,62 +525,131 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
             None => bad_entry(m, start),
         };
     }
-    let before = c.value.wrapping_sub(e.instruction_count());
-    match jit.run(m, i, start, before, c.max) {
-        JitExit::Halt { pc, counter } => halt(
-            m,
-            pc,
-            Counter {
-                value: counter,
-                max: c.max,
-            },
-        ),
-        JitExit::Jump { pc, counter } => begin_block!(
-            exec,
-            cache,
-            exec.index(pc),
-            m,
-            pc,
-            Counter {
-                value: counter,
-                max: c.max,
+    let (mut slot, mut entry_pc) = (i, start);
+    let mut before = c.value.wrapping_sub(e.instruction_count());
+    let mut c = c;
+    loop {
+        match jit.run(m, slot, entry_pc, before, c.max) {
+            JitExit::Halt { pc, counter } => {
+                return halt(
+                    m,
+                    pc,
+                    Counter {
+                        value: counter,
+                        max: c.max,
+                    },
+                );
             }
-        ),
-        JitExit::Indirect { pc, counter } => unchecked_jump!(
-            exec,
-            cache,
-            m,
-            pc,
-            Counter {
-                value: counter,
-                max: c.max,
-            }
-        ),
-        JitExit::Slow { pc, counter } => {
-            // Continue the chain at that instruction with the interpreter's
-            // own handler (the block is counted already).
-            let si = exec.index(pc);
-            let e = entry!(exec, cache, si, m, pc, c);
-            let handler = jit.original_handler(si).unwrap_or(e.handler);
-            let block_pc = pc.wrapping_add(e.block_bytes());
-            become handler(
+            JitExit::Jump { pc, counter } => begin_block!(
                 exec,
                 cache,
-                si,
+                exec.index(pc),
                 m,
-                block_pc,
+                pc,
                 Counter {
                     value: counter,
                     max: c.max,
-                },
-                e.instr,
-            )
+                }
+            ),
+            JitExit::Indirect { pc, counter } => unchecked_jump!(
+                exec,
+                cache,
+                m,
+                pc,
+                Counter {
+                    value: counter,
+                    max: c.max,
+                }
+            ),
+            JitExit::Slow { pc, counter } => {
+                // Continue the chain at that instruction with the interpreter's
+                // own handler (the block is counted already).
+                let si = exec.index(pc);
+                let e = entry!(exec, cache, si, m, pc, c);
+                let handler = jit.original_handler(si).unwrap_or(e.handler);
+                let block_pc = pc.wrapping_add(e.block_bytes());
+                become handler(
+                    exec,
+                    cache,
+                    si,
+                    m,
+                    block_pc,
+                    Counter {
+                        value: counter,
+                        max: c.max,
+                    },
+                    e.instr,
+                )
+            }
+            JitExit::Dyncall { pc, counter } => {
+                // C++ asmjit `execute_counted_dyncall`: the handler sees the
+                // exact PC, the counter and the limit, and what it does to
+                // them takes effect right after it.
+                m.cpu.regs.pc = pc;
+                m.counter = counter;
+                m.max_counter = m.dispatch.visible_max(c.max);
+                let instr = Instr(exec.read_u32(pc));
+                if let Err(err) = crate::isa::rvi::Custom::exec(m, instr) {
+                    return fault(m, err);
+                }
+                c = Counter {
+                    value: m.counter,
+                    max: m.dispatch.chain_max(m.max_counter),
+                };
+                let next = pc.wrapping_add(4);
+                let ends_block = exec
+                    .cache
+                    .get(exec.index(pc))
+                    .is_none_or(|e| e.block_bytes() == 0);
+                // Counted up to the dyncall: the block's instructions after it
+                // aren't retired yet (native entries count them again).
+                let retired = if ends_block {
+                    c.value
+                } else {
+                    c.value.wrapping_sub(crate::jit::block_icount(exec, next))
+                };
+                if c.overflowed() {
+                    return halt(
+                        m,
+                        next,
+                        Counter {
+                            value: retired,
+                            max: c.max,
+                        },
+                    );
+                }
+                // The handler may have made the segment stale: leave it, like
+                // the interpreter's FUNCTION handler.
+                if exec.is_stale() {
+                    return leave_segment(m, next, c);
+                }
+                let si = exec.index(next);
+                if exec.is_within(next, 2) && jit.has_entry(si) {
+                    (slot, entry_pc, before) = (si, next, retired);
+                    continue;
+                }
+                if ends_block {
+                    begin_block!(exec, cache, si, m, next, c)
+                }
+                // Finish the block in the interpreter, as after EXIT_SLOW.
+                let e = entry!(exec, cache, si, m, next, c);
+                let handler = jit.original_handler(si).unwrap_or(e.handler);
+                let block_pc = next.wrapping_add(e.block_bytes());
+                become handler(exec, cache, si, m, block_pc, c, e.instr)
+            }
+            JitExit::Fault(err) => return fault(m, err),
+            JitExit::Unavailable if slot == i => match jit.original_handler(i) {
+                Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
+                None => return bad_entry(m, start),
+            },
+            JitExit::Unavailable => {
+                // Re-entry after a dyncall: finish its block in the interpreter.
+                let e = entry!(exec, cache, slot, m, entry_pc, c);
+                let handler = jit.original_handler(slot).unwrap_or(e.handler);
+                let block_pc = entry_pc.wrapping_add(e.block_bytes());
+                become handler(exec, cache, slot, m, block_pc, c, e.instr)
+            }
         }
-        JitExit::Fault(err) => fault(m, err),
-        JitExit::Unavailable => match jit.original_handler(i) {
-            Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
-            None => bad_entry(m, start),
-        },
     }
 }
 

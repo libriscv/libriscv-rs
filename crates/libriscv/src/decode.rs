@@ -244,7 +244,8 @@ pub(crate) fn decode(i: Instr) -> OpInfo {
     if i.whole() == 0 {
         return OpInfo::of::<Illegal>();
     }
-    OpInfo::of::<Unimplemented>()
+    // C++ `on_unimplemented_instruction`, or UNIMPLEMENTED without one.
+    OpInfo::of::<Custom>()
 }
 
 /// The `RV32A_ATOMIC` case of `instr_decoding.inc` (RV64). `None` (an

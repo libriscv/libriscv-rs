@@ -67,6 +67,7 @@ mod cpu;
 mod decode;
 mod decoder_cache;
 mod dispatch;
+mod dyncall;
 mod elf;
 mod error;
 pub mod instruction;
@@ -88,11 +89,14 @@ mod vmcall;
 
 pub use cpu::Cpu;
 pub use decoder_cache::DecodedSegment;
+pub use dyncall::Dyncall;
 pub use elf::interpreter as elf_interpreter;
 pub use error::{ExceptionKind, MachineError, Result};
+pub use instruction::Instr;
 pub use linux::auxv;
 pub use machine::{
-    Machine, Printer, Rdtime, Stdin, SyscallHandler, UnhandledCsr, UnhandledSyscall,
+    CustomInstruction, Machine, Printer, Rdtime, Stdin, SyscallHandler, UnhandledCsr,
+    UnhandledSyscall, UnimplementedInstruction,
 };
 pub use memory::{Buffer, GuestPod, GuestSlice, GuestSliceMut, MEMVIEW_MAX, Memory, PAGE_SIZE};
 pub use options::MachineOptions;

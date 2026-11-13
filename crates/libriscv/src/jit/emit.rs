@@ -78,7 +78,7 @@ use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 
 use super::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary};
 use super::region::{Analysis, Insn, RegionId, block_icount};
-use super::{EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW};
+use super::{EXIT_DYNCALL, EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
 
 /// Functions are placed at this alignment in the code image.
@@ -993,6 +993,13 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let next = ins.pc.wrapping_add(ins.len);
         match ins.op {
             JOp::Nop => {}
+            JOp::Dyncall => {
+                // Leave with every register stored and the block counted;
+                // the dispatcher runs the handler and re-enters at `next`.
+                let c = self.count();
+                self.leave(EXIT_DYNCALL, ins.pc, c);
+                return Some(false);
+            }
             JOp::Fence => {
                 self.b.ins().fence();
             }
@@ -1774,7 +1781,9 @@ fn operands(op: JOp) -> Operands {
         ..Default::default()
     };
     match op {
-        JOp::Nop | JOp::Fence => Operands::default(),
+        // The handler reads and writes the register file: everything the
+        // region wrote is stored on the way out, and reloaded on re-entry.
+        JOp::Nop | JOp::Fence | JOp::Dyncall => Operands::default(),
         JOp::Const { rd, .. } => int([None, None], Some(rd)),
         JOp::AluImm { rd, rs1, .. } | JOp::Unary { rd, rs1, .. } => {
             int([Some(rs1), None], Some(rd))

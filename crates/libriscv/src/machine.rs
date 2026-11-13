@@ -45,6 +45,13 @@ pub type Rdtime = fn(&Machine) -> u64;
 /// Reads guest standard input into the buffer and returns the number of
 /// bytes read (C++ `stdin_func`).
 pub type Stdin = fn(&Machine, &mut [u8]) -> i64;
+/// The handler of a custom instruction (C++ `Instruction::handler`).
+pub type CustomInstruction = fn(&mut Machine, Instr) -> Result<()>;
+/// Picks the handler for an instruction the decoder doesn't know, or
+/// `None` for the UNIMPLEMENTED_INSTRUCTION fault (C++
+/// `CPU::on_unimplemented_instruction`, returning
+/// `get_unimplemented_instruction()` for `None`).
+pub type UnimplementedInstruction = fn(Instr) -> Option<CustomInstruction>;
 
 /// A RISC-V RV64 machine: CPU, memory and system call table.
 pub struct Machine {
@@ -57,6 +64,7 @@ pub struct Machine {
     syscall_handlers: Arc<[SyscallHandler; SYSCALLS_MAX]>,
     on_unhandled_syscall: UnhandledSyscall,
     on_unhandled_csr: UnhandledCsr,
+    on_unimplemented_instruction: Option<UnimplementedInstruction>,
     printer: Printer,
     rdtime: Rdtime,
     stdin: Stdin,
@@ -136,6 +144,7 @@ impl Machine {
             syscall_handlers: Arc::new([unknown_syscall_handler as SyscallHandler; SYSCALLS_MAX]),
             on_unhandled_syscall: default_unknown_syscall_no,
             on_unhandled_csr: |_, _, _, _| {},
+            on_unimplemented_instruction: None,
             printer: default_printer,
             rdtime: default_rdtime,
             stdin: default_stdin,
@@ -172,8 +181,8 @@ impl Machine {
     ///
     /// Like C++, a fork does not get this machine's printer, stdin and
     /// rdtime callbacks (it has the defaults), file descriptors, signal
-    /// handlers or userdata. The callbacks for unhandled system calls and CSRs are
-    /// kept (C++ has them per process).
+    /// handlers or userdata. The callbacks for unhandled system calls, CSRs
+    /// and instructions are kept (C++ has them per process).
     ///
     /// Unlike C++, this machine may be changed or dropped while forks
     /// exist: a fork sees it as it was at the fork. A fork can be forked
@@ -201,6 +210,7 @@ impl Machine {
             syscall_handlers: Arc::clone(&self.syscall_handlers),
             on_unhandled_syscall: self.on_unhandled_syscall,
             on_unhandled_csr: self.on_unhandled_csr,
+            on_unimplemented_instruction: self.on_unimplemented_instruction,
             printer: default_printer,
             rdtime: default_rdtime,
             stdin: default_stdin,
@@ -444,6 +454,34 @@ impl Machine {
     /// Set the callback for unknown CSRs.
     pub const fn set_on_unhandled_csr(&mut self, f: UnhandledCsr) {
         self.on_unhandled_csr = f;
+    }
+    /// Set the hook for instructions the decoder doesn't know (C++
+    /// `CPU::on_unimplemented_instruction`), for custom instructions: it
+    /// returns the handler to run, or `None` for the
+    /// UNIMPLEMENTED_INSTRUCTION fault. C++'s hook is one per process and
+    /// asked once per decoder entry; this one is per machine (kept by
+    /// forks) and asked each time such an instruction executes, so it
+    /// should be a quick match on the instruction bits.
+    ///
+    /// Only instructions the decoder falls through on reach it (the
+    /// reserved custom opcodes, for example, but not encodings the
+    /// decoder rejects as illegal itself, as in C++). The interpreter runs
+    /// the handler mid-block without making the PC or the instruction
+    /// counter visible to it, like C++. With the JIT, valid
+    /// [`Dyncall`](crate::Dyncall) words are *counted*: the handler sees
+    /// the exact PC and the counter and limit, and `stop()`, `penalize()`
+    /// and changes to the limit take effect right after it (C++ asmjit's
+    /// `execute_counted_dyncall`).
+    pub const fn set_on_unimplemented_instruction(&mut self, f: UnimplementedInstruction) {
+        self.on_unimplemented_instruction = Some(f);
+    }
+    /// Remove the hook: unknown instructions fault again.
+    pub const fn clear_on_unimplemented_instruction(&mut self) {
+        self.on_unimplemented_instruction = None;
+    }
+    /// The custom handler for `instr`, if the hook has one.
+    pub fn custom_instruction(&self, instr: Instr) -> Option<CustomInstruction> {
+        (self.on_unimplemented_instruction?)(instr)
     }
     /// Set where guest output goes.
     pub const fn set_printer(&mut self, f: Printer) {

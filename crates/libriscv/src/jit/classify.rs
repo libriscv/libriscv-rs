@@ -220,6 +220,12 @@ pub(crate) enum Cond {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JOp {
     Nop,
+    /// A valid [`Dyncall`](crate::Dyncall) word: leave native code to run
+    /// the machine's custom instruction handler with the exact PC and
+    /// counter (C++ asmjit `emit_dyncall` / `execute_counted_dyncall`).
+    /// Native code continues at the next instruction, which is always an
+    /// entry point.
+    Dyncall,
     /// FENCE: a full barrier, like the interpreter.
     Fence,
     /// `rd = value`, without reading any register.
@@ -636,6 +642,7 @@ pub(crate) fn classify(i: Instr, pc: u64) -> Option<JOp> {
         // FENCE.I can make segments stale, and CBO writes memory: both stay
         // in the interpreter.
         FENCE if it.funct3() == 0 => Some(JOp::Fence),
+        crate::Dyncall::OPCODE if crate::Dyncall::valid(i.whole()) => Some(JOp::Dyncall),
         // F and D are compiled when the interpreter has them, and without
         // NaN-boxing (the `debug-checks` build boxes single-precision values).
         #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]

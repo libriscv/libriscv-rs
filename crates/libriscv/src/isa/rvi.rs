@@ -192,6 +192,19 @@ ops! {
         Err(MachineError::trigger(ExceptionKind::UnimplementedInstruction, u64::from(data)))
     }
 
+    /// What C++ `CPU::decode` falls through to for anything it doesn't
+    /// know: `on_unimplemented_instruction(instr)` if set, otherwise
+    /// UNIMPLEMENTED. C++ asks the hook when decoding (lazily, once per
+    /// decoder entry); here the machine's hook is asked when the
+    /// instruction executes, so decoded segments shared between machines
+    /// don't depend on any machine's hook.
+    Custom = |m, i| {
+        match m.custom_instruction(i) {
+            Some(handler) => handler(m, i),
+            None => Unimplemented::exec(m, i),
+        }
+    }
+
     Illegal = |m, i| {
         Err(MachineError::trigger(ExceptionKind::IllegalOpcode, 0))
     }

@@ -90,7 +90,21 @@ Decided in Phase 5 (moved up, for dynamic executables):
   into the page table. See "Virtual paging".
 - **Machine shape.** `Machine { cpu, memory, .. }` is not generic. System
   call handlers are `fn(&mut Machine) -> Result<()>` in a per-machine table
-  (C++'s is per process). Userdata is still open (Phase 3).
+  (C++'s is per process). Userdata (C++'s `void*` user pointer) is an
+  owned `Box<dyn Any + Send + Sync>`, type-checked on access
+  (`set_userdata`, `userdata::<T>()`, `userdata_mut`, `take_userdata`);
+  an `Arc` in it shares state with the host like the C++ pointer. Forks
+  don't get it, as in C++. (The generic `Machine<U>` recommended below
+  wasn't worth making every machine type generic: userdata is only read
+  from host callbacks, never on the dispatch path.)
+- **Custom instructions.** C++'s process-wide
+  `CPU::on_unimplemented_instruction` is a per-machine hook,
+  `set_on_unimplemented_instruction(fn(Instr) -> Option<CustomInstruction>)`,
+  kept by forks. The decoder's final fall-through (and only it, as in
+  C++) is the `isa::rvi::Custom` op, which asks the hook when it
+  *executes* rather than when the entry is decoded, so decoded segments
+  shared between machines don't depend on any machine's hook. There is
+  no disassembler yet, so a custom instruction has no printer.
 - **One definition per instruction.** Each instruction is a unit type
   implementing `isa::Op` (the C++ precise handler). The dispatcher wraps the
   same `exec` in its generic handlers (`seq::<O>`, `function::<O>`,
@@ -395,6 +409,17 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   finishes the (already counted) block.
 - Decoder entries at block starts that native code can be entered at get the
   `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
+  Valid dyncall words (`dyncall.rs`, C++ `dyncall.hpp`) are compiled as
+  counted calls, like asmjit's `emit_dyncall`/`execute_counted_dyncall`:
+  native code leaves with `EXIT_DYNCALL` (all registers stored, block
+  counted), `jit_enter` runs the machine's custom instruction handler
+  with the exact PC, counter and limit visible, then halts if the handler
+  stopped or penalized the machine (at the next instruction, with the
+  count up to the dyncall), leaves a segment the handler made stale, or
+  re-enters native code at the next instruction, which region formation
+  always makes an entry point. A fault is reported at the dyncall's own
+  PC (the interpreter reports the block's). The interpreter runs dyncalls
+  like any custom instruction, without publishing the counter, as C++.
   Native code exits to the interpreter on anything it doesn't compile
   (system calls, CSRs incl. FCSR, atomics, Zfa, Zfhmin, FENCE.I, CBO,
   CLMUL), on faults and at the instruction limit, with exactly the PC,
@@ -995,10 +1020,11 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Call-depth handling
 - [ ] `PreparedCall` (`prepared_call.hpp`)
 - [x] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push` (`memory/helpers.rs`: `Buffer`/`membuffer`, `strlen`, `memstring_view`, `memview`/`memview_mut` with `maxlen`, typed `memarray`/`memspan`/`try_memarray` as `GuestSlice`/`GuestSliceMut` over `GuestPod`, `try_memmove`, both `memcmp`s, machine-to-machine `memcpy_from`, `read_value`/`write_value`; `stack_push_value`)
-- [ ] Printer / stdin / rdtime hooks
+- [x] Printer / stdin / rdtime hooks
+- [x] Userdata (`set_userdata`/`get_userdata`), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
-- [ ] Ports of `tests/unit/{dynamic,exceptions,examples,checksum,pcrel,png}.cpp` (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction" needs custom instruction handlers and userdata) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
+- [ ] Ports of `tests/unit/{dynamic,exceptions,examples,checksum,pcrel,png}.cpp` (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction": done, `tests/custom.rs`) (`dyncall.cpp`: done, `tests/dyncall.rs`) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
 
 ### Phase 4 — Performance
 
@@ -1022,7 +1048,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Native threads (`native_threads.cpp`); POSIX threads are done (Phase 2)
 - [ ] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`)
 - [ ] Guest datatypes (`guest/`, `guest_datatypes.hpp`)
-- [ ] Dynamic calls (`dyncall.hpp`)
+- [x] Dynamic calls (`dyncall.hpp`): the encoding, counted calls in the JIT (see "JIT")
 - [ ] Disassembler (`rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp`)
 - [ ] CLI debugger (`debug.cpp`, `debug.hpp`)
 - [ ] GDB RSP server (`rsp_server.hpp`, `linux/rsp_server.hpp`)
@@ -1077,7 +1103,7 @@ phase starts; names below are the intended targets.
 | `debug.*` | `debug.rs` | 5 | |
 | `rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp` | `disasm/` | 5 | |
 | `rsp_server.hpp`, `linux/rsp_server.hpp` | `rsp.rs` | 5 | |
-| `dyncall.hpp` | `dyncall.rs` | 5 | |
+| `dyncall.hpp` | `dyncall.rs` | 5 | ✅ (JIT side in `jit/`, see "JIT") |
 | `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | |
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |

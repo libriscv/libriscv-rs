@@ -228,7 +228,9 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         for t in targets.into_iter().flatten() {
             if let Some(r) = a.region_at(exec, t) {
                 let is_direct_target = matches!(ins.op, JOp::Branch { target, .. } | JOp::Jal { target, .. } if target == t);
-                if Some(r) != own || is_direct_target {
+                // Native code leaves at a dyncall and comes back after it.
+                let after_dyncall = matches!(ins.op, JOp::Dyncall);
+                if Some(r) != own || is_direct_target || after_dyncall {
                     extra.push((r, t));
                 }
             }
