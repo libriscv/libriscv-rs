@@ -342,6 +342,187 @@ fn accesses_outside_the_arena_use_the_page_table() {
     assert_eq!(m.memory.owned_pages_active(), 2);
 }
 
+/// A minimal static ELF: one read+execute `PT_LOAD` holding `code` at `V`,
+/// followed by `pad` zero bytes, so that read-only data ends past them and
+/// the write window starts there (inside the read window, unlike a machine
+/// without a program, whose write window starts at 0). The loader wants a
+/// section table: one empty string table, after the segment.
+fn elf_with(code: &[u8], pad: usize) -> Vec<u8> {
+    // The segment starts with the code, so that it begins a block.
+    const HDR: u64 = 0x80;
+    let len = code.len() as u64 + pad as u64;
+    let mut elf = Vec::new();
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    elf.extend_from_slice(&2u16.to_le_bytes()); // e_type: ET_EXEC
+    elf.extend_from_slice(&243u16.to_le_bytes()); // e_machine: EM_RISCV
+    elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    elf.extend_from_slice(&V.to_le_bytes()); // e_entry
+    elf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+    elf.extend_from_slice(&(HDR + len).to_le_bytes()); // e_shoff
+    elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    for v in [64u16, 56, 1, 64, 1, 0] {
+        // e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.extend_from_slice(&1u32.to_le_bytes()); // p_type: PT_LOAD
+    elf.extend_from_slice(&5u32.to_le_bytes()); // p_flags: R | X
+    for v in [HDR, V, V, len, len, 0x1000u64] {
+        // p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.resize(HDR as usize, 0);
+    elf.extend_from_slice(code);
+    elf.resize((HDR + len) as usize, 0);
+    // sh_name, sh_type (SHT_STRTAB): its name is the NUL at offset HDR - 1.
+    elf.extend_from_slice(&0u32.to_le_bytes());
+    elf.extend_from_slice(&3u32.to_le_bytes());
+    for v in [0, 0, HDR - 1, 1u64] {
+        // sh_flags, sh_addr, sh_offset, sh_size
+        elf.extend_from_slice(&v.to_le_bytes());
+    }
+    elf.extend_from_slice(&[0; 24]); // sh_link, sh_info, sh_addralign, sh_entsize
+    elf
+}
+
+fn elf_machine(elf: &[u8], jit: bool) -> Machine {
+    let mut m = Machine::new(
+        elf,
+        MachineOptions {
+            memory_max: 1 << 20,
+            jit,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    m.set_printer(|_, _| {});
+    m.set_rdtime(|_| 1234);
+    m
+}
+
+/// One bounds check covers the loads and stores through the same base
+/// register in a block. It must pass and fail exactly when the accesses'
+/// own checks would: sweep the base across the window edges (the read
+/// window's start, the end of read-only data where the write window starts,
+/// and the end of the arena), with accesses on both sides of each. With a
+/// program loaded, store checks cover the loads between the stores too.
+/// Past the arena, the page table holds a pattern that the arena's padding
+/// doesn't, so an access wrongly made natively there reads something else.
+#[test]
+fn merged_bounds_checks_match_the_interpreter() {
+    const PTR: u32 = 6;
+    // A: one check per run; the highest access is a load above the stores
+    // (so a check that misses it lets it through at the arena's end).
+    let spans = [
+        itype(0x13, 0, 11, 0, 24),     // 0x00: li a1, 24
+        itype(0x03, 3, 12, PTR, 8),    // 0x04: loop: ld a2, 8(t1)
+        itype(0x03, 2, 13, PTR, -8),   // 0x08: lw a3, -8(t1)
+        stype(3, PTR, 12, 0),          // 0x0C: sd a2, 0(t1)
+        itype(0x03, 4, 14, PTR, 4),    // 0x10: lbu a4, 4(t1): between the stores
+        itype(0x03, 3, 15, PTR, 16),   // 0x14: ld a5, 16(t1): above the stores
+        stype(2, PTR, 13, 12),         // 0x18: sw a3, 12(t1)
+        rtype(0x33, 0, 0, 10, 10, 12), // 0x1C: add a0, a0, a2
+        rtype(0x33, 0, 0, 10, 10, 14), // 0x20: add a0, a0, a4
+        rtype(0x33, 0, 0, 10, 10, 15), // 0x24: add a0, a0, a5
+        itype(0x13, 0, PTR, PTR, 4),   // 0x28: addi t1, t1, 4
+        itype(0x13, 0, 11, 11, -1),    // 0x2C: addi a1, a1, -1
+        btype(1, 11, 0, -44),          // 0x30: bnez a1, loop
+        jtype(0, 0),                   // 0x34: j .
+    ];
+    // B: the base changes mid-run, so a check made through the old value
+    // no longer applies (the same offset is a different address).
+    let rewrite = [
+        itype(0x13, 0, 11, 0, 24),     // 0x00: li a1, 24
+        itype(0x03, 3, 12, PTR, 0),    // 0x04: loop: ld a2, 0(t1)
+        stype(3, PTR, 12, -8),         // 0x08: sd a2, -8(t1)
+        itype(0x13, 0, PTR, PTR, 8),   // 0x0C: addi t1, t1, 8
+        itype(0x03, 3, 13, PTR, 0),    // 0x10: ld a3, 0(t1): the highest access
+        stype(3, PTR, 13, -8),         // 0x14: sd a3, -8(t1)
+        rtype(0x33, 0, 0, 10, 10, 13), // 0x18: add a0, a0, a3
+        itype(0x13, 0, PTR, PTR, -4),  // 0x1C: addi t1, t1, -4
+        itype(0x13, 0, 11, 11, -1),    // 0x20: addi a1, a1, -1
+        btype(1, 11, 0, -32),          // 0x24: bnez a1, loop
+        jtype(0, 0),                   // 0x28: j .
+    ];
+    let mut fuels = fuels();
+    fuels.extend((150..420).step_by(3));
+    for (what, program) in [("spans", &spans[..]), ("rewrite", &rewrite[..])] {
+        let code = words(program);
+        let elf = elf_with(&code, 0x200);
+        let kinds: [(&str, &dyn Fn(bool) -> Machine); 2] = [
+            ("no program", &|jit| machine(&code, jit)),
+            ("program", &|jit| elf_machine(&elf, jit)),
+        ];
+        for (kind, make) in kinds {
+            let probe = make(false);
+            let rodata_end = probe.memory.initial_rodata_end();
+            let arena_end = probe.memory.memory_arena_size();
+            let mut starts = vec![0x1000 - 0x30, arena_end - 0x40, SCRATCH + 0x100];
+            if rodata_end > 0x30 {
+                starts.push(rodata_end - 0x30);
+            }
+            let edge = |m: &Machine| -> Vec<u64> {
+                (0..32u64)
+                    .map(|k| m.memory.read_u64(arena_end - 0x80 + 8 * k).unwrap_or(1))
+                    .collect()
+            };
+            for start in starts {
+                let mut regs = [0u64; 64];
+                regs[PTR as usize] = start;
+                let (mut m, mut interp) = (make(true), make(false));
+                for &fuel in &fuels {
+                    // Runs store past the arena too: seed it every time.
+                    for mm in [&mut m, &mut interp] {
+                        for k in 0..16u64 {
+                            mm.memory
+                                .write_u64(arena_end + 8 * k, 0x0123_4567_89AB_CDEF ^ (k << 56))
+                                .unwrap();
+                        }
+                    }
+                    let expected = run(&mut interp, &regs, fuel);
+                    let got = run(&mut m, &regs, fuel);
+                    let at = format!("{what}, {kind}, base {start:#x}, fuel {fuel}");
+                    assert!(
+                        m.cpu.current_execute_segment().jit_entry_count() >= 2,
+                        "{at}: not compiled"
+                    );
+                    assert!(got == expected, "{at}:\n{}", describe(&got, &expected));
+                    assert_eq!(edge(&m), edge(&interp), "{at}");
+                }
+            }
+        }
+    }
+}
+
+/// Blocks too long for the decoder end in a FUNCBLOCK entry, which isn't
+/// control flow: native code runs it and begins the next block, with the
+/// dispatcher's instruction-limit check in between.
+#[test]
+fn funcblock_entries_stay_native() {
+    let mut program = vec![itype(0x13, 0, 11, 0, 20)]; // li a1, 20
+    let body = program.len();
+    for k in 0..400 {
+        program.push(match k % 4 {
+            0 => itype(0x13, 0, 10, 10, k),              // addi a0, a0, k
+            1 => stype(3, BASE, 10, (k % 64) * 8),       // sd a0, (k % 64) * 8(t0)
+            2 => itype(0x03, 3, 12, BASE, (k % 32) * 8), // ld a2, ...
+            _ => rtype(0x33, 0, 0, 10, 10, 12),          // add a0, a0, a2
+        });
+    }
+    program.push(itype(0x13, 0, 11, 11, -1)); // addi a1, a1, -1
+    let back = -4 * (program.len() - body) as i32;
+    program.push(btype(1, 11, 0, back)); // bnez a1, body
+    program.push(jtype(0, 0)); // j .
+    let mut regs = [0u64; 64];
+    regs[BASE as usize] = SCRATCH;
+    let mut fuels = fuels();
+    fuels.extend(110..150);
+    fuels.extend(240..280);
+    fuels.extend(380..420);
+    fuels.extend([1999, 2000, 2001, 5000]);
+    let entries = compare(&words(&program), &regs, &fuels, "funcblock");
+    assert!(entries > 0, "nothing was compiled");
+}
+
 #[test]
 fn x0_writes_are_discarded() {
     // OP-32 fast paths with rd = x0 are no-ops in the dispatcher (C++

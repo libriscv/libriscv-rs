@@ -24,10 +24,13 @@
 //!
 //! * Guest memory is accessed only as `arena[addr]` for accesses of at most
 //!   8 bytes where `addr - read_base < read_len` (loads) or
-//!   `addr - write_base < write_len` (stores), unsigned and wrapping; or, in
-//!   code built with an address mask `m` ([`CodeMemory::new`]), as
-//!   `arena[addr & m]`, unchecked. [`CodeMemory::enter`] refuses to run such
-//!   code unless `m` plus the widest access fits in the arena.
+//!   `addr - write_base < write_len` (stores), unsigned and wrapping, with
+//!   the windows the code was built for ([`MemoryLayout`]): they are
+//!   constants in the code, and [`CodeMemory::enter`] refuses to run it
+//!   unless they lie inside the windows of the [`JitState`]. Or, in code
+//!   built with an address mask `m`, as `arena[addr & m]`, unchecked:
+//!   [`CodeMemory::enter`] refuses to run such code unless `m` plus the
+//!   widest access fits in the arena.
 //! * Only the 32 integer registers behind `regs`, the 32 floating-point
 //!   registers behind `fregs` and the fields of [`JitState`] are accessed
 //!   besides guest memory.
@@ -43,6 +46,28 @@ use memmap2::Mmap;
 
 /// The largest guest memory access generated code makes, in bytes.
 pub const MAX_ACCESS: u64 = 8;
+
+/// The guest memory layout generated code is built for, see the crate
+/// documentation: a non-zero `mask` (masked accesses, no windows), or the
+/// `(base, len)` windows of the arena that loads and stores check against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MemoryLayout {
+    pub mask: u64,
+    pub read: (u64, u64),
+    pub write: (u64, u64),
+}
+
+/// True if the window `inner` lies inside `outer`. An empty window lies
+/// inside anything.
+fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
+    inner.1 == 0
+        || (inner.0 >= outer.0
+            && inner
+                .0
+                .checked_add(inner.1)
+                .zip(outer.0.checked_add(outer.1))
+                .is_some_and(|(i, o)| i <= o))
+}
 
 /// The state block passed to generated code. The layout is shared with the
 /// code generator through the `OFFSET_*` constants.
@@ -138,8 +163,8 @@ type Trampoline = extern "C" fn(*mut JitState<'_>, u64, u64, u64);
 pub struct CodeMemory {
     map: Mmap,
     trampoline: usize,
-    /// The address mask the code applies to guest addresses, 0 for none.
-    mask: u64,
+    /// The memory layout the code was built for.
+    layout: MemoryLayout,
     /// Absolute function addresses, 0 for "no entry". Generated code indexes
     /// it for indirect jumps (through `JitState::table`).
     table: Box<[u64]>,
@@ -150,7 +175,7 @@ impl std::fmt::Debug for CodeMemory {
         f.debug_struct("CodeMemory")
             .field("base", &self.map.as_ptr())
             .field("len", &self.map.len())
-            .field("mask", &self.mask)
+            .field("layout", &self.layout)
             .field("entries", &self.table.iter().filter(|&&e| e != 0).count())
             .finish()
     }
@@ -163,9 +188,15 @@ impl CodeMemory {
     /// Copy `code` into fresh executable memory. `trampoline` is the offset of
     /// the trampoline function, and `entries[i]` the offset of the function
     /// for table slot `i` (or [`Self::NO_ENTRY`]). All offsets must be inside
-    /// `code`. `mask` is the address mask the code applies to guest memory
-    /// accesses instead of range checks (0: it checks the windows).
-    pub fn new(code: &[u8], trampoline: usize, entries: &[u32], mask: u64) -> io::Result<Self> {
+    /// `code`. `layout` is the guest memory layout the code was built for:
+    /// the address mask it applies to guest memory accesses, or (mask 0) the
+    /// windows it checks them against.
+    pub fn new(
+        code: &[u8],
+        trampoline: usize,
+        entries: &[u32],
+        layout: MemoryLayout,
+    ) -> io::Result<Self> {
         let invalid = |what| io::Error::new(io::ErrorKind::InvalidInput, what);
         if code.is_empty() || trampoline >= code.len() {
             return Err(invalid("trampoline outside the code"));
@@ -185,7 +216,7 @@ impl CodeMemory {
         Ok(Self {
             map,
             trampoline,
-            mask,
+            layout,
             table,
         })
     }
@@ -207,19 +238,25 @@ impl CodeMemory {
 
     /// Run the function in table slot `slot` with `pc` and `counter` as its
     /// arguments, until it returns. Returns `false` (without running
-    /// anything) if the slot is empty, or if the code's address mask
-    /// doesn't fit in `state`'s arena. The results are in `state`.
+    /// anything) if the slot is empty, if the code's address mask doesn't
+    /// fit in `state`'s arena, or if the code's windows aren't inside
+    /// `state`'s. The results are in `state`.
     #[allow(unsafe_code)]
     pub fn enter(&self, state: &mut JitState<'_>, slot: usize, pc: u64, counter: u64) -> bool {
         let Some(&function) = self.table.get(slot).filter(|&&e| e != 0) else {
             return false;
         };
-        if self.mask != 0
-            && self
+        let layout = &self.layout;
+        let fits = if layout.mask != 0 {
+            layout
                 .mask
                 .checked_add(MAX_ACCESS)
-                .is_none_or(|end| end > state.arena_len)
-        {
+                .is_some_and(|end| end <= state.arena_len)
+        } else {
+            window_within(layout.read, (state.read_base, state.read_len))
+                && window_within(layout.write, (state.write_base, state.write_len))
+        };
+        if !fits {
             return false;
         }
         state.table = self.table.as_ptr();
@@ -233,7 +270,9 @@ impl CodeMemory {
         // (`JitState::new`), with `table` pointing at `self.table`, and
         // `function` is a function start in the same mapping, and a masked
         // access (`arena[addr & mask]`, at most `MAX_ACCESS` bytes) stays
-        // inside the arena (checked above). What the generated code does
+        // inside the arena, as does a checked one: the code's windows are
+        // inside `state`'s (both checked above), which `JitState::new`
+        // validated against the arena. What the generated code does
         // with them is the contract in the crate documentation.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
         trampoline(state, function, pc, counter);
@@ -260,11 +299,25 @@ mod tests {
     #[test]
     fn entries_must_be_inside_the_code() {
         let code = [0xC3u8; 16]; // x86 `ret`, never run here
-        assert!(CodeMemory::new(&code, 0, &[CodeMemory::NO_ENTRY, 8], 0).is_ok());
-        assert!(CodeMemory::new(&code, 16, &[], 0).is_err());
-        assert!(CodeMemory::new(&code, 0, &[16], 0).is_err());
-        assert!(CodeMemory::new(&[], 0, &[], 0).is_err());
-        let mem = CodeMemory::new(&code, 0, &[CodeMemory::NO_ENTRY, 8], 0).unwrap();
+        assert!(
+            CodeMemory::new(
+                &code,
+                0,
+                &[CodeMemory::NO_ENTRY, 8],
+                MemoryLayout::default()
+            )
+            .is_ok()
+        );
+        assert!(CodeMemory::new(&code, 16, &[], MemoryLayout::default()).is_err());
+        assert!(CodeMemory::new(&code, 0, &[16], MemoryLayout::default()).is_err());
+        assert!(CodeMemory::new(&[], 0, &[], MemoryLayout::default()).is_err());
+        let mem = CodeMemory::new(
+            &code,
+            0,
+            &[CodeMemory::NO_ENTRY, 8],
+            MemoryLayout::default(),
+        )
+        .unwrap();
         assert!(!mem.has_entry(0) && mem.has_entry(1) && !mem.has_entry(2));
     }
 
@@ -276,9 +329,48 @@ mod tests {
         let mut arena = vec![0u8; 0x1000 + 6];
         let mut state =
             JitState::new(&mut regs, &mut fregs, &mut arena, (0, 0), (0, 0), 0, 0).unwrap();
-        let mem = CodeMemory::new(&code, 0, &[0], 0xFFF).unwrap();
+        let masked = |mask| MemoryLayout {
+            mask,
+            ..MemoryLayout::default()
+        };
+        let mem = CodeMemory::new(&code, 0, &[0], masked(0xFFF)).unwrap();
         assert!(!mem.enter(&mut state, 0, 0, 0));
-        let mem = CodeMemory::new(&code, 0, &[0], u64::MAX).unwrap();
+        let mem = CodeMemory::new(&code, 0, &[0], masked(u64::MAX)).unwrap();
         assert!(!mem.enter(&mut state, 0, 0, 0));
+    }
+
+    #[test]
+    fn checked_code_needs_its_windows_inside_the_state() {
+        let code = [0xC3u8; 16]; // never run: `enter` refuses first
+        let (mut regs, mut fregs) = ([0u64; 32], [0u64; 32]);
+        let mut arena = vec![0u8; 0x3000];
+        let mut state = JitState::new(
+            &mut regs,
+            &mut fregs,
+            &mut arena,
+            (0x1000, 0x1000),
+            (0x1800, 0x800),
+            0,
+            0,
+        )
+        .unwrap();
+        let checked = |read, write| MemoryLayout {
+            mask: 0,
+            read,
+            write,
+        };
+        for (read, write) in [
+            ((0x1000, 0x1001), (0x1800, 0x800)),
+            ((0xFFF, 0x10), (0x1800, 0x800)),
+            ((0x1000, 0x1000), (0x1000, 0x800)),
+            ((0x1000, 0x1000), (u64::MAX, 2)),
+        ] {
+            let mem = CodeMemory::new(&code, 0, &[0], checked(read, write)).unwrap();
+            assert!(!mem.enter(&mut state, 0, 0, 0), "{read:x?} {write:x?}");
+        }
+        assert!(window_within((0x1000, 0x1000), (0x1000, 0x1000)));
+        assert!(window_within((0x1200, 0x100), (0x1000, 0x1000)));
+        assert!(window_within((u64::MAX, 0), (0x1000, 0)));
+        assert!(!window_within((0x1000, 1), (0x1000, 0)));
     }
 }

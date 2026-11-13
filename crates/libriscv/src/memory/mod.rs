@@ -425,6 +425,18 @@ impl Memory {
     pub const fn initial_rodata_end(&self) -> u64 {
         self.initial_rodata_end
     }
+    /// The guest memory layout JIT code is built for and run with: the
+    /// N-bit address mask, or (mask 0) the arena windows loads and stores
+    /// check against, as `read_*`/`write_*` do. The windows are final once
+    /// the program is loaded, before any execute segment is created.
+    #[cfg(feature = "jit")]
+    pub(crate) const fn jit_layout(&self) -> libriscv_jit_rt::MemoryLayout {
+        libriscv_jit_rt::MemoryLayout {
+            mask: self.jit_arena_mask,
+            read: (RWREAD_BEGIN, self.read_boundary),
+            write: (self.initial_rodata_end, self.write_boundary),
+        }
+    }
     /// The whole arena including the padding page, for the JIT.
     #[cfg(feature = "jit")]
     pub(crate) fn arena_mut(&mut self) -> &mut [u8] {
@@ -482,18 +494,18 @@ impl Memory {
         }
         let crc32c = decoder_cache::crc32c(code);
         #[cfg(feature = "jit")]
-        let (jit, background, mask) = (self.jit, self.jit_background, self.jit_arena_mask);
+        let (jit, background, layout) = (self.jit, self.jit_background, self.jit_layout());
         let build = |shared| {
             #[allow(unused_mut)]
             let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
             #[cfg(feature = "jit")]
             if jit && !background {
-                crate::jit::JitSegment::attach(&mut segment, mask);
+                crate::jit::JitSegment::attach(&mut segment, layout);
             }
             let segment = Arc::new(segment);
             #[cfg(feature = "jit")]
             if jit && background {
-                crate::jit::spawn_background(&segment, mask);
+                crate::jit::spawn_background(&segment, layout);
             }
             Ok(segment)
         };
@@ -504,9 +516,7 @@ impl Memory {
                 crc32c,
                 execute_only,
                 #[cfg(feature = "jit")]
-                jit: jit.then_some(mask),
-                #[cfg(not(feature = "jit"))]
-                jit: None,
+                jit: jit.then_some(layout),
             };
             decoder_cache::shared_segment(key, code, build)?
         } else {

@@ -644,9 +644,11 @@ pub(crate) struct SegmentKey {
     pub len: u64,
     pub crc32c: u32,
     pub execute_only: bool,
-    /// `None` without the JIT, else its guest address mask (0 for bounds
-    /// checks). Machines that don't JIT never get native code this way.
-    pub jit: Option<u64>,
+    /// `None` without the JIT, else the guest memory layout its code is
+    /// built for (the address mask, or the windows it checks against).
+    /// Machines that don't JIT never get native code this way.
+    #[cfg(feature = "jit")]
+    pub jit: Option<libriscv_jit_rt::MemoryLayout>,
 }
 
 /// One entry of the process-wide segment cache (C++

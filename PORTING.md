@@ -321,10 +321,34 @@ own Iterations/Sec, one run each, same date and C++ builds:
 | coremark-rv64g_zba_zbb | 2543 | 2727 | 2540 | 15848 | 19451 |
 
 The Rust interpreter is 4-8% behind C++ threaded on every ELF (level with
-tailcall), the Rust JIT 18-24% behind asmjit. With background compilation
+tailcall), the Rust JIT was 18-24% behind asmjit (see below for the
+numbers after "Bounds checks and register pressure"). With background compilation
 the JIT can arrive after CoreMark has calibrated on the interpreter, which
 then picks too few iterations and fails the 10-second rule; the Rust JIT
 column is up front where that happened (rv64gc, rv64g_zba_zbb; same score).
+
+After the JIT changes in "Bounds checks and register pressure" (JIT
+section), 2026-11-13, Rust JIT up front against C++ asmjit up front,
+interleaved runs (`perf stat` cycles per CoreMark iteration are steadier
+than the score while other work loads the machine):
+
+| ELF | Rust JIT | C++ asmjit | |
+|---|---:|---:|---:|
+| coremark-rv64g | 18015 | 18658 | −3.4% |
+| coremark-rv64gc | 18046 | 19276 | −6.4% |
+| coremark-rv64g_b | 19365-19822 | 19816-19823 | −2% to 0% |
+| coremark.rv64gb.gcc14.2.elf | 17723 | 18931 | −6.4% |
+| coremark-rv64g_zba_zbb | 19522 | 19411 | +0.6% |
+
+On rv64g_b the Rust JIT now runs 6% fewer host instructions per iteration
+than asmjit (1.56M vs 1.67M) at 1-3% more cycles; on rv64gc and the
+gcc14.2 ELF it still runs more instructions than asmjit (not yet looked
+at). The remaining difference elsewhere is mostly register allocation:
+guest registers live across a whole region (loaded at entry, stored at
+every exit, as in asmjit), and in high-pressure loops regalloc2 keeps
+loop-carried ones in spill slots. Guest calls are still tail calls with
+returns through the entry table, where asmjit makes native calls
+(`emit_direct_call`) whose returns the host predicts.
 
 ## JIT
 
@@ -361,8 +385,11 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   and loops never go back through the interpreter, and the stack doesn't
   grow.
 - Guest registers (integer and FP, the latter as raw 64-bit patterns) live
-  in SSA variables, loaded on function entry and stored on exit; arena
-  loads/stores are inlined with `Memory`'s exact range checks.
+  in SSA variables, loaded on function entry and stored on exit; `x0` is
+  the constant zero (C++ asmjit's `get(0)`; nothing writes it, the
+  register file included). Arena loads/stores are inlined with `Memory`'s
+  exact range checks, against windows that are constants in the code (see
+  "Bounds checks and register pressure").
   An access outside them leaves native code at that instruction
   (`EXIT_SLOW`): the interpreter runs it through the page table and
   finishes the (already counted) block.
@@ -370,8 +397,12 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
   Native code exits to the interpreter on anything it doesn't compile
   (system calls, CSRs incl. FCSR, atomics, Zfa, Zfhmin, FENCE.I, CBO,
-  CLMUL, FUNCBLOCK entries), on faults and at the instruction limit, with
-  exactly the PC, registers and counter the interpreter would have.
+  CLMUL), on faults and at the instruction limit, with exactly the PC,
+  registers and counter the interpreter would have. FUNCBLOCK entries
+  (the decoder's split of over-long blocks) are compiled: the instruction,
+  then `NEXT_BLOCK`'s limit check and the next block's count, as
+  `dispatch::funcblock` does. (They used to exit, which cost ~5% of
+  CoreMark in `jit_enter` and the interpreter.)
 - F and D (not in the `debug-checks` build, which NaN-boxes): Cranelift's
   IEEE operations as they are, whatever is fastest. For non-NaN inputs
   that's the interpreter's result (both round to nearest on the host, and
@@ -385,14 +416,52 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   single-precision write keeps the upper half of the register (no
   NaN-boxing), like the interpreter.
 - Instruction selection follows `decode::fast_handler`, not the precise
-  decoder, quirks included. `x0` is still read from the register file rather
-  than assumed zero.
+  decoder, quirks included.
   Counting follows the dispatcher: block counts on block entry, checks at the
   same block ends, and mid-block exits pre-subtract the target's count.
 - Stale segments are interpreted (native code doesn't check staleness after
   slow-path instructions, and nothing it runs can make a segment stale).
 - x86-64 only for now: AArch64 needs an instruction-cache flush in the rt
   crate. Cranelift's x64 tail calls need `preserve_frame_pointers`.
+
+**Bounds checks and register pressure** (2026-11-13; the JIT was 18-24%
+behind asmjit on CoreMark 1.0, `--nbit-address-space` closed most of it,
+so the checks were the cost). Each region function used to keep the arena
+pointer, both windows' base and length and the instruction limit live in
+registers throughout. That forced spills: each check reloaded two values
+from the stack, and the exit arguments were built on the fast path. Now:
+
+- The windows are constants in the code (C++ `aj_machine_info`'s baked
+  arena bounds): a check is `lea`/`cmp`/`jae`. The layout
+  (`libriscv_jit_rt::MemoryLayout`: N-bit mask or windows) is part of the
+  shared segment key, and `CodeMemory::enter` refuses code whose windows
+  aren't inside the machine's (the interpreter runs it then). The windows
+  are final before any execute segment is created (`loader.rs`).
+- Each exit (slow access, limit, misaligned jump) is a cold block of its
+  own, which materialises the exit kind and PC.
+- The instruction limit is read from the state block at each check (as
+  asmjit compares against memory), not kept in a register.
+- One check covers several accesses: the first access through a base
+  register checks the span of offsets of the accesses through it up to the
+  end of its straight-line run (a label, a control-flow instruction, a
+  FUNCBLOCK) or until the register is written. The interpreter checks only
+  an access's start address, so the span check passes exactly when all of
+  the accesses' checks would; when it fails, native code leaves at the
+  first access and the interpreter finishes the block, as for any slow
+  access. Results and counts stay the interpreter's, unlike C++'s binary
+  translator, which elides checks within the arena's over-allocation of
+  an earlier one and so lets accesses at the window edges through. When
+  the write window lies inside the read window (a loaded program), a store
+  check also covers the loads whose offsets lie inside the stores' span:
+  they lie between two writable addresses. `tests/jit.rs`
+  (`merged_bounds_checks_match_the_interpreter`, which also runs a minimal
+  ELF so the write window starts at the end of read-only data) sweeps base
+  registers across the window edges.
+
+Tried and dropped: making the fall-through of an in-region conditional
+branch a plain label instead of an entry (asmjit's leaders aren't these),
+so checks could carry across not-taken branches. It increased host
+instructions by 2% and branch misses by 12% on CoreMark.
 
 **Background compilation** (C++ `asmjit_background_callback` +
 `livepatch.hpp`). C++ compiles on an embedder thread, patches a *copy* of

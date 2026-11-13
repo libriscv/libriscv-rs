@@ -19,7 +19,7 @@ mod classify;
 mod emit;
 mod region;
 
-use libriscv_jit_rt::{CodeMemory, JitState};
+use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
@@ -28,7 +28,6 @@ use crate::decoder_cache::DecodedSegment;
 use crate::dispatch::Handler;
 use crate::error::{ExceptionKind, MachineError};
 use crate::machine::Machine;
-use crate::memory::RWREAD_BEGIN;
 
 /// Exit kinds written by generated code (`JitState::exit_kind`).
 /// The instruction limit was reached before jumping to `exit_pc`.
@@ -55,7 +54,7 @@ pub(crate) struct JitSegment {
     original: Vec<(usize, Handler)>,
 }
 
-/// Compile `segment` (with the guest address mask `mask`, see
+/// Compile `segment` (for the guest memory layout `layout`, see
 /// [`JitSegment::compile`]) on a new thread (`MachineOptions::jit_background`,
 /// C++ `asmjit_background_callback`), which publishes the result in the
 /// segment ([`DecodedSegment::finish_background_jit`]). Every machine
@@ -63,7 +62,7 @@ pub(crate) struct JitSegment {
 /// process-wide cache) keeps interpreting it meanwhile, and switches to the
 /// compiled copy at its next slice. If no thread can be started, compiles
 /// synchronously instead.
-pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, mask: u64) {
+pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, layout: MemoryLayout) {
     /// Publishes "nothing compiled" if the compilation panics, so that
     /// nobody waits for it forever. (No effect after a real result.)
     struct Finish(Arc<DecodedSegment>);
@@ -77,11 +76,11 @@ pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, mask: u64) {
     let spawned = std::thread::Builder::new()
         .name("libriscv-jit".into())
         .spawn(move || {
-            let compiled = JitSegment::compile(&finish.0, mask);
+            let compiled = JitSegment::compile(&finish.0, layout);
             finish.0.finish_background_jit(compiled);
         });
     if spawned.is_err() {
-        segment.finish_background_jit(JitSegment::compile(segment, mask));
+        segment.finish_background_jit(JitSegment::compile(segment, layout));
     }
 }
 
@@ -116,20 +115,23 @@ pub(crate) enum JitExit {
 impl JitSegment {
     /// Compile `exec` and patch its decoder entries to enter the native code.
     /// Leaves `exec` untouched if nothing could be compiled.
-    pub(crate) fn attach(exec: &mut DecodedSegment, mask: u64) {
-        if let Some(compiled) = Self::compile(exec, mask) {
+    pub(crate) fn attach(exec: &mut DecodedSegment, layout: MemoryLayout) {
+        if let Some(compiled) = Self::compile(exec, layout) {
             Self::install(exec, compiled);
         }
     }
 
     /// Compile `exec` without changing it. Only reads the segment, so it can
     /// run on another thread while the interpreter executes the segment.
-    /// With a non-zero `mask` (the arena size minus one, a power of two
-    /// minus one), guest addresses are masked instead of bounds-checked
-    /// (`MachineOptions::jit_automatic_nbit_address_space`).
-    pub(crate) fn compile(exec: &DecodedSegment, mask: u64) -> Option<Compiled> {
+    /// With a non-zero `layout.mask` (the arena size minus one, a power of
+    /// two minus one), guest addresses are masked instead of bounds-checked
+    /// (`MachineOptions::jit_automatic_nbit_address_space`). Otherwise the
+    /// code checks them against `layout`'s windows, which are constants in
+    /// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
+    /// windows don't contain them interpret the segment instead.
+    pub(crate) fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Compiled> {
         let analysis = region::analyse(exec);
-        emit::compile(exec, &analysis, mask)
+        emit::compile(exec, &analysis, layout)
     }
 
     /// Patch `exec`'s decoder entries to enter `compiled`.
@@ -172,11 +174,7 @@ impl JitSegment {
         counter: u64,
         max: u64,
     ) -> JitExit {
-        let read = (RWREAD_BEGIN, m.memory.memory_arena_read_boundary());
-        let write = (
-            m.memory.initial_rodata_end(),
-            m.memory.memory_arena_write_boundary(),
-        );
+        let MemoryLayout { read, write, .. } = m.memory.jit_layout();
         let frm = u64::from(m.cpu.regs.fcsr().frm());
         let (regs, fregs) = m.cpu.regs.x_f_mut();
         let arena = m.memory.arena_mut();

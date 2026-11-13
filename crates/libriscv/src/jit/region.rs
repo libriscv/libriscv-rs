@@ -25,6 +25,10 @@ pub(crate) struct Insn {
     pub pc: u64,
     pub len: u64,
     pub op: JOp,
+    /// A FUNCBLOCK entry (C++ `RV32I_BC_FUNCBLOCK`): the last instruction
+    /// of an over-long block, which isn't control flow. The next
+    /// instruction begins a new block, after an instruction-limit check.
+    pub funcblock: bool,
 }
 
 /// Index of a region.
@@ -109,12 +113,20 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
             classify(exec.read_instruction(pc, end), pc)
         };
         // Block-ending entries that aren't control flow are FUNCBLOCK
-        // entries (over-long blocks): they keep the precise handler, so they
-        // stay interpreted.
-        let op = op.filter(|op| op.is_terminator() == ends_block);
+        // entries (over-long blocks). They run the precise handler, which
+        // for everything `classify` accepts does what the fast one does
+        // (the fast handlers defer to it for their quirks), and then begin
+        // the next block like a jump would.
+        let op = op.filter(|op| !op.is_terminator() || ends_block);
+        let funcblock = ends_block && op.is_some_and(|op| !op.is_terminator());
         if let (Some(op), Some(slot)) = (op, by_index.get_mut(index)) {
             *slot = Some(insns.len() as u32);
-            insns.push(Insn { pc, len, op });
+            insns.push(Insn {
+                pc,
+                len,
+                op,
+                funcblock,
+            });
             if starts_block {
                 block_starts.push(index);
             }

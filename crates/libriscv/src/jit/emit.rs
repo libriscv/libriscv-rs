@@ -27,12 +27,24 @@
 //!
 //! Generated code only touches the state block, the 32 integer and 32
 //! floating-point registers and the guest arena, and every arena access is
-//! preceded by the same range check as `Memory::read_*`/`write_*`, or with
+//! covered by the same range check as `Memory::read_*`/`write_*`, or with
 //! an N-bit address space, masked with the arena size minus one (C++
 //! `arena_index` in `aj_emit.cpp`); `CodeMemory` checks the arena is that
-//! large. `libriscv-jit-rt` validates the
-//! checked windows against the real arena length. See its crate
-//! documentation for the full contract. Besides other region functions, it
+//! large. The windows are constants in the code (C++ `aj_machine_info`'s
+//! baked arena bounds), and `libriscv-jit-rt` only enters the code when
+//! they lie inside the machine's windows, which it validates against the
+//! real arena length. See its crate documentation for the full contract.
+//!
+//! One check can cover several accesses: the first access through a base
+//! register checks the whole span of offsets that the accesses through the
+//! same register (and of the same kind, load or store) use until the end of
+//! its straight-line run, or until the register changes. Each access's own
+//! check is on its start address, so the span check passes exactly when
+//! all of theirs would; when it fails, native code leaves at the first
+//! access and the interpreter runs the rest of the block, as it would for
+//! that access alone. (C++'s binary translator elides checks within the
+//! arena's over-allocation of the first one instead, which lets accesses
+//! near the window edges through; this keeps the interpreter's results.) Besides other region functions, it
 //! only calls the pure floating-point helpers below (Cranelift's libcalls
 //! for rounding and FMA on hosts without SSE4.1 or FMA).
 //!
@@ -62,7 +74,7 @@ use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{Context, RelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
-use libriscv_jit_rt::{CodeMemory, JitState};
+use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 
 use super::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary};
 use super::region::{Analysis, Insn, RegionId, block_icount};
@@ -248,8 +260,12 @@ fn relocate(image: &mut [u8], at: usize, kind: Reloc, what: i64) -> Option<()> {
 }
 
 /// Compile every region of `a`, link them and map the result executable.
-/// `mask`: see [`JitSegment::compile`](super::JitSegment::compile).
-pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, mask: u64) -> Option<Compiled> {
+/// `layout`: see [`JitSegment::compile`](super::JitSegment::compile).
+pub(crate) fn compile(
+    exec: &DecodedSegment,
+    a: &Analysis,
+    layout: MemoryLayout,
+) -> Option<Compiled> {
     if a.regions.is_empty() {
         return None;
     }
@@ -260,7 +276,7 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, mask: u64) -> Option<
     for r in 0..a.regions.len() {
         ctx.clear();
         ctx.func = Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
-        RegionEmitter::emit(exec, a, r, mask, &mut ctx.func, &mut fctx, &isa)?;
+        RegionEmitter::emit(exec, a, r, layout, &mut ctx.func, &mut fctx, &isa)?;
         objects.push(compile_function(&mut ctx, &isa)?);
     }
     // The trampoline: called from Rust with the C calling convention as
@@ -298,7 +314,7 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, mask: u64) -> Option<
         }
     }
     let trampoline = *offsets.last()?;
-    let code = CodeMemory::new(&image, trampoline, &entries, mask).ok()?;
+    let code = CodeMemory::new(&image, trampoline, &entries, layout).ok()?;
     let patch = a
         .block_starts
         .iter()
@@ -348,8 +364,8 @@ struct RegionEmitter<'a, 'f> {
     exec: &'a DecodedSegment,
     a: &'a Analysis,
     region: RegionId,
-    /// Guest address mask, 0 for bounds checks.
-    mask: u64,
+    /// Guest address mask (or 0) and the windows checked against.
+    layout: MemoryLayout,
     b: FunctionBuilder<'f>,
     regs: [Variable; 32],
     /// The FP registers, as raw 64-bit patterns.
@@ -362,12 +378,13 @@ struct RegionEmitter<'a, 'f> {
     regs_ptr: Value,
     fregs_ptr: Value,
     arena: Value,
-    read_base: Value,
-    read_len: Value,
-    write_base: Value,
-    write_len: Value,
-    max: Value,
     labels: HashMap<u64, Block>,
+    /// Position in the region's instruction list of the instruction being
+    /// emitted.
+    pos: usize,
+    /// `[load, store][base register]`: the span of offsets an earlier check
+    /// in this straight-line run covers for accesses through that register.
+    checked: [[Option<Span>; 32]; 2],
     /// `(kind, pc, counter)`: store the registers, then leave.
     exit: Block,
     /// `(kind, pc, counter)`: leave; the registers are already stored.
@@ -385,7 +402,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         exec: &'a DecodedSegment,
         a: &'a Analysis,
         region: RegionId,
-        mask: u64,
+        layout: MemoryLayout,
         func: &'f mut Function,
         fctx: &'f mut FunctionBuilderContext,
         isa: &OwnedTargetIsa,
@@ -395,10 +412,11 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let (mut fused, mut fwritten) = ([false; 32], [false; 32]);
         for &i in &r.insns {
             let u = operands(a.insns.get(i)?.op);
-            for s in u.x.into_iter().flatten() {
+            // x0 is a constant: never loaded, never stored.
+            for s in u.x.into_iter().flatten().filter(|&s| s != 0) {
                 *used.get_mut(s as usize)? = true;
             }
-            if let Some(d) = u.xw {
+            if let Some(d) = u.xw.filter(|&d| d != 0) {
                 *used.get_mut(d as usize)? = true;
                 *written.get_mut(d as usize)? = true;
             }
@@ -431,11 +449,6 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         let regs_ptr = ld(&mut b, JitState::OFFSET_REGS);
         let fregs_ptr = ld(&mut b, JitState::OFFSET_FREGS);
         let arena = ld(&mut b, JitState::OFFSET_ARENA);
-        let read_base = ld(&mut b, JitState::OFFSET_READ_BASE);
-        let read_len = ld(&mut b, JitState::OFFSET_READ_LEN);
-        let write_base = ld(&mut b, JitState::OFFSET_WRITE_BASE);
-        let write_len = ld(&mut b, JitState::OFFSET_WRITE_LEN);
-        let max = ld(&mut b, JitState::OFFSET_MAX);
         for (n, (&u, &var)) in used.iter().zip(&regs).enumerate() {
             if u {
                 let v = b.ins().load(I64, host_flags(), regs_ptr, (n * 8) as i32);
@@ -463,7 +476,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             exec,
             a,
             region,
-            mask,
+            layout,
             b,
             regs,
             fregs,
@@ -474,12 +487,9 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             regs_ptr,
             fregs_ptr,
             arena,
-            read_base,
-            read_len,
-            write_base,
-            write_len,
-            max,
             labels: HashMap::new(),
+            pos: 0,
+            checked: [[None; 32]; 2],
             exit,
             exit_stored,
             xfer: HashMap::new(),
@@ -523,18 +533,34 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         self.a.insns.get(i)
     }
 
+    /// Integer register `r`. `x0` is the constant zero (C++ asmjit's
+    /// `get(0)`): nothing ever writes it, in the register file either.
     fn reg(&mut self, r: u32) -> Value {
+        let r = (r & 31) as usize;
+        if r == 0 {
+            return self.b.ins().iconst(I64, 0);
+        }
         // The index is masked to 0..32, so it is always in bounds.
         #[allow(clippy::indexing_slicing)]
-        let var = self.regs[(r & 31) as usize];
+        let var = self.regs[r];
         self.b.use_var(var)
     }
 
+    /// Write integer register `r`; writes to `x0` are discarded.
     fn set_reg(&mut self, r: u32, v: Value) {
+        let r = (r & 31) as usize;
+        if r == 0 {
+            return;
+        }
         // The index is masked to 0..32, so it is always in bounds.
         #[allow(clippy::indexing_slicing)]
-        let var = self.regs[(r & 31) as usize];
-        self.b.def_var(var, v);
+        {
+            let var = self.regs[r];
+            self.b.def_var(var, v);
+            // Checks made through the old value no longer apply.
+            self.checked[0][r] = None;
+            self.checked[1][r] = None;
+        }
     }
 
     /// FP register `r` as raw bits.
@@ -594,7 +620,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     fn body(&mut self, insns: &[usize]) -> Option<()> {
         // `open`: the current block can still fall through.
         let mut open = false;
-        for &i in insns {
+        for (pos, &i) in insns.iter().enumerate() {
             let ins = *self.insn(i)?;
             if let Some(&label) = self.labels.get(&ins.pc) {
                 if open {
@@ -602,13 +628,24 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.b.ins().jump(label, &[]);
                 }
                 self.b.switch_to_block(label);
+                // Other paths reach the label without this run's checks.
+                self.checked = [[None; 32]; 2];
             } else if !open {
                 // Unreachable by construction: a non-entry instruction is
                 // only ever reached by falling through.
                 return None;
             }
+            self.pos = pos;
             open = self.instruction(&ins)?;
-            if open {
+            if open && ins.funcblock {
+                // C++ `RV32I_BC_FUNCBLOCK`: `NEXT_BLOCK` with the overflow
+                // check. (It also leaves a stale segment, but nothing native
+                // code runs can make one stale.)
+                let next = ins.pc.wrapping_add(ins.len);
+                self.check_counter(next);
+                self.enter_block(next);
+                open = false;
+            } else if open {
                 let next = ins.pc.wrapping_add(ins.len);
                 if self.a.region_at(self.exec, next) != Some(self.region) {
                     self.leave_mid_block(next);
@@ -662,18 +699,39 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// `if counter >= max { halt at target }`, as the dispatcher checks
     /// before jumping.
     fn check_counter(&mut self, target: u64) {
+        let over = self.over_limit();
+        self.exit_if(over, EXIT_HALT, ExitPc::Const(target));
+    }
+
+    /// `counter >= max`. The limit is read from the state block at every
+    /// check (as C++ asmjit compares against memory) rather than kept in a
+    /// register for the whole function.
+    fn over_limit(&mut self) -> Value {
         let c = self.count();
-        let over = self
+        let max = self
             .b
             .ins()
-            .icmp(IntCC::UnsignedGreaterThanOrEqual, c, self.max);
-        let ok = self.b.create_block();
-        let kind = self.b.ins().iconst(I64, EXIT_HALT as i64);
-        let pc = self.b.ins().iconst(I64, target as i64);
-        self.b
-            .ins()
-            .brif(over, self.exit, &args(&[kind, pc, c]), ok, &[]);
-        self.b.switch_to_block(ok);
+            .load(I64, host_flags(), self.state, JitState::OFFSET_MAX);
+        self.b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, c, max)
+    }
+
+    /// Leave with `kind` at `pc` (and the current counter) if `cond`. The
+    /// exit is a cold block of its own, so its arguments are only
+    /// materialised on the way out, not on the fast path.
+    fn exit_if(&mut self, cond: Value, kind: u64, pc: ExitPc) {
+        let c = self.count();
+        let cold = self.b.create_block();
+        self.b.set_cold_block(cold);
+        let cont = self.b.create_block();
+        self.b.ins().brif(cond, cold, &[], cont, &[]);
+        self.b.switch_to_block(cold);
+        let kind = self.b.ins().iconst(I64, kind as i64);
+        let pc = match pc {
+            ExitPc::Const(pc) => self.b.ins().iconst(I64, pc as i64),
+            ExitPc::Value(pc) => pc,
+        };
+        self.b.ins().jump(self.exit, &args(&[kind, pc, c]));
+        self.b.switch_to_block(cont);
     }
 
     fn leave(&mut self, kind: u64, pc: u64, counter: Value) {
@@ -806,37 +864,128 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         f
     }
 
-    /// Bounds-check `addr` against `[base, base + len)` and return the host
-    /// address. Like `Memory`'s fast path, anything else goes to the page
-    /// table: the interpreter takes over at the instruction at `pc`. With
-    /// an N-bit address space, mask it instead, without a check.
-    fn guest_addr(&mut self, addr: Value, write: bool, pc: u64) -> Value {
-        if self.mask != 0 {
-            let index = if self.mask == u64::from(u32::MAX) {
+    /// The host address of the access at `rs1 + imm`, bounds-checked
+    /// against the load or store window `[base, base + len)`. Like
+    /// `Memory`'s fast path, anything else goes to the page table: the
+    /// interpreter takes over at the instruction at `pc`. With an N-bit
+    /// address space, mask it instead, without a check.
+    ///
+    /// The check covers the accesses through `rs1` later in the run as well
+    /// (see [`Self::check_span`] and the module documentation); one that an
+    /// earlier check covers has none of its own.
+    fn guest_addr(&mut self, rs1: u32, imm: i64, write: bool, pc: u64) -> Value {
+        let base = self.reg(rs1);
+        let addr = self.b.ins().iadd_imm_s(base, imm);
+        let mask = self.layout.mask;
+        if mask != 0 {
+            let index = if mask == u64::from(u32::MAX) {
                 // A 32-bit zero extension, without materialising the mask.
                 let low = self.b.ins().ireduce(I32, addr);
                 self.b.ins().uextend(I64, low)
             } else {
-                self.b.ins().band_imm_s(addr, self.mask as i64)
+                self.b.ins().band_imm_s(addr, mask as i64)
             };
             return self.b.ins().iadd(self.arena, index);
         }
-        let (base, len) = if write {
-            (self.write_base, self.write_len)
-        } else {
-            (self.read_base, self.read_len)
+        let reg = (rs1 & 31) as usize;
+        let within = |span: Option<Span>| span.is_some_and(|(lo, hi)| lo <= imm && imm <= hi);
+        let covered_by = |kind: usize| {
+            within(
+                self.checked
+                    .get(kind)
+                    .and_then(|k| k.get(reg))
+                    .copied()
+                    .flatten(),
+            )
         };
-        let off = self.b.ins().isub(addr, base);
-        let ok = self.b.ins().icmp(IntCC::UnsignedLessThan, off, len);
-        let cont = self.b.create_block();
-        let kind = self.b.ins().iconst(I64, EXIT_SLOW as i64);
-        let pc = self.b.ins().iconst(I64, pc as i64);
-        let c = self.count();
-        self.b
-            .ins()
-            .brif(ok, cont, &[], self.exit, &args(&[kind, pc, c]));
-        self.b.switch_to_block(cont);
+        // A store check also covers loads when every writable address is
+        // readable.
+        let stores_cover_loads = window_within(self.layout.write, self.layout.read);
+        let covered = if write {
+            covered_by(1)
+        } else {
+            covered_by(0) || (stores_cover_loads && covered_by(1))
+        };
+        if !covered {
+            let (loads, stores) = self.check_spans(rs1);
+            // A load inside the span of the stores that follow it is checked
+            // with them: it lies between two of their addresses, so it is
+            // inside the window when they are, and the check only fails
+            // when one of the stores would leave native code anyway.
+            let as_store = write || (stores_cover_loads && within(stores));
+            let (lo, hi) = if as_store { stores } else { loads }.unwrap_or((imm, imm));
+            let (win_base, win_len) = if as_store {
+                self.layout.write
+            } else {
+                self.layout.read
+            };
+            // Every `rs1 + k` for k in lo..=hi is inside the window exactly
+            // when `rs1 + lo` is inside its first `len - (hi - lo)` bytes:
+            // the span is below 2^13 and the window below 2^64, so nothing
+            // wraps in between.
+            let span = hi.wrapping_sub(lo) as u64;
+            let first = self
+                .b
+                .ins()
+                .iadd_imm_s(base, lo.wrapping_sub(win_base as i64));
+            let outside = self.b.ins().icmp_imm_s(
+                IntCC::UnsignedGreaterThanOrEqual,
+                first,
+                win_len.saturating_sub(span) as i64,
+            );
+            self.exit_if(outside, EXIT_SLOW, ExitPc::Const(pc));
+            if let Some(slot) = self
+                .checked
+                .get_mut(usize::from(as_store))
+                .and_then(|k| k.get_mut(reg))
+            {
+                *slot = Some((lo, hi));
+            }
+        }
         self.b.ins().iadd(self.arena, addr)
+    }
+
+    /// The offset spans `(lo, hi)` of the loads and of the stores through
+    /// `rs1` from the instruction at `self.pos` to the end of its
+    /// straight-line run (the next label, or an instruction that doesn't
+    /// fall through), up to and including the first instruction that writes
+    /// `rs1`: what a check made there can cover.
+    fn check_spans(&self, rs1: u32) -> (Option<Span>, Option<Span>) {
+        let mut spans: [Option<Span>; 2] = [None, None];
+        let Some(run) = self
+            .a
+            .regions
+            .get(self.region)
+            .and_then(|r| r.insns.get(self.pos..))
+        else {
+            return (None, None);
+        };
+        let mut prev: Option<&Insn> = None;
+        for &i in run {
+            let Some(ins) = self.insn(i) else { break };
+            // Straight-line code: the next instruction, reached only by
+            // falling through, not a label (which other paths reach).
+            if let Some(p) = prev
+                && (p.op.is_terminator()
+                    || p.funcblock
+                    || p.pc.wrapping_add(p.len) != ins.pc
+                    || self.labels.contains_key(&ins.pc))
+            {
+                break;
+            }
+            if let Some((base, off, write)) = access(ins.op)
+                && base == rs1
+                && let Some(span) = spans.get_mut(usize::from(write))
+            {
+                *span = Some(span.map_or((off, off), |(lo, hi)| (lo.min(off), hi.max(off))));
+            }
+            if operands(ins.op).xw == Some(rs1) {
+                break;
+            }
+            prev = Some(ins);
+        }
+        let [loads, stores] = spans;
+        (loads, stores)
     }
 
     /// Emit one instruction. Returns whether control falls through.
@@ -874,9 +1023,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs1,
                 imm,
             } => {
-                let base = self.reg(rs1);
-                let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, false, ins.pc);
+                let host = self.guest_addr(rs1, imm, false, ins.pc);
                 if let Some(rd) = rd {
                     let v = self.load(width, signed, host);
                     self.set_reg(rd, v);
@@ -888,10 +1035,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs2,
                 imm,
             } => {
-                let base = self.reg(rs1);
                 let value = self.reg(rs2);
-                let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, true, ins.pc);
+                let host = self.guest_addr(rs1, imm, true, ins.pc);
                 self.store(width, value, host);
             }
             JOp::Branch {
@@ -938,27 +1083,14 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.set_reg(rd, link);
                 }
                 let target = self.b.ins().band_imm_s(address, !1);
-                let c = self.count();
                 if !COMPRESSED {
                     let low = self.b.ins().band_imm_s(target, 3);
-                    let ok = self.b.create_block();
-                    let kind = self.b.ins().iconst(I64, EXIT_MISALIGNED as i64);
-                    self.b
-                        .ins()
-                        .brif(low, self.exit, &args(&[kind, target, c]), ok, &[]);
-                    self.b.switch_to_block(ok);
+                    self.exit_if(low, EXIT_MISALIGNED, ExitPc::Value(target));
                 }
                 // overflow_checked_jump
-                let over = self
-                    .b
-                    .ins()
-                    .icmp(IntCC::UnsignedGreaterThanOrEqual, c, self.max);
-                let go = self.b.create_block();
-                let kind = self.b.ins().iconst(I64, EXIT_HALT as i64);
-                self.b
-                    .ins()
-                    .brif(over, self.exit, &args(&[kind, target, c]), go, &[]);
-                self.b.switch_to_block(go);
+                let over = self.over_limit();
+                self.exit_if(over, EXIT_HALT, ExitPc::Value(target));
+                let c = self.count();
                 let blk = self.indirect_block();
                 self.b.ins().jump(blk, &args(&[target, c]));
                 return Some(false);
@@ -969,9 +1101,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs1,
                 imm,
             } => {
-                let base = self.reg(rs1);
-                let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, false, ins.pc);
+                let host = self.guest_addr(rs1, imm, false, ins.pc);
                 if width == 4 {
                     let w = self.b.ins().load(I32, guest_flags(), host, 0);
                     self.set_low_word(rd, w);
@@ -986,10 +1116,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs2,
                 imm,
             } => {
-                let base = self.reg(rs1);
                 let value = self.freg(rs2);
-                let addr = self.b.ins().iadd_imm_s(base, imm);
-                let host = self.guest_addr(addr, true, ins.pc);
+                let host = self.guest_addr(rs1, imm, true, ins.pc);
                 self.store(width, value, host);
             }
             JOp::FBin {
@@ -1592,6 +1720,37 @@ const fn intcc(cond: Cond) -> IntCC {
         Cond::Ge => IntCC::SignedGreaterThanOrEqual,
         Cond::Ltu => IntCC::UnsignedLessThan,
         Cond::Geu => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+/// Offsets `lo..=hi` of guest memory accesses through one base register.
+type Span = (i64, i64);
+
+/// The PC an exit leaves with.
+#[derive(Debug, Clone, Copy)]
+enum ExitPc {
+    Const(u64),
+    Value(Value),
+}
+
+/// True if the window `inner` lies inside `outer` and isn't empty.
+fn window_within(inner: (u64, u64), outer: (u64, u64)) -> bool {
+    inner.1 != 0
+        && inner.0 >= outer.0
+        && inner
+            .0
+            .checked_add(inner.1)
+            .zip(outer.0.checked_add(outer.1))
+            .is_some_and(|(i, o)| i <= o)
+}
+
+/// The base register and offset of a guest memory access, and whether it
+/// is a store.
+const fn access(op: JOp) -> Option<(u32, i64, bool)> {
+    match op {
+        JOp::Load { rs1, imm, .. } | JOp::FLoad { rs1, imm, .. } => Some((rs1, imm, false)),
+        JOp::Store { rs1, imm, .. } | JOp::FStore { rs1, imm, .. } => Some((rs1, imm, true)),
+        _ => None,
     }
 }
 
