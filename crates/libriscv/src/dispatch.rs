@@ -499,6 +499,12 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
 /// the decoder entry with the asmjit function the same way). Only installed
 /// at block starts, which are only reached through `BEGIN_BLOCK`, so the
 /// counter already includes this block; native code counts it itself.
+///
+/// The dispatcher loop also calls it directly for unpatched entries that
+/// native code can be entered at (`dispatch_chain`): native entries inside
+/// a decoder block, such as a loop head, which can't be patched because the
+/// interpreter falls through them. Then the entry's own handler is the
+/// interpreter's.
 #[cfg(feature = "jit")]
 pub(crate) extern "rust-preserve-none" fn jit_enter(
     exec: &DecodedSegment,
@@ -520,10 +526,8 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
     // native code doesn't check for: interpret it instead. (Nothing native
     // code runs can make the segment stale, so checking once is enough.)
     if exec.is_stale() {
-        return match jit.original_handler(i) {
-            Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
-            None => bad_entry(m, start),
-        };
+        let handler = jit.original_handler(i).unwrap_or(e.handler);
+        become handler(exec, cache, i, m, pc, c, ins)
     }
     let (mut slot, mut entry_pc) = (i, start);
     let mut before = c.value.wrapping_sub(e.instruction_count());
@@ -638,10 +642,10 @@ pub(crate) extern "rust-preserve-none" fn jit_enter(
                 become handler(exec, cache, si, m, block_pc, c, e.instr)
             }
             JitExit::Fault(err) => return fault(m, err),
-            JitExit::Unavailable if slot == i => match jit.original_handler(i) {
-                Some(handler) => become handler(exec, cache, i, m, pc, c, ins),
-                None => return bad_entry(m, start),
-            },
+            JitExit::Unavailable if slot == i => {
+                let handler = jit.original_handler(i).unwrap_or(e.handler);
+                become handler(exec, cache, i, m, pc, c, ins)
+            }
             JitExit::Unavailable => {
                 // Re-entry after a dyncall: finish its block in the interpreter.
                 let e = entry!(exec, cache, slot, m, entry_pc, c);
@@ -796,7 +800,21 @@ impl Machine {
             // BEGIN_BLOCK
             let block_pc = pc.wrapping_add(e.block_bytes());
             c.value = c.value.wrapping_add(e.instruction_count());
-            match (e.handler)(&exec, &exec.cache, i, self, block_pc, c, e.instr) {
+            // Native code can be entered at more places than the decoder
+            // entries patched with `jit_enter`: those are only the decoder
+            // block starts, since the interpreter falls through the others.
+            // A block beginning here at a native entry inside a decoder block
+            // (resuming after a background-compilation slice or a halt, at a
+            // loop head reached by a backward branch) enters native code too;
+            // otherwise the interpreter would run the whole loop.
+            #[cfg(feature = "jit")]
+            let handler = match &exec.jit {
+                Some(jit) if jit.has_entry(i) && !exec.is_stale() => jit_enter,
+                _ => e.handler,
+            };
+            #[cfg(not(feature = "jit"))]
+            let handler = e.handler;
+            match handler(&exec, &exec.cache, i, self, block_pc, c, e.instr) {
                 Exit::Halt => return Ok((self.dispatch.counter, self.dispatch.pc)),
                 Exit::Jump => {
                     c = self.dispatch.counter;

@@ -560,6 +560,11 @@ impl Memory {
     pub(crate) const fn hold_jit_pending(&mut self) {
         self.jit_hold = true;
     }
+    /// Undo [`hold_jit_pending`](Self::hold_jit_pending).
+    #[cfg(all(test, feature = "jit"))]
+    pub(crate) const fn release_jit_pending(&mut self) {
+        self.jit_hold = false;
+    }
     #[cfg(all(test, feature = "jit"))]
     pub(crate) const fn jit_held(&self) -> bool {
         self.jit_hold

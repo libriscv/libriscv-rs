@@ -62,7 +62,7 @@ use std::collections::HashMap;
 
 use cranelift_codegen::binemit::Reloc;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::condcodes::{CondCode, FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Offset32;
 use cranelift_codegen::ir::types::{F32, F64, I8, I16, I32, I64};
 use cranelift_codegen::ir::{
@@ -1053,17 +1053,34 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 target,
                 check,
             } => {
+                // Cranelift lowers a `brif`'s else successor right after
+                // it. Forward branches keep the guest's fall-through there.
+                // Backward branches (loops) invert the condition so the
+                // taken path, the limit check and the jump back to the loop
+                // head, comes next: one taken host branch per iteration
+                // instead of two (C++ asmjit's `jcc notaken` + back-edge
+                // check). Half the cycles of a tight loop.
+                let backward = target <= ins.pc;
+                let cc = if backward {
+                    intcc(cond).complement()
+                } else {
+                    intcc(cond)
+                };
                 let a = self.reg(rs1);
-                let taken = match rs2 {
+                let test = match rs2 {
                     Some(rs2) => {
                         let b = self.reg(rs2);
-                        self.b.ins().icmp(intcc(cond), a, b)
+                        self.b.ins().icmp(cc, a, b)
                     }
-                    None => self.b.ins().icmp_imm_s(intcc(cond), a, 0),
+                    None => self.b.ins().icmp_imm_s(cc, a, 0),
                 };
                 let yes = self.b.create_block();
                 let no = self.b.create_block();
-                self.b.ins().brif(taken, yes, &[], no, &[]);
+                if backward {
+                    self.b.ins().brif(test, no, &[], yes, &[]);
+                } else {
+                    self.b.ins().brif(test, yes, &[], no, &[]);
+                }
                 self.b.switch_to_block(yes);
                 if check {
                     self.check_counter(target);

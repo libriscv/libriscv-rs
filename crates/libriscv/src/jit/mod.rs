@@ -189,6 +189,8 @@ impl JitSegment {
         counter: u64,
         max: u64,
     ) -> JitExit {
+        #[cfg(test)]
+        tests::ENTRIES.with_borrow_mut(|e| e.push(pc));
         let MemoryLayout { read, write, .. } = m.memory.jit_layout();
         let frm = u64::from(m.cpu.regs.fcsr().frm());
         let (regs, fregs) = m.cpu.regs.x_f_mut();
@@ -225,6 +227,12 @@ mod tests {
     use crate::{Machine, MachineOptions};
 
     const V: u64 = 0x10000;
+
+    thread_local! {
+        /// The PC of every entry into native code on this thread.
+        pub(super) static ENTRIES: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
         ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x13
@@ -438,6 +446,77 @@ mod tests {
             assert_eq!(run(true, a, b), run(false, a, b), "{a} {b}");
         }
         super::emit::BASELINE_ISA.store(false, Ordering::Relaxed);
+    }
+
+    /// A loop head inside a decoder block (straight-line code runs into
+    /// it) is a native entry, but its decoder entry isn't patched, since the
+    /// interpreter falls through it. A block beginning there must still
+    /// enter native code: resuming after a halt at the back-edge, and after
+    /// a background compilation arrives mid-loop (the slice ends at the
+    /// back-edge). Otherwise the interpreter runs the rest of the loop.
+    #[test]
+    fn resuming_at_a_loop_head_inside_a_block_enters_native_code() {
+        let head = V + 8;
+        let code: Vec<u8> = [
+            addi(15, 0, 1000),
+            addi(10, 0, 0),
+            // loop (inside the decoder block that began at V):
+            addi(10, 10, 1),
+            addi(15, 15, -1),
+            bne(15, 0, -8),
+            JSELF,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let state = |m: &Machine| {
+            let mut s = m.cpu.registers().all().to_vec();
+            s.extend([m.cpu.pc(), m.instruction_counter()]);
+            s
+        };
+        let machine = |jit: bool, background: bool| {
+            let mut m = Machine::new(
+                &[],
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    jit_background: background,
+                    jit_background_slice: 7,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            m.cpu.jump(V).unwrap();
+            m
+        };
+        let mut expected = machine(false, false);
+        expected.try_simulate(100, 0).unwrap();
+        assert_eq!(expected.cpu.pc(), head);
+        let resume = |m: &mut Machine| {
+            let c = m.instruction_counter();
+            m.try_simulate(c + 2000, c).unwrap();
+        };
+        resume(&mut expected);
+
+        for background in [false, true] {
+            let mut m = machine(true, background);
+            if background {
+                // Interpret in slices until the halt, then let the code in.
+                m.memory.hold_jit_pending();
+            }
+            m.try_simulate(100, 0).unwrap();
+            assert_eq!(m.cpu.pc(), head, "background {background}");
+            if background {
+                m.memory.release_jit_pending();
+                m.wait_for_jit();
+            }
+            ENTRIES.with_borrow_mut(Vec::clear);
+            resume(&mut m);
+            let first = ENTRIES.with_borrow(|e| e.first().copied());
+            assert_eq!(first, Some(head), "background {background}");
+            assert_eq!(state(&m), state(&expected), "background {background}");
+        }
     }
 
     #[test]

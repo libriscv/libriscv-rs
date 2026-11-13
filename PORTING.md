@@ -409,6 +409,15 @@ Cranelift's rounding and FMA libcalls, resolved to plain Rust helpers in
   finishes the (already counted) block.
 - Decoder entries at block starts that native code can be entered at get the
   `dispatch::jit_enter` handler (C++ patches decoder entries the same way).
+  Only decoder block starts are patched: the interpreter falls through the
+  other entries mid-block, already counted (C++ patches every region entry
+  and over-counts then). Native entries inside a decoder block, such as a
+  loop head that straight-line code runs into, are entered when a block
+  *begins* there in the dispatcher loop (`dispatch_chain`): resuming after
+  a halt, after a background-compilation slice, or in a new segment.
+  Before that, a loop running while its background compilation finished
+  stayed interpreted to its end (`binaries/measure_mips/fib64`: 800 ms
+  instead of 95 ms).
   Valid dyncall words (`dyncall.rs`, C++ `dyncall.hpp`) are compiled as
   counted calls, like asmjit's `emit_dyncall`/`execute_counted_dyncall`:
   native code leaves with `EXIT_DYNCALL` (all registers stored, block
@@ -482,6 +491,14 @@ from the stack, and the exit arguments were built on the fast path. Now:
   (`merged_bounds_checks_match_the_interpreter`, which also runs a minimal
   ELF so the write window starts at the end of read-only data) sweeps base
   registers across the window edges.
+
+Backward conditional branches invert their condition so that Cranelift
+lowers the taken path (limit check, jump to the loop head) right after the
+branch, as asmjit's `jcc notaken` + back-edge check: Cranelift places a
+`brif`'s else successor next, which put the loop exit inline and cost a
+second taken branch per iteration. A 5-instruction loop went from ~3 to ~2
+host cycles per iteration (asmjit `--accurate` parity), CoreMark rv64gc
+~4% (2026-11-13). Forward branches keep the guest's fall-through inline.
 
 Tried and dropped: making the fall-through of an in-region conditional
 branch a plain label instead of an entry (asmjit's leaders aren't these),
