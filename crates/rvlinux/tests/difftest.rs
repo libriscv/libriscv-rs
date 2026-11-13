@@ -834,7 +834,7 @@ static void fold(ulong v) { h[n] = (h[n] ^ v) * 0x100000001b3ul; h[n] = (h[n] <<
 
 #define LD "fmv.d.x ft0, %1\n\tfmv.d.x ft1, %2\n\tfmv.d.x ft2, %3\n\tfmv.d.x ft3, %4\n\t"
 #define IN : "r"(a), "r"(b), "r"(c), "r"(d) : "ft0", "ft1", "ft2", "ft3"
-#define F3(op) do { ulong r; asm volatile(LD op " ft3, ft0, ft1, ft2\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
+#define F3(op, canon) do { ulong r; asm volatile(LD op " ft3, ft0, ft1, ft2\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(canon(r)); } while (0)
 #define F2(op) do { ulong r; asm volatile(LD op " ft3, ft0, ft1\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
 #define F1(op) do { ulong r; asm volatile(LD op " ft3, ft0\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
 #define F1R(op, rm) do { ulong r; asm volatile(LD op " ft3, ft0, " rm "\n\tfmv.x.d %0, ft3" : "=r"(r) IN); fold(r); } while (0)
@@ -861,10 +861,15 @@ static void __attribute__((noinline)) bin(ulong a, ulong b, ulong c, ulong d) {
     X2("feq.s"); X2("flt.s"); X2("fle.s"); X2("feq.d"); X2("flt.d"); X2("fle.d");
     X2("fleq.s"); X2("fltq.s"); X2("fleq.d"); X2("fltq.d");
 }
+/* FMA NaN results are the host fma()'s: C++ calls glibc's, which uses the
+   CPU's FMA instruction, and which NaN that returns varies between CPUs;
+   Rust uses compiler-builtins' software fma(). Only fold whether it's NaN. */
+static ulong canon32(ulong v) { return ((v & 0x7f800000) == 0x7f800000 && (v & 0x7fffff)) ? 0x7fc00000 : v; }
+static ulong canon64(ulong v) { return ((v & 0x7ff0000000000000ul) == 0x7ff0000000000000ul && (v & 0xffffffffffffful)) ? 0x7ff8000000000000ul : v; }
 static void __attribute__((noinline)) fused(ulong a, ulong b, ulong c, ulong d) {
     n = 0;
-    F3("fmadd.s"); F3("fmsub.s"); F3("fnmadd.s"); F3("fnmsub.s");
-    F3("fmadd.d"); F3("fmsub.d"); F3("fnmadd.d"); F3("fnmsub.d");
+    F3("fmadd.s", canon32); F3("fmsub.s", canon32); F3("fnmadd.s", canon32); F3("fnmsub.s", canon32);
+    F3("fmadd.d", canon64); F3("fmsub.d", canon64); F3("fnmadd.d", canon64); F3("fnmsub.d", canon64);
 }
 /* Single-operand operations, including signaling NaNs. */
 static void __attribute__((noinline)) unary(ulong a, ulong d) {

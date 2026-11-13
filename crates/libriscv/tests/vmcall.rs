@@ -10,6 +10,8 @@
     clippy::expect_used,
     clippy::indexing_slicing
 )]
+// Every test runs a glibc guest, and the distribution's glibc is RV64GC.
+#![cfg(all(feature = "ext-a", feature = "ext-c", feature = "ext-f"))]
 
 use std::cell::Cell;
 

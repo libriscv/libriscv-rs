@@ -13,6 +13,8 @@
     clippy::expect_used,
     clippy::indexing_slicing
 )]
+// Every test runs a glibc guest, and the distribution's glibc is RV64GC.
+#![cfg(all(feature = "ext-a", feature = "ext-c", feature = "ext-f"))]
 
 use libriscv::registers::{REG_ARG0, REG_ARG7};
 use libriscv::{ExceptionKind, Machine, MachineOptions};

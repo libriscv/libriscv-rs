@@ -20,7 +20,7 @@ env:
   DEBUGINFOD_URLS: ''
   # C++ libriscv commit whose tests/unit/elf binaries seed elffuzzer.
   # Same as LIBRISCV_CPP_REF in ci.yml.
-  LIBRISCV_CPP_REF: 6b81381257f00826da357c40e7288a0e5e523274
+  LIBRISCV_CPP_REF: e806d46046fb4059ab6e605255852b9335386de2
   # cargo-fuzz flags (do_fuzz.sh reads them too). The prebuilt cargo-fuzz is
   # a musl binary and would default --target to musl, so pin the host's.
   FUZZ_FLAGS: -s none -a --target x86_64-unknown-linux-gnu

@@ -12,6 +12,12 @@
 //! JIT's `emit` module), so FP programs are compared up to the first NaN.
 
 #![cfg(feature = "jit")]
+// The FP tests need F/D without NaN-boxing; without them, their helpers are
+// unused.
+#![cfg_attr(
+    not(all(feature = "ext-f", not(feature = "debug-checks"))),
+    allow(dead_code)
+)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -306,6 +312,27 @@ fn faults_and_syscalls_leave_the_jit_precisely() {
     // A store into the read-only window faults too.
     let program = [itype(0x13, 0, 10, 0, 1), stype(0, 0, 10, 0x10), jtype(0, 0)];
     compare(&words(&program), &regs, &fuels(), "write fault");
+}
+
+/// Straight-line code that runs off the end of the segment, entered at its
+/// start and through a branch into the last instruction. In the 4-byte
+/// layout the last instruction keeps its handler and falls into the padding
+/// entry (an illegal instruction, counted when native code leaves there);
+/// with compressed instructions the decoder force-ends it as invalid.
+#[test]
+fn falling_off_the_segment_end_matches_the_interpreter() {
+    let addi = itype(0x13, 0, 10, 10, 1); // addi a0, a0, 1
+    for n in 1..=6 {
+        let program = vec![addi; n];
+        compare(&words(&program), &[0; 64], &fuels(), &format!("{n} addi"));
+    }
+    let program = [
+        btype(0, 0, 0, 12), // beqz x0, +12
+        addi,
+        addi,
+        addi,
+    ];
+    compare(&words(&program), &[0; 64], &fuels(), "branch to the end");
 }
 
 /// Loads and stores outside the arena windows go through the page table:

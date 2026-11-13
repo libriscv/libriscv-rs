@@ -4,9 +4,9 @@ This is the plan and progress tracker for the port. Update the status column
 in the same commit that changes it.
 
 **Reference:** C++ libriscv at `../libriscv` (override with `$LIBRISCV_CPP`),
-tracking upstream commit `6b81381257f00826da357c40e7288a0e5e523274` (v1.11+).
-When the C++ side moves, bump this hash and the one in `.github/workflows/ci.yml`
-together.
+tracking upstream commit `e806d46046fb4059ab6e605255852b9335386de2` (v1.11+).
+When the C++ side moves, bump this hash and the ones in
+`.github/workflows/ci.yml` and `fuzzing.yml` together.
 
 ## Goals
 
@@ -642,6 +642,12 @@ Phase 5) and `insert_non_owned_memory`.
 Prebuilt guests (Rust, Go, Zig, newlib, tinycc) live in
 `../libriscv/tests/unit/elf`; use `testutil::cpp_fixture(name)`.
 
+CI also tests the 4-byte decoder layout (`--no-default-features`, with and
+without `jit`). The distribution's glibc is RV64GC, so tests running glibc
+guests are ignored (or, for `linux.rs` and `vmcall.rs`, compiled out)
+without the A, C and F features; freestanding guests are built for what
+the features allow.
+
 The C++ reference is always run with `--no-translate --accurate` so we compare
 against the interpreter with exact instruction counts.
 `scripts/build-cpp-reference.sh` builds the threaded, tailcall and switch
@@ -687,6 +693,12 @@ Expected until the listed phase:
   depends on the C++ compiler: clang inlines `std::fmin` as `minnum` (the
   other operand, as here), while a call into glibc returns a quiet NaN. The
   difftests avoid that case.
+- FMADD/FMSUB/FNMADD/FNMSUB NaN results (payload and sign) come from the
+  host's `fma`: C++ calls glibc's, which uses the CPU's FMA instruction,
+  and which NaN operand that returns differs between CPUs; Rust's
+  `mul_add` calls compiler-builtins' software `fma`. They agree on an AMD
+  Ryzen 7950X but differed on a GitHub runner. Calling glibc's `fma` would
+  need `unsafe`. The float difftest compares only whether the result is NaN.
 - Freestanding guests have no crt0 to set `gp`, so with linker relaxation
   their globals land near address 0 or `-2048`: build them with
   `-mno-relax`.

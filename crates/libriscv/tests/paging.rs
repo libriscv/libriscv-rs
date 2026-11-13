@@ -150,6 +150,10 @@ fn misaligned_page_attributes() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn writes_to_read_only_segment() {
     let Some(binary) = build(
         r#"
@@ -393,6 +397,10 @@ fn run_all_ways(binary: &[u8], name: &str, expected: i64, inaccurate: bool) {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn fib_on_execute_page() {
     let code = format!(
         r#"{SYSCALLS}
@@ -421,6 +429,10 @@ fn fib_on_execute_page() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn fib_on_high_memory_page() {
     let Some(binary) = build(
         r#"
@@ -454,6 +466,10 @@ fn fib_on_high_memory_page() {
 /// FENCE.I makes earlier stores to instruction memory visible to later
 /// fetches: the stale segment is evicted and rebuilt from the pages.
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn fence_i_observes_stores_to_instruction_memory() {
     let code = format!(
         r#"{SYSCALLS}
@@ -483,6 +499,10 @@ fn fence_i_observes_stores_to_instruction_memory() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn riscv_flush_icache_observes_stores_to_instruction_memory() {
     let code = format!(
         r#"{SYSCALLS}
@@ -509,6 +529,10 @@ fn riscv_flush_icache_observes_stores_to_instruction_memory() {
 
 /// A linear decode can't tell a constant pool from instructions.
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn guest_jit_emits_constants_between_functions() {
     let code = format!(
         r#"{SYSCALLS}
@@ -535,6 +559,10 @@ fn guest_jit_emits_constants_between_functions() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn repeated_fence_i_does_not_rebuild_the_main_segment() {
     let code = format!(
         r#"{SYSCALLS}
@@ -566,6 +594,10 @@ fn repeated_fence_i_does_not_rebuild_the_main_segment() {
 
 /// Executing outside any executable page faults with the address.
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn jumping_to_data_is_an_execute_fault() {
     let Some(binary) = build(
         r#"
@@ -588,6 +620,10 @@ fn jumping_to_data_is_an_execute_fault() {
 const PIE_ARGS: &str = "-O2 -pie -Wl,--no-dynamic-linker,-z,text";
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn instantiate_pie_machine() {
     let Some(binary) = build("int main() { return 666; }", PIE_ARGS) else {
         return;
@@ -619,6 +655,10 @@ fn shared_object_needs_a_dynamic_linker() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn fib_in_pie_executable() {
     let Some(binary) = build(
         r#"

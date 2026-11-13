@@ -294,6 +294,7 @@ pub(crate) use overflow_checked_jump;
 /// next entry. Used for C++ bytecodes whose handler does the same, without
 /// FUNCTION's stale-segment check (FMADD). The entry holds the original
 /// instruction bits.
+#[cfg(feature = "ext-f")]
 pub(crate) extern "rust-preserve-none" fn seq<O: Op>(
     exec: &DecodedSegment,
     cache: &[DecoderEntry],

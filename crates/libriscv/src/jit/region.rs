@@ -75,12 +75,11 @@ impl Analysis {
 }
 
 /// The instruction count the interpreter adds when it begins a block at
-/// `pc` (C++ `BEGIN_BLOCK`). Zero if there's no entry (the interpreter faults
-/// there instead).
+/// `pc` (C++ `BEGIN_BLOCK`): the entry `begin_block!` looks up, including
+/// the padding entries past the segment end (which count one instruction in
+/// the 4-byte layout, where the count is `idxend + 1`). Zero if there's no
+/// entry (the interpreter faults there instead).
 pub(crate) fn block_icount(exec: &DecodedSegment, pc: u64) -> u64 {
-    if !exec.is_within(pc, 2) {
-        return 0;
-    }
     exec.cache
         .get(exec.index(pc))
         .map_or(0, |e| e.instruction_count())
@@ -116,9 +115,14 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
         // entries (over-long blocks). They run the precise handler, which
         // for everything `classify` accepts does what the fast one does
         // (the fast handlers defer to it for their quirks), and then begin
-        // the next block like a jump would.
+        // the next block like a jump would. The exception is the segment's
+        // last instruction in the 4-byte layout, whose block ends only
+        // because the segment does: it keeps its handler and falls through
+        // into the padding entry past the end. (With compressed
+        // instructions, the decoder force-ends it as invalid instead.)
         let op = op.filter(|op| !op.is_terminator() || ends_block);
-        let funcblock = ends_block && op.is_some_and(|op| !op.is_terminator());
+        let last = pc.wrapping_add(len) >= end;
+        let funcblock = ends_block && !last && op.is_some_and(|op| !op.is_terminator());
         if let (Some(op), Some(slot)) = (op, by_index.get_mut(index)) {
             *slot = Some(insns.len() as u32);
             insns.push(Insn {

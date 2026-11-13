@@ -69,8 +69,17 @@ fn an_automatic_nbit_address_space_masks_arena_accesses() {
     if !testutil::need_compiler() {
         return;
     }
-    let binary = testutil::build_and_load(WRITER, "-O2 -static -nostdlib -ffreestanding")
-        .unwrap_or_else(|e| panic!("{e}"));
+    // The compiler defaults to RV64GC; the guest only needs RV64IM.
+    let march = if cfg!(feature = "ext-c") {
+        ""
+    } else {
+        "-march=rv64im -mabi=lp64"
+    };
+    let binary = testutil::build_and_load(
+        WRITER,
+        &format!("-O2 -static -nostdlib -ffreestanding {march}"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     // A bounds-checked build faults on a read-only store...
     assert_eq!(
         run(&binary, true, false),

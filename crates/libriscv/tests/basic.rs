@@ -131,6 +131,10 @@ fn linux_options() -> MachineOptions {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn verify_program_arguments_and_environment() {
     if !testutil::need_compiler() {
         return;
@@ -163,6 +167,10 @@ fn verify_program_arguments_and_environment() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn catch_output_from_write_system_call() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static HELLO: AtomicBool = AtomicBool::new(false);
@@ -204,6 +212,10 @@ const FIB: &str = r#"
     }"#;
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn calculate_fib_50() {
     if !testutil::need_compiler() {
         return;
@@ -217,6 +229,10 @@ fn calculate_fib_50() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn count_using_ebreak() {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);

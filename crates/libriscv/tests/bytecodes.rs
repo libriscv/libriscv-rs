@@ -148,7 +148,9 @@ fn short_instruction(r: &mut Rng) -> u16 {
 fn program(r: &mut Rng) -> Vec<u8> {
     let mut code = Vec::new();
     for _ in 0..INSTRUCTIONS {
-        if r.below(2) == 0 {
+        // Without the C extension, only 4-byte instructions (the 4-byte
+        // decoder layout).
+        if !cfg!(feature = "ext-c") || r.below(2) == 0 {
             code.extend(long_instruction(r).to_le_bytes());
         } else {
             code.extend(short_instruction(r).to_le_bytes());

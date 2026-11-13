@@ -5,6 +5,10 @@
 //! `fp64reg`); the F/D extension adds the NaN-boxing views. Vector registers
 //! come with the V extension (Phase 5).
 
+/// C++ `nanboxing`: single-precision values get the upper half of their
+/// register filled with ones only in the `debug-checks` build.
+pub(crate) const NANBOXING: bool = cfg!(feature = "debug-checks");
+
 /// `x1`, the return address register.
 pub const REG_RA: u32 = 1;
 /// `x2`, the stack pointer.
@@ -132,6 +136,20 @@ impl Registers {
         {
             self.f[(idx & 31) as usize] = value;
         }
+    }
+
+    /// Set the low 32 bits of floating-point register `idx`, NaN-boxing it
+    /// in the `debug-checks` build and keeping the upper half otherwise; C++
+    /// `getfl(idx).load_u32(value)` (and `set_float`). Available without the
+    /// F extension, like in C++, for VM call arguments.
+    #[inline(always)]
+    pub const fn load_fp_u32(&mut self, idx: u32, value: u32) {
+        let upper = if NANBOXING {
+            0xFFFF_FFFF_0000_0000
+        } else {
+            self.fp_bits(idx) & 0xFFFF_FFFF_0000_0000
+        };
+        self.set_fp_bits(idx, upper | value as u64);
     }
 
     /// All 32 floating-point registers as raw bits.

@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   # C++ libriscv commit used as the differential-testing oracle.
   # Keep in sync with PORTING.md.
-  LIBRISCV_CPP_REF: 6b81381257f00826da357c40e7288a0e5e523274
+  LIBRISCV_CPP_REF: e806d46046fb4059ab6e605255852b9335386de2
   # eembc/coremark commit for the CoreMark difftest and benchmark.
   COREMARK_REF: eefc986ebd3452d6adde22eafaff3e5c859f29e4
 
@@ -97,4 +97,6 @@ jobs:
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - run: cargo build -p libriscv --no-default-features
-      - run: cargo build -p libriscv --all-features
+      # Everything except `fcsr`, which is a deliberate compile error until
+      # it's ported.
+      - run: cargo build -p libriscv --features ext-a,ext-c,ext-f,ext-v,debug-checks,jit

@@ -76,7 +76,7 @@ impl ArgRegs {
         if self.farg > REG_LAST {
             return Err(too_many_args());
         }
-        crate::isa::rvfd::load_u32(m, self.farg, value.to_bits());
+        m.cpu.regs.load_fp_u32(self.farg, value.to_bits());
         self.farg += 1;
         Ok(())
     }

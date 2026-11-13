@@ -25,8 +25,7 @@ compile_error!(
     "the `fcsr` feature (C++ RISCV_FCSR) is not ported yet: FCSR emulation needs long double"
 );
 
-/// C++ `nanboxing`.
-pub(crate) const NANBOXING: bool = cfg!(feature = "debug-checks");
+pub(crate) use crate::registers::NANBOXING;
 
 /// RISC-V canonical NaNs.
 pub(crate) const CANONICAL_NAN_F32: u32 = 0x7fc0_0000;
@@ -99,12 +98,7 @@ fn unboxed(m: &Machine, r: u32) -> bool {
 /// `load_u32`: the low word, plus the box if NaN-boxing.
 #[inline(always)]
 pub(crate) fn load_u32(m: &mut Machine, r: u32, v: u32) {
-    let upper = if NANBOXING {
-        0xFFFF_FFFF_0000_0000
-    } else {
-        bits(m, r) & 0xFFFF_FFFF_0000_0000
-    };
-    m.cpu.regs.set_fp_bits(r, upper | u64::from(v));
+    m.cpu.regs.load_fp_u32(r, v);
 }
 /// `set_float`
 #[inline(always)]

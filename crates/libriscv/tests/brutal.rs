@@ -92,6 +92,10 @@ fn forked_machines_require_an_empty_flat_memory_arena() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn calculate_fib_50_slowly() {
     let Some(binary) = build(
         r#"
@@ -141,6 +145,10 @@ fn calculate_fib_50_slowly() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn execute_libc_start_main_slowly() {
     let Some(binary) = build("int main() { return 1234; }", "-O2 -static") else {
         return;
@@ -163,6 +171,10 @@ fn execute_libc_start_main_slowly() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn threads_test_suite_slowly() {
     if !testutil::need_compiler() {
         return;
@@ -203,6 +215,10 @@ fn threads_test_suite_slowly() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn forks_see_their_own_copy_on_write_pages() {
     // Four arrays, two pages each, visited interleaved so that every access
     // moves to another page. The fork first reads the master's pages, then
@@ -336,6 +352,10 @@ fn vmcall2(m: &mut Machine, f: &str, a: i64, b: i64) -> libriscv::Result<i64> {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn page_caches_drop_pages_whose_protections_change() {
     let Some(mut machine) = boot_page_cache_program() else {
         return;
@@ -389,6 +409,10 @@ fn page_caches_drop_pages_whose_protections_change() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn discarding_a_forks_copy_on_write_page() {
     let Some(machine) = boot_page_cache_program() else {
         return;
@@ -410,6 +434,10 @@ fn discarding_a_forks_copy_on_write_page() {
 // What follows goes beyond brutal.cpp.
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn forks_are_snapshots_of_their_master() {
     let Some(mut machine) = boot_page_cache_program() else {
         return;
@@ -435,6 +463,10 @@ fn forks_are_snapshots_of_their_master() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn forking_from_many_threads() {
     let Some(machine) = boot_page_cache_program() else {
         return;
@@ -462,6 +494,10 @@ fn forking_from_many_threads() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn fork_page_accounting() {
     let Some(mut machine) = boot_page_cache_program() else {
         return;
@@ -510,6 +546,10 @@ fn fork_page_accounting() {
 }
 
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn mprotect_of_a_loaned_page_does_not_reach_the_master() {
     let Some(mut machine) = boot_page_cache_program() else {
         return;
