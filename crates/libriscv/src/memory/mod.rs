@@ -1080,4 +1080,35 @@ mod tests {
         assert_eq!(mem.read_u32(0x1000).unwrap(), 5);
         assert_eq!(mem.owned_pages_active(), 1);
     }
+
+    /// Ranges running past the top of the address space end there. They
+    /// used to overflow (a panic with overflow checks; undefined behaviour
+    /// in C++): `madvise(0x203000, -1, MADV_DONTNEED)` wraps back into its
+    /// own first page, so it took the page-by-page path with an end before
+    /// its start. Found by `linuxfuzzer`.
+    #[test]
+    fn memdiscard_past_the_top_of_the_address_space() {
+        let far = 0x10_0000_0000;
+        // The fuzzer's lengths, then one ending exactly at 2^64.
+        for (dst, len) in [
+            (0x3000, u64::MAX),
+            (0x3000, 0xFFFF_FFFF_FFFF_F930),
+            (0x3000, 0x3000u64.wrapping_neg()),
+            (0x3800, u64::MAX),
+        ] {
+            let mut mem = empty_memory(MIB);
+            mem.write_u64(0x2000, 1).unwrap(); // below: kept
+            mem.write_u64(0x8000, 2).unwrap(); // above, in the arena
+            mem.write_u64(far, 3).unwrap(); // above, outside the arena
+            mem.memdiscard(dst, len, true).unwrap();
+            assert_eq!(mem.read_u64(0x2000).unwrap(), 1, "{dst:#x} {len:#x}");
+            assert_eq!(mem.read_u64(0x8000).unwrap(), 0, "{dst:#x} {len:#x}");
+            assert_eq!(mem.read_u64(far).unwrap(), 0, "{dst:#x} {len:#x}");
+        }
+        // From 0, the whole address space.
+        let mut mem = empty_memory(MIB);
+        mem.write_u64(0x8000, 2).unwrap();
+        mem.memdiscard(0, u64::MAX, true).unwrap();
+        assert_eq!(mem.read_u64(0x8000).unwrap(), 0);
+    }
 }
