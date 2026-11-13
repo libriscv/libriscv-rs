@@ -77,6 +77,7 @@ mod jit;
 mod linux;
 mod machine;
 pub mod memory;
+mod native;
 mod options;
 pub mod registers;
 mod signals;
@@ -88,7 +89,7 @@ mod threads;
 mod vmcall;
 
 pub use cpu::Cpu;
-pub use decoder_cache::DecodedSegment;
+pub use decoder_cache::{DecodedSegment, EbreakLocation};
 pub use dyncall::Dyncall;
 pub use elf::interpreter as elf_interpreter;
 pub use error::{ExceptionKind, MachineError, Result};
@@ -99,6 +100,7 @@ pub use machine::{
     UnhandledSyscall, UnimplementedInstruction,
 };
 pub use memory::{Buffer, GuestPod, GuestSlice, GuestSliceMut, MEMVIEW_MAX, Memory, PAGE_SIZE};
+pub use native::{Arena, ArenaChunk, Callsite, PointerType, UnknownFree, UnknownRealloc};
 pub use options::MachineOptions;
 pub use registers::Registers;
 pub use signals::{SignalAction, SignalPerThread, SignalStack, Signals};

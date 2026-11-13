@@ -105,7 +105,10 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
             break;
         };
         let ends_block = entry.block_bytes() == 0;
-        let op = if entry.invalid {
+        // SYSTEM entries aren't compiled. Besides the real ones, that
+        // keeps native code away from the breakpoints and hot-patched libc
+        // functions (`native::libc`) that replace an entry's instruction.
+        let op = if entry.invalid || entry.is_system() {
             None
         } else {
             // The entry holds the rewriter's bits; classify the original.

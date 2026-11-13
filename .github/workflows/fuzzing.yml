@@ -63,7 +63,7 @@ jobs:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
         run: |
           status=0
-          for target in vmfuzzer elffuzzer syshelperfuzzer; do
+          for target in vmfuzzer elffuzzer nativefuzzer syshelperfuzzer; do
             echo "::group::$target (${FUZZ_SECONDS}s)"
             ./do_fuzz.sh "$target" -- \
               -max_total_time="$FUZZ_SECONDS" \

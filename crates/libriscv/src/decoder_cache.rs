@@ -24,7 +24,8 @@
 //! machine holding the segment switches to the native code, not only the
 //! one that started the compilation (C++ live-patches the shared segment).
 //!
-//! Not ported yet: EBREAK locations and the libc fast path.
+//! New segments get the decoder cache patches of [`SegmentPatches`]: EBREAK
+//! locations, and the libc fast path for the program's initial segment.
 
 use std::collections::BTreeMap;
 #[cfg(feature = "jit")]
@@ -81,6 +82,43 @@ impl DecoderEntry {
             self.icount as u64
         } else {
             self.idxend as u64 + 1
+        }
+    }
+
+    /// C++ `get_bytecode() == RV32I_BC_SYSTEM`: EBREAK, the CSR
+    /// instructions, and the EBREAKs of breakpoints and the libc fast path.
+    pub(crate) fn is_system(&self) -> bool {
+        std::ptr::fn_addr_eq(self.handler, dispatch::system as Handler)
+    }
+}
+
+/// Where a breakpoint goes (C++ `MachineOptions::ebreak_locations`, a
+/// `std::variant` of an address and a symbol name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EbreakLocation {
+    Address(u64),
+    /// An ELF symbol; ignored if the program has no such symbol.
+    Symbol(String),
+}
+
+/// The decoder cache patches applied to new execute segments
+/// (`Memory::generate_decoder_cache`, after decoding).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SegmentPatches {
+    /// `MachineOptions::ebreak_locations`, for every segment.
+    pub ebreak_locations: Vec<EbreakLocation>,
+    /// `MachineOptions::libc_fastpath`, for the initial segment.
+    pub libc_fastpath: bool,
+    /// `MachineOptions::verbose_loader`.
+    pub verbose: bool,
+}
+
+impl SegmentPatches {
+    pub(crate) fn from_options(options: &crate::MachineOptions) -> Self {
+        Self {
+            ebreak_locations: options.ebreak_locations.clone(),
+            libc_fastpath: options.libc_fastpath,
+            verbose: options.verbose_loader,
         }
     }
 }
@@ -390,6 +428,107 @@ impl DecodedSegment {
         Ok(seg)
     }
 
+    /// Apply `patches` to this (new) segment, the end of C++
+    /// `generate_decoder_cache`: EBREAK locations (symbols are looked up in
+    /// `binary`), then, if `initial`, the libc fast path.
+    pub(crate) fn apply_patches(
+        &mut self,
+        patches: &SegmentPatches,
+        binary: &[u8],
+        initial: bool,
+    ) -> Result<()> {
+        for loc in &patches.ebreak_locations {
+            let addr = match loc {
+                EbreakLocation::Address(addr) => *addr,
+                EbreakLocation::Symbol(name) => {
+                    crate::elf::resolve_symbol(binary, name)?.map_or(0, |s| s.st_value)
+                }
+            };
+            if addr != 0 && addr >= self.begin && addr < self.end {
+                self.install_ebreak_for(addr)?;
+                if patches.verbose {
+                    println!("libriscv: Added ebreak location at 0x{addr:x}");
+                }
+            }
+        }
+        if patches.libc_fastpath && initial {
+            crate::native::libc::install_libc_fastpath(self, binary, patches.verbose)?;
+        }
+        Ok(())
+    }
+
+    /// Port of `CPU::create_block_ending_entry_at`: make the instruction at
+    /// `addr` the last one of its block, by ending the entries before it
+    /// in the same block there. Returns its decoder index; the caller
+    /// replaces the entry. Like C++, the instruction counts of the entries
+    /// before it become 0 with the C extension (a C++ TODO).
+    pub(crate) fn create_block_ending_entry_at(&mut self, addr: u64) -> Result<usize> {
+        if !self.is_within(addr, 2) {
+            return Err(MachineError::new(
+                crate::ExceptionKind::ExecutionSpaceProtectionFault,
+                "Breakpoint address is not within the execute segment",
+                addr,
+            ));
+        }
+        let begin = self.index(self.begin);
+        let last = self.index(addr);
+        // 1. Look back to find the beginning of the block.
+        let block_bytes = |i: usize| self.cache.get(i).map_or(0, DecoderEntry::block_bytes);
+        let mut current = last;
+        let mut last_block_bytes = block_bytes(current);
+        while current > begin && block_bytes(current - 1) > last_block_bytes {
+            current -= 1;
+            last_block_bytes = block_bytes(current);
+        }
+        // 2. Find the start address of the block.
+        let block_begin_addr = addr.wrapping_sub(DIVISOR * (last - current) as u64);
+        if !self.is_within(block_begin_addr, 2) {
+            return Err(MachineError::invalid_program(
+                "Breakpoint block was outside execute area",
+                block_begin_addr,
+            ));
+        }
+        // 3. Correct the block length of every entry in the block.
+        let mut patched_addr = block_begin_addr;
+        for dd in current..last {
+            let i = self.index(patched_addr);
+            if let Some(p) = self.cache.get_mut(i) {
+                p.idxend = (last - dd) as u16;
+                if COMPRESSED {
+                    p.icount = 0; // TODO in C++: C-extension icount for breakpoints
+                }
+            }
+            patched_addr = patched_addr.wrapping_add(DIVISOR);
+        }
+        // Check that the last address matches the breakpoint address.
+        if patched_addr != addr {
+            return Err(MachineError::invalid_program(
+                "Last instruction in breakpoint block was not aligned",
+                patched_addr,
+            ));
+        }
+        Ok(last)
+    }
+
+    /// Port of `CPU::install_ebreak_for`: replace the instruction at
+    /// `addr` with an EBREAK ending its block, in the decoder cache only.
+    /// Returns the entry's old instruction bits.
+    pub(crate) fn install_ebreak_for(&mut self, addr: u64) -> Result<u32> {
+        let i = self.create_block_ending_entry_at(addr)?;
+        let Some(entry) = self.cache.get_mut(i) else {
+            return Ok(0);
+        };
+        let old = entry.instr;
+        entry.instr = 0x0010_0073; // EBREAK
+        entry.handler = dispatch::system;
+        entry.invalid = false;
+        entry.idxend = 0;
+        if COMPRESSED {
+            entry.icount = 0; // TODO in C++: C-extension icount for breakpoints
+        }
+        Ok(old)
+    }
+
     fn entry_mut(&mut self, pc: u64) -> Option<&mut DecoderEntry> {
         let i = self.index(pc);
         self.cache.get_mut(i)
@@ -644,6 +783,9 @@ pub(crate) struct SegmentKey {
     pub len: u64,
     pub crc32c: u32,
     pub execute_only: bool,
+    /// The libc fast path patched the segment. (C++ doesn't key on it, so
+    /// a machine without the fast path can get a patched segment there.)
+    pub libc_fastpath: bool,
     /// `None` without the JIT, else the guest memory layout its code is
     /// built for (the address mask, or the windows it checks against).
     /// Machines that don't JIT never get native code this way.

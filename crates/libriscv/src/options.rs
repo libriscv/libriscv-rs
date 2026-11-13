@@ -72,6 +72,19 @@ pub struct MachineOptions {
     /// address (C++ `use_shared_execute_segments`, default on). Forks share
     /// their master's segments either way.
     pub use_shared_execute_segments: bool,
+    /// Breakpoints: EBREAKs installed in the decoder cache of every
+    /// execute segment containing them (guest memory is unchanged), which
+    /// run the EBREAK system call handler (C++ `ebreak_locations`).
+    /// Segments with breakpoints are not shared with other machines.
+    pub ebreak_locations: Vec<crate::EbreakLocation>,
+    /// Hot-patch known libc functions (memcpy, memset, memmove, memcmp,
+    /// memchr, rawmemchr, strlen, strnlen, strcmp, strncmp, strcpy, stpcpy,
+    /// strncpy, strchr, strchrnul and their aliases, found by ELF symbol)
+    /// in the program's initial execute segment with native
+    /// implementations, charged like the native memory system calls (C++
+    /// `libc_fastpath`). Only the decoder cache is patched; other EBREAKs
+    /// still reach the EBREAK handler, whenever it is installed.
+    pub libc_fastpath: bool,
 }
 
 impl Default for MachineOptions {
@@ -94,6 +107,8 @@ impl Default for MachineOptions {
             jit_automatic_nbit_address_space: false,
             default_exit_function: None,
             use_shared_execute_segments: true,
+            ebreak_locations: Vec::new(),
+            libc_fastpath: false,
         }
     }
 }

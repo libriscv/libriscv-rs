@@ -659,10 +659,10 @@ Phase 5) and `insert_non_owned_memory`.
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
-| Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `syshelperfuzzer` (system call memory helpers). Built with debug assertions and overflow checks; any panic is a bug. `FUZZ_NAT` waits for the native heap |
+| Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `nativefuzzer` (native heap and memory system calls; C++ `FUZZ_NAT` without native threads), `syshelperfuzzer` (system call memory helpers). Built with debug assertions and overflow checks; any panic is a bug |
 
 Prebuilt guests (Rust, Go, Zig, newlib, tinycc) live in
 `../libriscv/tests/unit/elf`; use `testutil::cpp_fixture(name)`.
@@ -991,10 +991,63 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   address_t, size_t)` compares the host byte as a signed `char`, flipping
   the result for bytes above 0x7F; here every path compares unsigned bytes
   (and returns an `Ordering`, since only `memcmp`'s sign is meaningful).
+  The guest-to-guest `memcmp` behind the native memcmp system call and
+  the libc fast path returns the difference of the first differing
+  (unsigned) bytes, what C++'s slow path returns; its fast paths return
+  the host `std::memcmp`'s value, whose magnitude depends on the host libc.
 - Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
   above 64 throws `std::out_of_range`, here it's `ILLEGAL_OPERATION`.
+
+### Native heap and libc fast path
+
+`native/` ports `native_heap.hpp` and `native_libc.cpp` (not
+`native_threads.cpp`):
+
+- `native/heap.rs`: the allocator (`Arena`), step for step, so the same
+  calls give the same addresses (`tests/heap.rs` replays 200k random
+  calls, with and without a chunk cap, against the results C++ gave). Its errors are returned with
+  C++'s kind, message and data; the search statistics C++ only keeps with
+  `RISCV_ARENA_DEBUG` (which its unit tests enable) are always kept. The
+  inline metadata storage (`ArenaInlineVector`) is kept, since
+  `metadata_on_heap` reports it.
+- `native/mod.rs`: `Machine::setup_native_heap` (malloc, calloc,
+  realloc, free, meminfo), `setup_native_memory` (memcpy, memset, memmove,
+  memcmp, strlen, strncmp, the reserved call, backtrace), `arena()`,
+  `transfer_arena_from`, with C++'s penalties. Forks don't get the arena
+  (a C++ TODO). Guest-to-guest copies use `Memory::memcpy_within`
+  (C++ `memcpy(dst, machine, src, len)` with the same machine), which
+  copies overlapping arena ranges like `memmove` (C++'s `std::memcpy`
+  leaves that undefined).
+- `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
+  `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
+  with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).
+- `native/libc.rs`: the libc fast path (`MachineOptions::libc_fastpath`,
+  `rvlinux --libc-fastpath`). Known libc functions in the program's
+  initial execute segments become block-ending EBREAK entries carrying a
+  function id; the EBREAK handler runs them natively and returns to `ra`,
+  and chains to the previous handler for other EBREAKs. Breakpoints
+  (`MachineOptions::ebreak_locations`, C++ `install_ebreak_for`) use the
+  same block-ending patch (`DecodedSegment::create_block_ending_entry_at`).
+
+Differences from C++:
+
+- The EBREAK handler chain is per machine (C++: statics, so once any
+  machine installs the fast path, every machine of the process has its
+  handler). Forks keep their master's chain.
+- Shared execute segments are keyed on whether the libc fast path patched
+  them, and segments with breakpoints aren't shared. (C++ keys on neither,
+  so a machine can get another machine's patched segment.)
+- The JIT never compiles SYSTEM entries (`DecoderEntry::is_system`), so it
+  leaves native code in front of a patched entry and the interpreter runs
+  it. (C++ asmjit translates the segment before the patches are
+  applied.)
+- Like C++, a patched function's entry block (and a breakpoint's) counts
+  0 instructions with the C extension (`create_block_ending_entry_at`'s
+  TODO), and the patch only finds the block start through entries in
+  front of it, not through the second half of a preceding 4-byte
+  instruction.
 
 ### Phase 2 — Linux userspace parity
 
@@ -1024,7 +1077,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] Userdata (`set_userdata`/`get_userdata`), custom instructions (`on_unimplemented_instruction`); see "Architecture decisions"
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
-- [ ] Ports of `tests/unit/{dynamic,exceptions,examples,checksum,pcrel,png}.cpp` (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction": done, `tests/custom.rs`) (`dyncall.cpp`: done, `tests/dyncall.rs`) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
+- [ ] Ports of `tests/unit/{dynamic,examples,checksum,pcrel,png}.cpp` (`exceptions.cpp`: done, `tests/exceptions.rs`) (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction": done, `tests/custom.rs`) (`dyncall.cpp`: done, `tests/dyncall.rs`) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
 
 ### Phase 4 — Performance
 
@@ -1046,7 +1099,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 - [ ] V extension (`rvv.hpp`, `rvv_instr.cpp`, `rvv_registers.hpp`)
 - [ ] Native threads (`native_threads.cpp`); POSIX threads are done (Phase 2)
-- [ ] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`)
+- [x] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`; see "Native heap and libc fast path"), breakpoints (`ebreak_locations`); tests: `heaptest.cpp`, `heap_invariants.cpp`, `libc_fastpath.cpp` (`tests/heap.rs`, `tests/libc_fastpath.rs`), the native heap cases of `native.cpp` (`tests/native.rs`), `exceptions.cpp`, difftests with `--libc-fastpath`
 - [ ] Guest datatypes (`guest/`, `guest_datatypes.hpp`)
 - [x] Dynamic calls (`dyncall.hpp`): the encoding, counted calls in the JIT (see "JIT")
 - [ ] Disassembler (`rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp`)
@@ -1055,7 +1108,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] Virtual paging (`memory_helpers_paging.hpp`, `memory_inline_pages.hpp`, `page.hpp`, paging parts of `memory.cpp`/`memory_rw.cpp`/`cpu.cpp`); see "Virtual paging" (page caches included)
 - [ ] Memory traps (`RISCV_MEMORY_TRAPS`)
 - [ ] Sockets, epoll, poll, select (`posix/socket_calls.cpp`, `linux/syscalls_{epoll,poll,select}.cpp`)
-- [x] Fuzzing harness (`fuzz/`; `FUZZ_NAT` waits for the native heap)
+- [x] Fuzzing harness (`fuzz/`; `nativefuzzer` without native threads)
 
 ## File mapping
 
@@ -1074,7 +1127,7 @@ phase starts; names below are the intended targets.
 | `memory_helpers_paging.hpp`, `memory_inline_pages.hpp` | `memory/paging.rs`, `memory/helpers.rs` | 3, 5 | ✅ incl. page caches, fork page tables and the host-side helpers (`membuffer`, `memarray`, `memspan`, ...) |
 | `cached_address.hpp` (`CachedAddress`) | — | 3 | not yet (a cached `address_of`) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
-| `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
+| `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (`create_block_ending_entry_at`, `install_ebreak_for`: `decoder_cache.rs`; other debugger helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
 | `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs`, `sysargs.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅, typed `sysargs`/`set_result` ✅ |
@@ -1087,7 +1140,7 @@ phase starts; names below are the intended targets.
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
 | `rvi_fuse.cpp` | — | — | dead code in C++ (`try_fuse` is never called) |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
-| `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | ✅ incl. shared segments (EBREAK locations, libc fast path: not yet) |
+| `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | ✅ incl. shared segments, EBREAK locations and the libc fast path patches |
 | `decode_bytecodes.cpp`, `threaded_rewriter.cpp` | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–4 | ✅ RV64IMAFDC + Zcb + B |
 | `bytecode_impl.cpp`, `threaded_bytecodes.hpp` | `bytecode.rs` (slow-path and system bytecodes: `dispatch.rs`) | 4 | ✅ |
 | `bytecode_dispatch.cpp`, `threaded_bytecode_array.hpp` | — | — | superseded by tail-call dispatch |
@@ -1098,7 +1151,7 @@ phase starts; names below are the intended targets.
 | `posix/signals.*` | `signals.rs` | 2 | ✅ |
 | `posix/socket_calls.cpp` | `syscalls/socket.rs` | 5 | |
 | `posix/threads.cpp`, `threads.hpp`, `native_threads.cpp` | `threads.rs` | 2, 5 | ✅ POSIX threads (native threads: Phase 5) |
-| `native_heap.hpp`, `native_libc.cpp` | `native/` | 5 | |
+| `native_heap.hpp`, `native_libc.cpp` | `native/` | 5 | ✅ (native threads: not ported) |
 | `serialize.cpp` | `serialize.rs` | 3 | |
 | `debug.*` | `debug.rs` | 5 | |
 | `rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp` | `disasm/` | 5 | |

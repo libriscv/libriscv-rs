@@ -97,7 +97,19 @@ pub(crate) struct SectionHeader {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Symbol {
     pub st_name: u32,
+    pub st_info: u8,
     pub st_value: u64,
+    pub st_size: u64,
+}
+
+/// `STT_FUNC`.
+pub(crate) const STT_FUNC: u8 = 2;
+
+impl Symbol {
+    /// `ELF64_ST_TYPE` (C++ `Elf::SymbolType`).
+    pub(crate) const fn symbol_type(&self) -> u8 {
+        self.st_info & 0xF
+    }
 }
 
 /// `Elf64_Rela`.
@@ -160,7 +172,9 @@ pub(crate) fn section_header(bin: &[u8], ofs: u64) -> Result<SectionHeader> {
 fn symbol(bin: &[u8], ofs: u64) -> Result<Symbol> {
     Ok(Symbol {
         st_name: u32_at(bin, ofs)?,
+        st_info: u8::from_le_bytes(bytes(bin, ofs.wrapping_add(4))?),
         st_value: u64_at(bin, ofs.wrapping_add(8))?,
+        st_size: u64_at(bin, ofs.wrapping_add(16))?,
     })
 }
 

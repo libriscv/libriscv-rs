@@ -411,6 +411,20 @@ impl Memory {
     /// C++ returns `std::memcmp`'s `int` (or a byte difference on its slow
     /// path); only the sign is meaningful, so this returns an [`Ordering`].
     pub fn memcmp_guest(&self, p1: u64, p2: u64, len: u64) -> Result<Ordering> {
+        Ok(self.memcmp_guest_diff(p1, p2, len)?.cmp(&0))
+    }
+
+    /// [`memcmp_guest`](Self::memcmp_guest) returning the difference of the
+    /// first differing bytes (as unsigned bytes), or 0. C++ returns
+    /// `std::memcmp`'s value, whose magnitude depends on the host's libc;
+    /// this is what its slow path returns.
+    pub(crate) fn memcmp_guest_diff(&self, p1: u64, p2: u64, len: u64) -> Result<i32> {
+        fn diff(s1: &[u8], s2: &[u8]) -> i32 {
+            s1.iter()
+                .zip(s2)
+                .find(|(a, b)| a != b)
+                .map_or(0, |(&a, &b)| i32::from(a) - i32::from(b))
+        }
         let e1 = p1.wrapping_add(len);
         let e2 = p2.wrapping_add(len);
         if e1 < p1 {
@@ -425,7 +439,7 @@ impl Memory {
             && p2 < e2
             && let (Some(s1), Some(s2)) = (self.arena_range(p1, len), self.arena_range(p2, len))
         {
-            return Ok(s1.cmp(s2));
+            return Ok(diff(s1, s2));
         }
         // Neither range crosses a page boundary.
         let pageno1 = p1 / PAGE_SIZE;
@@ -438,20 +452,20 @@ impl Memory {
             let n = len as usize;
             let s1 = page1.get(o1..o1 + n).unwrap_or_default();
             let s2 = page2.get(o2..o2 + n).unwrap_or_default();
-            return Ok(s1.cmp(s2));
+            return Ok(diff(s1, s2));
         }
         let (mut p1, mut p2, mut len) = (p1, p2, len);
         while len > 0 {
             let v1 = self.byte_at(p1)?;
             let v2 = self.byte_at(p2)?;
             if v1 != v2 {
-                return Ok(v1.cmp(&v2));
+                return Ok(i32::from(v1) - i32::from(v2));
             }
             p1 = p1.wrapping_add(1);
             p2 = p2.wrapping_add(1);
             len -= 1;
         }
-        Ok(Ordering::Equal)
+        Ok(0)
     }
 
     /// Port of `Memory::memcmp(const void*, address_t, size_t)`: compare
@@ -547,6 +561,78 @@ impl Memory {
             len -= 1;
         }
         Ok(())
+    }
+
+    /// Port of `Memory::memcpy(address_t, Machine&, address_t, address_t)`
+    /// with this machine as the source (the native heap's `realloc` and the
+    /// native `memcpy`): copy `len` guest bytes from `src` to `dst`, like
+    /// [`memcpy_from`](Self::memcpy_from). Overlapping ranges in the arena
+    /// are copied as if through a temporary buffer (C++'s `std::memcpy`
+    /// leaves that undefined).
+    pub fn memcpy_within(&mut self, dst: u64, src: u64, len: u64) -> Result<()> {
+        let (mut dst, mut src, mut len) = (dst, src, len);
+        if let Some(s) = self.write_window_range(src, len) {
+            if let Some(d) = self.write_window_range(dst, len) {
+                self.arena.copy_within(s, d.start);
+                return Ok(());
+            }
+            let tmp = self.arena.get(s).unwrap_or_default().to_vec();
+            return self.memcpy(dst, &tmp);
+        }
+        const W: u64 = 8;
+        if (dst & (W - 1)) == (src & (W - 1)) {
+            while (src & (W - 1)) != 0 && len > 0 {
+                let v = self.read_u8(src)?;
+                self.write_u8(dst, v)?;
+                dst = dst.wrapping_add(1);
+                src = src.wrapping_add(1);
+                len -= 1;
+            }
+            while len >= 4 * W {
+                if let Some(s) = self.write_window_range(src, len) {
+                    let tmp = self.arena.get(s).unwrap_or_default().to_vec();
+                    return self.memcpy(dst, &tmp);
+                }
+                for i in 0..4 {
+                    let v = self.read_u64(src.wrapping_add(i * W))?;
+                    self.write_u64(dst.wrapping_add(i * W), v)?;
+                }
+                dst = dst.wrapping_add(4 * W);
+                src = src.wrapping_add(4 * W);
+                len -= 4 * W;
+            }
+            while len >= W {
+                let v = self.read_u64(src)?;
+                self.write_u64(dst, v)?;
+                dst = dst.wrapping_add(W);
+                src = src.wrapping_add(W);
+                len -= W;
+            }
+        }
+        while len > 0 {
+            let v = self.read_u8(src)?;
+            self.write_u8(dst, v)?;
+            dst = dst.wrapping_add(1);
+            src = src.wrapping_add(1);
+            len -= 1;
+        }
+        Ok(())
+    }
+
+    /// The arena indices of `[addr, addr + len)` if it is in the arena's
+    /// write window (where C++ `try_memarray<uint8_t>` succeeds).
+    fn write_window_range(&self, addr: u64, len: u64) -> Option<std::ops::Range<usize>> {
+        if len == 0 {
+            return None;
+        }
+        let offset = addr.wrapping_sub(self.initial_rodata_end);
+        if offset < self.write_boundary && len <= self.write_boundary - offset {
+            let a = usize::try_from(addr).ok()?;
+            let n = usize::try_from(len).ok()?;
+            let range = a..a.checked_add(n)?;
+            return (range.end <= self.arena.len()).then_some(range);
+        }
+        None
     }
 
     /// C++ `try_memarray<uint8_t>` (non-const): the range in the arena's

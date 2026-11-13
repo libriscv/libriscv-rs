@@ -8,11 +8,11 @@ libFuzzer. The harnesses are in `src/lib.rs`, and each target in
 | ------ | -------- | -------------- |
 | `vmfuzzer` | `FUZZ_VM` | the decoder and interpreter: the input is code at 0x2000, run for 5000 instructions |
 | `elffuzzer` | `FUZZ_ELF` | the ELF loader, execute segments and the Linux system calls (no filesystem, no sockets): the input is a program, run for 5000 instructions |
+| `nativefuzzer` | `FUZZ_NAT` | the native heap and memory system calls (`setup_native_heap`, `setup_native_memory`): the input is a system call number and code at 0x2000 that can call them, run for 10000 instructions, then that system call once more |
 | `syshelperfuzzer` | `FUZZ_SYSH` | the memory helpers host system calls are built from (`memstring`, `gather_buffers`, `memview`, `memcmp`, `memcpy`, `gather_writable_buffers`), called from system call 1 |
 
-`FUZZ_NAT` (the native heap/memory/thread system calls) isn't ported, as
-those system calls aren't ported yet. There are no 32- or 128-bit variants:
-the port is RV64 only.
+`nativefuzzer` runs without the native thread system calls, which aren't
+ported. There are no 32- or 128-bit variants: the port is RV64 only.
 
 Guest input must never panic the host, so every crash is a bug. Errors from
 the machine are expected and ignored, like the C++ harness ignores

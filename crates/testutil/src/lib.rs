@@ -237,6 +237,158 @@ pub fn cpp_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The unit test directory of C++ libriscv (`tests/unit`), whose guest
+/// headers (`include/native_libc.h`, ...) guests include with
+/// `-I{cpp_unit_test_dir}`.
+pub fn cpp_unit_test_dir() -> PathBuf {
+    cpp_source_dir().join("tests").join("unit")
+}
+
+/// The guest program of `tests/unit/libc_fastpath.cpp` (C): calls every
+/// libc function the libc fast path replaces through volatile function
+/// pointers, so that the calls reach the real symbols, and prints
+/// `libc: 0 failures` (and a line per failed check).
+pub const LIBC_FASTPATH_EXERCISER: &str = r#"
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+static int failures = 0;
+#define CHECK(expr) do { if (!(expr)) { printf("FAIL line %d: %s\n", __LINE__, #expr); failures++; } } while (0)
+
+static void *(*volatile p_memcpy)(void*, const void*, size_t) = memcpy;
+static void *(*volatile p_memset)(void*, int, size_t) = memset;
+static void *(*volatile p_memmove)(void*, const void*, size_t) = memmove;
+static int   (*volatile p_memcmp)(const void*, const void*, size_t) = memcmp;
+static void *(*volatile p_memchr)(const void*, int, size_t) = memchr;
+#ifdef __GLIBC__ /* rawmemchr is a glibc-only extension */
+static void *(*volatile p_rawmemchr)(const void*, int) = rawmemchr;
+#endif
+static size_t(*volatile p_strlen)(const char*) = strlen;
+static size_t(*volatile p_strnlen)(const char*, size_t) = strnlen;
+static int   (*volatile p_strcmp)(const char*, const char*) = strcmp;
+static int   (*volatile p_strncmp)(const char*, const char*, size_t) = strncmp;
+static char *(*volatile p_strcpy)(char*, const char*) = strcpy;
+static char *(*volatile p_stpcpy)(char*, const char*) = stpcpy;
+static char *(*volatile p_strncpy)(char*, const char*, size_t) = strncpy;
+static char *(*volatile p_strchr)(const char*, int) = strchr;
+static char *(*volatile p_strchrnul)(const char*, int) = strchrnul;
+
+#define SZ 40000
+static char big1[SZ];
+static char big2[SZ];
+
+static int sign(int x) { return (x > 0) - (x < 0); }
+
+int main(void)
+{
+	char buf[128], buf2[128];
+	const char* hello = "Hello, World!";
+
+	/* memcpy */
+	p_memset(buf, 0xAB, sizeof(buf));
+	CHECK(p_memcpy(buf, hello, 14) == buf);
+	CHECK(p_strcmp(buf, hello) == 0);
+	CHECK((unsigned char)buf[14] == 0xAB);
+	CHECK(p_memcpy(buf, hello, 0) == buf);
+
+	/* memset */
+	CHECK(p_memset(buf2, 'x', 10) == buf2);
+	CHECK(buf2[0] == 'x' && buf2[9] == 'x');
+
+	/* memmove, overlapping in both directions */
+	p_strcpy(buf, "0123456789");
+	CHECK(p_memmove(buf + 2, buf, 8) == buf + 2);
+	CHECK(p_memcmp(buf, "0101234567", 10) == 0);
+	p_strcpy(buf, "0123456789");
+	CHECK(p_memmove(buf, buf + 2, 8) == buf);
+	CHECK(p_memcmp(buf, "2345678989", 10) == 0);
+
+	/* memcmp */
+	CHECK(p_memcmp("abc", "abc", 3) == 0);
+	CHECK(sign(p_memcmp("abc", "abd", 3)) < 0);
+	CHECK(sign(p_memcmp("abd", "abc", 3)) > 0);
+	CHECK(p_memcmp("abc", "xyz", 0) == 0);
+
+	/* memchr and rawmemchr */
+	CHECK(p_memchr(hello, 'W', 13) == hello + 7);
+	CHECK(p_memchr(hello, 'W', 5) == NULL);
+	CHECK(p_memchr(hello, 'Z', 13) == NULL);
+	CHECK(p_memchr(hello, 'H', 0) == NULL);
+#ifdef __GLIBC__
+	CHECK(p_rawmemchr(hello, '!') == hello + 12);
+	CHECK(p_rawmemchr(hello, '\0') == hello + 13);
+#endif
+
+	/* strlen and strnlen */
+	CHECK(p_strlen(hello) == 13);
+	CHECK(p_strlen("") == 0);
+	CHECK(p_strnlen(hello, 5) == 5);
+	CHECK(p_strnlen(hello, 100) == 13);
+
+	/* strcmp and strncmp */
+	CHECK(p_strcmp("abc", "abc") == 0);
+	CHECK(sign(p_strcmp("abc", "abd")) < 0);
+	CHECK(sign(p_strcmp("abcd", "abc")) > 0);
+	CHECK(sign(p_strcmp("", "a")) < 0);
+	CHECK(p_strncmp("abcXX", "abcYY", 3) == 0);
+	CHECK(sign(p_strncmp("abcXX", "abcYY", 4)) < 0);
+	CHECK(p_strncmp("abc", "abd", 0) == 0);
+	CHECK(p_strncmp("ab", "ab", 10) == 0);
+
+	/* strcpy, stpcpy and strncpy */
+	p_memset(buf, 0x7F, sizeof(buf));
+	CHECK(p_strcpy(buf, hello) == buf);
+	CHECK(p_strlen(buf) == 13);
+	CHECK(p_stpcpy(buf, hello) == buf + 13);
+	p_memset(buf, 0x7F, sizeof(buf));
+	CHECK(p_strncpy(buf, "ab", 8) == buf);
+	CHECK(p_memcmp(buf, "ab\0\0\0\0\0\0", 8) == 0);
+	CHECK((unsigned char)buf[8] == 0x7F);
+	p_memset(buf, 0x7F, sizeof(buf));
+	p_strncpy(buf, "abcdefgh", 4);
+	CHECK(p_memcmp(buf, "abcd", 4) == 0);
+	CHECK((unsigned char)buf[4] == 0x7F);
+
+	/* strchr and strchrnul */
+	CHECK(p_strchr(hello, 'W') == hello + 7);
+	CHECK(p_strchr(hello, 'Z') == NULL);
+	CHECK(p_strchr(hello, '\0') == hello + 13);
+	CHECK(p_strchrnul(hello, 'W') == hello + 7);
+	CHECK(p_strchrnul(hello, 'Z') == hello + 13);
+
+	/* Buffers that span many pages */
+	p_memset(big1, 'A', SZ);
+	p_memset(big2, 'A', SZ);
+	CHECK(p_memcmp(big1, big2, SZ) == 0);
+	big2[SZ - 1] = 'B';
+	CHECK(sign(p_memcmp(big1, big2, SZ)) < 0);
+	p_memcpy(big2, big1, SZ);
+	CHECK(p_memcmp(big1, big2, SZ) == 0);
+	big1[SZ - 1] = '\0';
+	CHECK(p_strlen(big1) == SZ - 1);
+	CHECK(p_memchr(big1, '\0', SZ) == big1 + SZ - 1);
+	big1[SZ / 2] = 'Q';
+	CHECK(p_strchr(big1, 'Q') == big1 + SZ / 2);
+	CHECK(p_strcmp(big1, big1) == 0);
+	big2[SZ - 1] = '\0';
+	CHECK(sign(p_strcmp(big1, big2)) > 0);
+	p_memmove(big1 + 1000, big1, SZ - 1000);
+	CHECK(big1[1000 + SZ / 2] == 'Q');
+
+	/* Heap memory, which lives outside the initial ELF image */
+	char* h = malloc(70000);
+	p_memset(h, 'z', 70000);
+	h[69999] = 0;
+	CHECK(p_strlen(h) == 69999);
+	CHECK(p_memchr(h, 0, 70000) == h + 69999);
+	free(h);
+
+	printf("libc: %d failures\n", failures);
+	return 0;
+}"#;
+
 fn require_toolchain() -> bool {
     std::env::var("LIBRISCV_REQUIRE_TOOLCHAIN").is_ok_and(|v| v == "1")
 }

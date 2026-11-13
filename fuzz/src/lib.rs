@@ -5,8 +5,8 @@
 //! Errors are expected and ignored (C++ catches every exception); any panic,
 //! abort or hang is a bug, as guest input must never take down the host.
 //!
-//! Not ported: `FUZZ_NAT` (`fuzz_native_syscalls`), as the native heap,
-//! memory and thread system calls aren't ported yet (Phase 5).
+//! `FUZZ_NAT` (`fuzz_native_syscalls`) runs without the native thread
+//! system calls, which aren't ported.
 
 use libriscv::memory::PageAttributes;
 use libriscv::{Machine, MachineOptions};
@@ -156,4 +156,32 @@ pub fn fuzz_syscall_helpers(data: &[u8]) {
     let _ = run();
     // Accelerate syscall fuzzing.
     let _ = machine.system_call(1);
+}
+
+/// C++ `fuzz_native_syscalls`: run `data[1..]` as code that can call the
+/// native heap (system calls 200-204) and memory (100-114) functions, then
+/// call system call `data[0]` once more with whatever the registers hold.
+/// (C++ also installs the native thread system calls, which aren't ported.)
+pub fn fuzz_native_syscalls(data: &[u8]) {
+    const MAX_CYCLES: u64 = 10_000;
+    let Some((&syscall_id, code)) = data.split_first() else {
+        return;
+    };
+    let Ok(mut machine) = Machine::new(&[], loader_options()) else {
+        return;
+    };
+    quiet(&mut machine);
+    let mut run = || -> libriscv::Result<()> {
+        // Allocate a custom guest heap.
+        let heap = machine.memory.mmap_allocate(2 << 20);
+        machine.setup_native_memory(100);
+        machine.setup_native_heap(200, heap, 2 << 20)?;
+        machine.setup_argv(&["program"], &["LC_ALL=C"])?;
+        machine.init_execute_area(code, V)?;
+        machine.cpu.jump(V)?;
+        machine.simulate(MAX_CYCLES)
+    };
+    let _ = run();
+    // Accelerate syscall fuzzing.
+    let _ = machine.system_call(u64::from(syscall_id));
 }

@@ -1501,6 +1501,86 @@ fn glibc_cxx() {
     assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
 }
 
+/// The libc fast path (`--libc-fastpath`, hot-patched libc functions):
+/// the guest of `tests/unit/libc_fastpath.cpp`, which calls every patched
+/// function (on the stack, in .bss and on the heap).
+fn libc_fastpath() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(testutil::LIBC_FASTPATH_EXERCISER, testutil::Lang::C);
+    let out = diff_with(&elf, &["--libc-fastpath"], &[]);
+    assert_eq!(out.stdout.lines().next(), Some("libc: 0 failures"));
+}
+
+/// The glibc C program with the libc fast path.
+fn libc_fastpath_glibc() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(GLIBC_PROGRAM, testutil::Lang::C);
+    let out = diff_with(&elf, &["--libc-fastpath"], &["first"]);
+    assert!(out.stdout.contains("sorted sum="), "{}", out.stdout);
+}
+
+/// The glibc C++ program with the libc fast path.
+fn libc_fastpath_cxx() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(GLIBC_CXX_PROGRAM, testutil::Lang::Cxx);
+    let out = diff_with(&elf, &["--libc-fastpath"], &[]);
+    assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
+}
+
+/// Timeouts with the libc fast path, whose penalties move the counter in
+/// large steps.
+fn libc_fastpath_timeouts(fuels: &[u64]) {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(GLIBC_PROGRAM, testutil::Lang::C);
+    for fuel in fuels {
+        diff_with(
+            &elf,
+            &["--libc-fastpath", "--fuel", &fuel.to_string()],
+            &["first"],
+        );
+    }
+}
+
+/// Faults inside hot-patched functions, and memcmp's result.
+const LIBC_FASTPATH_FAULTS: &str = r#"
+#include <stdio.h>
+#include <string.h>
+static size_t (*volatile p_strlen)(const char*) = strlen;
+static void *(*volatile p_memcpy)(void*, const void*, size_t) = memcpy;
+static int (*volatile p_memcmp)(const void*, const void*, size_t) = memcmp;
+int main(int argc, char** argv) {
+    char buf[64] = {0};
+    printf("memcmp: %d %d\n", p_memcmp("abc", "abd", 3), p_memcmp("b", "a", 1));
+    fflush(stdout);
+    if (argv[1][0] == 's') printf("%zu\n", p_strlen((const char*)0x10));
+    if (argv[1][0] == 'w') p_memcpy((void*)0x10000, buf, 32);
+    return 0;
+}
+"#;
+
+/// `arg`: `s` for a read fault (strlen), `w` for a write fault (memcpy).
+fn libc_fastpath_fault(arg: &str) {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(LIBC_FASTPATH_FAULTS, testutil::Lang::C);
+    let out = diff_with(&elf, &["--libc-fastpath"], &[arg]);
+    assert!(out.stdout.starts_with("memcmp: -1 1\n"), "{}", out.stdout);
+    assert!(
+        testutil::exception_line(&out.stdout).is_some(),
+        "{}",
+        out.stdout
+    );
+}
+
 /// abort(): SIGABRT through tgkill, without a handler.
 fn glibc_abort() {
     if !have_tools() {
@@ -1834,6 +1914,13 @@ difftests!(
     glibc_threads_timeout_1m = glibc_threads(Some(1_000_000)),
     glibc_condvars,
     glibc_cxx,
+    libc_fastpath,
+    libc_fastpath_glibc,
+    libc_fastpath_cxx,
+    libc_fastpath_timeouts_early = libc_fastpath_timeouts(&[5_000, 100_000]),
+    libc_fastpath_timeouts_late = libc_fastpath_timeouts(&[1_000_000, 10_000_000]),
+    libc_fastpath_read_fault = libc_fastpath_fault("s"),
+    libc_fastpath_write_fault = libc_fastpath_fault("w"),
     glibc_abort,
     glibc_segfault_handler,
     dynamic_glibc_program,

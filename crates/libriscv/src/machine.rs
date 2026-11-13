@@ -11,7 +11,8 @@
 //!
 //! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
 //! `signals.rs`, VM calls in `vmcall.rs`, typed `sysargs`/`set_result` in
-//! `sysargs.rs`. Not ported yet: serialization (Phase 3).
+//! `sysargs.rs`, the native heap and libc fast path in `native/`. Not
+//! ported yet: serialization (Phase 3).
 //!
 //! C++'s `set_userdata(T*)` / `get_userdata<T>()` user pointer is an owned
 //! `Box<dyn Any + Send + Sync>` here ([`Machine::set_userdata`]), checked
@@ -78,6 +79,11 @@ pub struct Machine {
     pub(crate) signals: Option<Box<crate::signals::Signals>>,
     /// C++ `m_userdata`.
     userdata: Option<Box<dyn Any + Send + Sync>>,
+    /// The native heap, with `setup_native_heap` (C++ `m_arena`).
+    pub(crate) arena: Option<Box<crate::native::Arena>>,
+    /// With the libc fast path, which owns the EBREAK handler: the handler
+    /// it chains to (C++ `m_previous_ebreak_handler`, per process there).
+    pub(crate) previous_ebreak: Option<SyscallHandler>,
 }
 
 impl core::fmt::Debug for Machine {
@@ -154,9 +160,15 @@ impl Machine {
             mt: None,
             signals: None,
             userdata: None,
+            arena: None,
+            previous_ebreak: None,
         };
         if let Some(segment) = first_segment {
             machine.cpu.exec = segment;
+            // C++ installs it while patching the segment.
+            if machine.options.libc_fastpath {
+                machine.install_libc_fastpath_handler();
+            }
         }
         machine.reset_cpu()?;
         Ok(machine)
@@ -220,6 +232,9 @@ impl Machine {
             mt: self.mt.clone(),
             signals: None,
             userdata: None,
+            // Forks don't get the native heap (a C++ TODO).
+            arena: None,
+            previous_ebreak: self.previous_ebreak,
         })
     }
 
@@ -427,13 +442,36 @@ impl Machine {
 
     /// Install a system call handler. Numbers at or above
     /// [`SYSCALLS_MAX`] are ignored.
+    ///
+    /// With the libc fast path (`MachineOptions::libc_fastpath`), an
+    /// EBREAK handler ([`SYSCALL_EBREAK_NR`]) becomes the one the fast
+    /// path's handler chains to for EBREAKs that aren't patched functions,
+    /// so the order of set-up doesn't matter.
     pub fn install_syscall_handler(&mut self, number: usize, handler: SyscallHandler) {
         debug_assert!(
             number < SYSCALLS_MAX,
             "system call number {number} out of range"
         );
+        if number == SYSCALL_EBREAK_NR
+            && let Some(previous) = &mut self.previous_ebreak
+        {
+            *previous = handler;
+            return;
+        }
         if let Some(slot) = Arc::make_mut(&mut self.syscall_handlers).get_mut(number) {
             *slot = handler;
+        }
+    }
+
+    /// Port of `install_libc_fastpath_handler`: chain the libc fast path's
+    /// EBREAK handler onto the installed one (the Linux system calls
+    /// install one, and so would a debugger).
+    pub(crate) fn install_libc_fastpath_handler(&mut self) {
+        if self.previous_ebreak.is_none()
+            && let Some(slot) = Arc::make_mut(&mut self.syscall_handlers).get_mut(SYSCALL_EBREAK_NR)
+        {
+            self.previous_ebreak = Some(*slot);
+            *slot = crate::native::libc::libc_fastpath_ebreak_handler;
         }
     }
 

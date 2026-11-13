@@ -337,7 +337,7 @@ impl Memory {
             .ok_or(invalid("Not enough room for ELF program segment"))?;
         // The segment is execute-only when neither R nor W is set.
         let execute_only = ph.p_flags & (elf::PF_R | elf::PF_W) == 0;
-        self.create_execute_segment(code, vaddr, execute_only)
+        self.create_execute_segment(code, vaddr, execute_only, true)
     }
 
     /// Port of `Memory::dynamic_linking`.

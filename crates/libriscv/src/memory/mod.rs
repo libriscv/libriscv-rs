@@ -90,6 +90,8 @@ pub struct Memory {
     /// Share execute segments with other machines of the process
     /// (`MachineOptions::use_shared_execute_segments`).
     use_shared_segments: bool,
+    /// Breakpoints and the libc fast path, applied to new execute segments.
+    patches: decoder_cache::SegmentPatches,
 
     /// Compile execute segments with the JIT (`MachineOptions::jit`).
     #[cfg(feature = "jit")]
@@ -232,6 +234,7 @@ impl Memory {
             main_exec: None,
             exec: Vec::new(),
             use_shared_segments: options.use_shared_execute_segments,
+            patches: decoder_cache::SegmentPatches::from_options(options),
             #[cfg(feature = "jit")]
             jit: options.jit,
             #[cfg(feature = "jit")]
@@ -298,6 +301,7 @@ impl Memory {
             main_exec: self.main_exec.clone(),
             exec: self.exec.clone(),
             use_shared_segments: options.use_shared_execute_segments,
+            patches: decoder_cache::SegmentPatches::from_options(options),
             #[cfg(feature = "jit")]
             jit: options.jit,
             #[cfg(feature = "jit")]
@@ -480,12 +484,14 @@ impl Memory {
     /// Port of `Memory::create_execute_segment`: decode `code` as an execute
     /// segment at `vaddr` and register it. With `use_shared_execute_segments`
     /// an identical live segment of another machine is reused instead
-    /// (see [`decoder_cache::shared_segment`]).
+    /// (see [`decoder_cache::shared_segment`]). The program's `initial`
+    /// segment gets the libc fast path (`MachineOptions::libc_fastpath`).
     pub(crate) fn create_execute_segment(
         &mut self,
         code: &[u8],
         vaddr: u64,
         execute_only: bool,
+        initial: bool,
     ) -> Result<Arc<DecodedSegment>> {
         // Check the slot first: decoding (or compiling) for nothing is slow.
         if self.main_exec.is_some() && self.exec.len() >= MAX_EXECUTE_SEGS {
@@ -497,9 +503,11 @@ impl Memory {
         let crc32c = decoder_cache::crc32c(code);
         #[cfg(feature = "jit")]
         let (jit, background, layout) = (self.jit, self.jit_background, self.jit_layout());
+        let (patches, binary) = (&self.patches, &self.binary);
         let build = |shared| {
-            #[allow(unused_mut)]
             let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
+            // Before compiling: the JIT leaves patched entries alone.
+            segment.apply_patches(patches, binary, initial)?;
             #[cfg(feature = "jit")]
             if jit && !background {
                 crate::jit::JitSegment::attach(&mut segment, layout);
@@ -511,12 +519,15 @@ impl Memory {
             }
             Ok(segment)
         };
-        let segment = if self.use_shared_segments {
+        // Breakpoints aren't part of the key: segments with them aren't
+        // shared. (C++ shares them anyway.)
+        let segment = if self.use_shared_segments && patches.ebreak_locations.is_empty() {
             let key = decoder_cache::SegmentKey {
                 vaddr,
                 len: code.len() as u64,
                 crc32c,
                 execute_only,
+                libc_fastpath: initial && patches.libc_fastpath,
                 #[cfg(feature = "jit")]
                 jit: jit.then_some(layout),
             };

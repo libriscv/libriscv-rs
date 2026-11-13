@@ -128,7 +128,9 @@ impl Machine {
                 begin,
             ));
         }
-        self.cpu.exec = self.memory.create_execute_segment(code, begin, false)?;
+        self.cpu.exec = self
+            .memory
+            .create_execute_segment(code, begin, false, false)?;
         Ok(&self.cpu.exec)
     }
 

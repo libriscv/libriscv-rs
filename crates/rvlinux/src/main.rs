@@ -17,6 +17,7 @@ struct CliArgs {
     jit: bool,
     no_background: bool,
     nbit: bool,
+    libc_fastpath: bool,
     sandbox: bool,
     proxy: bool,
     allowed_files: Vec<String>,
@@ -43,6 +44,9 @@ fn usage(name: &str) {
     );
     println!("  -A, --allow file   Allow file to be opened by the guest");
     println!("  -c, --call func    Call a function after loading the program");
+    println!(
+        "      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations"
+    );
     if cfg!(feature = "jit") {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
         println!("  -B, --background   Compile in the background while interpreting (default)");
@@ -83,6 +87,7 @@ fn parse_args() -> Result<CliArgs, String> {
             "-B" | "--background" if cfg!(feature = "jit") => args.no_background = false,
             "--no-background" if cfg!(feature = "jit") => args.no_background = true,
             "--nbit-address-space" if cfg!(feature = "jit") => args.nbit = true,
+            "--libc-fastpath" => args.libc_fastpath = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
             "-c" | "--call" => {
@@ -157,6 +162,7 @@ fn main() -> ExitCode {
         // C++ rvlinux compiles in the background by default too.
         jit_background: !args.no_background,
         jit_automatic_nbit_address_space: args.nbit,
+        libc_fastpath: args.libc_fastpath,
         ..Default::default()
     };
     let mut machine = match libriscv::Machine::new(&binary, options) {

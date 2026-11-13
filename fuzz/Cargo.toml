@@ -51,3 +51,10 @@ path = "fuzz_targets/syshelperfuzzer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nativefuzzer"
+path = "fuzz_targets/nativefuzzer.rs"
+test = false
+doc = false
+bench = false
