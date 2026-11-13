@@ -23,9 +23,12 @@ cargo clippy --all-targets -- -D warnings    # must be clean (also with --featur
 cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
 ```
 
-Expected durations (with the JIT features): `difftest.rs` ~6 min, `vmcall.rs`
-~45 s, the rest seconds. That's normal: don't treat it as a regression, and
-never `git stash` work to time HEAD.
+Expected durations (warm build, 32 cores): the whole suite ~25 s with the JIT
+features (`difftest.rs` ~14 s, bounded by one up-front JIT compile of static
+libstdc++), ~7 s without. Cranelift is always built optimized
+(`[profile.dev.package."*"]`); our crates stay at opt-level 0. A test that
+loops over many runs should be split into separate tests (see `difftests!`)
+so the harness runs them concurrently. Never `git stash` work to time HEAD.
 
 ```sh
 cargo fmt --all

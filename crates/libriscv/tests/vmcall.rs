@@ -370,10 +370,19 @@ fn vm_function_call_in_fork() {
 struct Data(i32, i32, f32);
 
 impl GuestPod for Data {
+    const SIZE: usize = 12;
+    const ALIGN: usize = 4;
     fn write_guest(&self, out: &mut Vec<u8>) {
         self.0.write_guest(out);
         self.1.write_guest(out);
         self.2.write_guest(out);
+    }
+    fn read_guest(bytes: &[u8]) -> Self {
+        Data(
+            i32::read_guest(bytes),
+            i32::read_guest(&bytes[4..]),
+            f32::read_guest(&bytes[8..]),
+        )
     }
 }
 

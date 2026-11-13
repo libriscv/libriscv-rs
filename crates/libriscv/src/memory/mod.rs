@@ -17,11 +17,13 @@
 //! the end so an access starting at the last valid address never needs a
 //! size check.
 
+mod helpers;
 mod loader;
 mod mmap;
 mod page;
 mod paging;
 
+pub use helpers::{Buffer, GuestPod, GuestSlice, GuestSliceMut, MEMVIEW_MAX};
 pub(crate) use mmap::page_round_up;
 pub use mmap::{MEMSTRING_MAX, MmapCache, MmapRange};
 pub use page::PageAttributes;

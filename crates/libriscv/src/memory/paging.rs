@@ -41,8 +41,8 @@ use super::page::{HOST_PAGE, Page, PageAttributes, PageBytes, PageData, ZERO_PAG
 use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault};
 use crate::error::{ExceptionKind, MachineError, Result};
 
-const PAGE: usize = PAGE_SIZE as usize;
-const PAGE_MASK: u64 = PAGE_SIZE - 1;
+pub(super) const PAGE: usize = PAGE_SIZE as usize;
+pub(super) const PAGE_MASK: u64 = PAGE_SIZE - 1;
 
 /// C++ `PAGE_TABLE_OVERCOMMIT`: the page table holds at most this many
 /// entries per page of the memory limit, which bounds attribute-only pages
@@ -587,7 +587,7 @@ impl Memory {
     }
 
     /// Port of `Memory::get_readable_pageno`.
-    fn get_readable_pageno(&self, pageno: u64) -> Result<&PageBytes> {
+    pub(super) fn get_readable_pageno(&self, pageno: u64) -> Result<&PageBytes> {
         match self.get_pageno(pageno)? {
             (attr, data) if attr.read => Ok(data),
             _ => Err(protection_fault(pageno.wrapping_mul(PAGE_SIZE))),
@@ -868,7 +868,18 @@ impl Memory {
     /// Zero-copy view of readable `[addr, addr + len)` (C++ `memview`): the
     /// arena's read window, or a single gathered buffer (an
     /// `OUT_OF_MEMORY` error when the range isn't contiguous on the host).
+    /// More than [`MEMVIEW_MAX`](super::MEMVIEW_MAX) bytes is a protection
+    /// fault, as with C++'s default `maxlen`.
     pub fn memview(&self, addr: u64, len: u64) -> Result<&[u8]> {
+        self.memview_max(addr, len, super::MEMVIEW_MAX)
+    }
+
+    /// [`memview`](Self::memview) with C++'s `maxlen` argument: a `len`
+    /// above `maxlen` is a protection fault.
+    pub fn memview_max(&self, addr: u64, len: u64, maxlen: u64) -> Result<&[u8]> {
+        if len > maxlen {
+            return Err(protection_fault(addr));
+        }
         if len == 0 {
             return Ok(&[]);
         }
@@ -888,8 +899,17 @@ impl Memory {
 
     /// Writable zero-copy view of `[addr, addr + len)` (C++
     /// `writable_memview`): the arena's write window, or a single gathered
-    /// buffer.
+    /// buffer (pages are made writable, faulting on read-only ones). More
+    /// than [`MEMVIEW_MAX`](super::MEMVIEW_MAX) bytes is a protection fault.
     pub fn memview_mut(&mut self, addr: u64, len: u64) -> Result<&mut [u8]> {
+        self.memview_mut_max(addr, len, super::MEMVIEW_MAX)
+    }
+
+    /// [`memview_mut`](Self::memview_mut) with C++'s `maxlen` argument.
+    pub fn memview_mut_max(&mut self, addr: u64, len: u64, maxlen: u64) -> Result<&mut [u8]> {
+        if len > maxlen {
+            return Err(protection_fault(addr));
+        }
         if len == 0 {
             return Ok(&mut []);
         }
@@ -1076,30 +1096,6 @@ impl Memory {
             result.extend_from_slice(chunk);
         }
         Ok(result)
-    }
-
-    /// Port of `Memory::memcmp(const void*, address_t, size_t)`: true if
-    /// guest memory at `addr` equals `data`. Faults if it isn't readable.
-    pub fn memcmp(&self, data: &[u8], addr: u64) -> Result<bool> {
-        let len = data.len() as u64;
-        let end = addr.wrapping_add(len);
-        if end < addr {
-            return Err(protection_fault(addr));
-        }
-        if end.wrapping_sub(RWREAD_BEGIN) < self.read_boundary {
-            let a = usize::try_from(addr).map_err(|_| protection_fault(addr))?;
-            return Ok(self.arena.get(a..a + data.len()) == Some(data));
-        }
-        let mut data = data;
-        for (pageno, off, size) in page_chunks(addr, len) {
-            let page = self.get_readable_pageno(pageno)?;
-            let (head, tail) = data.split_at(size);
-            if page.get(off..off + size) != Some(head) {
-                return Ok(false);
-            }
-            data = tail;
-        }
-        Ok(true)
     }
 
     /// Port of `Memory::set_pageno_attr`.
@@ -1563,8 +1559,13 @@ impl Memory {
 /// Zero `d`, skipping 4 KiB chunks that are already zero so that untouched
 /// host pages are never committed.
 pub(super) fn zero_lazily(d: &mut [u8]) {
+    static ZERO_PAGE: [u8; PAGE] = [0; PAGE];
     for chunk in d.chunks_mut(PAGE) {
-        if chunk.iter().any(|&b| b != 0) {
+        // Slice equality is one `bcmp` call (vectorized, even in
+        // unoptimized builds), and untouched host pages all read from the
+        // kernel's shared zero page, which stays in cache: Go guests map
+        // and unmap the same 64 MiB over a hundred times at startup.
+        if ZERO_PAGE.get(..chunk.len()) != Some(&*chunk) {
             chunk.fill(0);
         }
     }

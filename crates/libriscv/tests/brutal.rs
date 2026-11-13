@@ -158,11 +158,25 @@ fn execute_libc_start_main_slowly() {
         // No matter how many (or few) instructions we execute before
         // exiting simulation, we should be able to resume and complete the
         // program normally.
-        for step in 5..105 {
-            let mut fork = machine.fork().unwrap();
-            run_in_steps(&mut fork, step);
-            assert_eq!(fork.return_value() as i64, 1234);
-        }
+        // The forks are independent, so they run on all cores. Besides
+        // speed (this was the slowest test in a debug build), that forks
+        // one shared machine from many threads at once and runs forks that
+        // share its copy-on-write pages and execute segments concurrently,
+        // which no other test does.
+        let steps: Vec<u64> = (5..105).collect();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        std::thread::scope(|s| {
+            for chunk in steps.chunks(steps.len().div_ceil(threads)) {
+                let machine = &machine;
+                s.spawn(move || {
+                    for &step in chunk {
+                        let mut fork = machine.fork().unwrap();
+                        run_in_steps(&mut fork, step);
+                        assert_eq!(fork.return_value() as i64, 1234);
+                    }
+                });
+            }
+        });
         if machine.try_simulate(1000, 0).unwrap() {
             break;
         }

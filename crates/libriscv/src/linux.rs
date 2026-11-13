@@ -51,6 +51,13 @@ impl Machine {
         self.stack_push(&data)
     }
 
+    /// Push a [`GuestPod`](crate::GuestPod) (C++ `stack_push(const T&)`).
+    pub fn stack_push_value<T: crate::GuestPod>(&mut self, value: &T) -> Result<u64> {
+        let mut data = Vec::with_capacity(T::SIZE);
+        value.write_guest(&mut data);
+        self.stack_push(&data)
+    }
+
     /// Copy `words` below `sp`, 16-byte aligned, and make that the stack
     /// pointer and the initial stack.
     fn install_vector(&mut self, sp: u64, words: &[u64]) -> Result<()> {
@@ -132,7 +139,7 @@ impl Machine {
                 push_down(self, &mut dst, ph)?;
             }
             phdr_location = dst;
-        } else if !self.memory.memcmp(phdrs, phdr_location)? {
+        } else if self.memory.memcmp(phdrs, phdr_location)?.is_ne() {
             return Err(MachineError::invalid_program(
                 "PT_PHDR program header is not loaded at the correct address",
                 0,

@@ -7,6 +7,10 @@
 //! threads; dynamic ones run under `ld.so`), programs generating code at
 //! runtime, and the prebuilt Rust, Go, Zig and newlib fixtures of C++
 //! libriscv.
+//!
+//! Every scenario is one test per Rust configuration (`<name>::interp`,
+//! `<name>::jit`, `<name>::jit_upfront`; see [`difftests!`]), so the test
+//! harness runs them concurrently instead of one after the other.
 
 #![allow(
     clippy::panic,
@@ -15,6 +19,7 @@
     clippy::indexing_slicing
 )]
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use testutil::RunOutput;
@@ -23,12 +28,78 @@ fn rvlinux() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rvlinux"))
 }
 
-/// Run both emulators and compare everything that must match. With the
-/// `jit` feature, the Rust emulator also runs with `--jit` (compiling in the
-/// background and up front), against the same reference. Dynamic
-/// executables skip compiling up front: that compiles all of `libc.so`'s
-/// executable mapping (1.5 MB) when it's first entered, which takes minutes
-/// in a debug build.
+/// The Rust emulator configuration a test compares with the reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// The interpreter.
+    Interp,
+    /// `--jit`: compiling in the background (the default).
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    Jit,
+    /// `--jit --no-background`: compiling up front.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    JitUpfront,
+}
+
+thread_local! {
+    /// Set by the tests [`difftests!`] generates (each test has its own
+    /// thread).
+    static MODE: Cell<Mode> = const { Cell::new(Mode::Interp) };
+}
+
+fn run_in_mode(mode: Mode, scenario: impl FnOnce()) {
+    MODE.set(mode);
+    scenario();
+}
+
+/// The Rust emulator's extra flags for this test's mode, or `None` if the
+/// mode doesn't apply to `elf`: dynamic executables skip compiling up
+/// front, which compiles all of `libc.so`'s executable mapping (1.5 MB)
+/// when it's first entered.
+fn mode_flags(elf: &Path) -> Option<&'static [&'static str]> {
+    match MODE.get() {
+        Mode::Interp => Some(&[]),
+        Mode::Jit => Some(&["--jit"]),
+        Mode::JitUpfront => {
+            let dynamic = std::fs::read(elf)
+                .ok()
+                .and_then(|b| libriscv::elf_interpreter(&b))
+                .is_some();
+            (!dynamic).then_some(&["--jit", "--no-background"])
+        }
+    }
+}
+
+/// Each scenario `fn name()` becomes the tests `name::interp` and, with the
+/// `jit` feature, `name::jit` and `name::jit_upfront`. `name = f(args)`
+/// names a call instead, to split a long scenario into several tests.
+macro_rules! difftests {
+    ($($name:ident $(= $call:expr)?),* $(,)?) => {$(
+        mod $name {
+            #[allow(unused_imports)]
+            use super::*;
+            #[test]
+            fn interp() {
+                run_in_mode(Mode::Interp, || difftests!(@call $name $($call)?));
+            }
+            #[cfg(feature = "jit")]
+            #[test]
+            fn jit() {
+                run_in_mode(Mode::Jit, || difftests!(@call $name $($call)?));
+            }
+            #[cfg(feature = "jit")]
+            #[test]
+            fn jit_upfront() {
+                run_in_mode(Mode::JitUpfront, || difftests!(@call $name $($call)?));
+            }
+        }
+    )*};
+    (@call $name:ident) => { super::$name() };
+    (@call $name:ident $call:expr) => { $call };
+}
+
+/// Run the reference and the Rust emulator in this test's [`Mode`], and
+/// compare everything that must match. Returns the reference's output.
 fn diff_with(elf: &Path, flags: &[&str], args: &[&str]) -> RunOutput {
     diff_jit_output(elf, flags, args, true)
 }
@@ -47,23 +118,11 @@ fn diff_jit_output(elf: &Path, flags: &[&str], args: &[&str], jit_output: bool) 
         reference.stdout,
         reference.stderr
     );
-    compare(&reference, elf, flags, args, true);
-    if cfg!(feature = "jit") {
-        let dynamic = std::fs::read(elf)
-            .ok()
-            .and_then(|b| libriscv::elf_interpreter(&b))
-            .is_some();
-        // Background compilation (the default) and compiling up front.
-        let modes: &[&[&str]] = if dynamic {
-            &[&["--jit"]]
-        } else {
-            &[&["--jit"], &["--jit", "--no-background"]]
-        };
-        for &extra in modes {
-            let mut jit_flags = flags.to_vec();
-            jit_flags.extend_from_slice(extra);
-            compare(&reference, elf, &jit_flags, args, jit_output);
-        }
+    if let Some(extra) = mode_flags(elf) {
+        let mut rust_flags = flags.to_vec();
+        rust_flags.extend_from_slice(extra);
+        let output = jit_output || MODE.get() == Mode::Interp;
+        compare(&reference, elf, &rust_flags, args, output);
     }
     reference
 }
@@ -209,7 +268,6 @@ int main(void) {
 void _start(void) { sys(93, main(), 0, 0); }
 "#;
 
-#[test]
 fn freestanding_compute() {
     if !have_tools() {
         return;
@@ -225,7 +283,6 @@ fn freestanding_compute() {
 /// Timeouts: the counter value at which execution stops depends on where
 /// the dispatcher checks it (block ends, but not forward branches), so this
 /// pins down the block structure.
-#[test]
 fn freestanding_timeouts() {
     if !have_tools() {
         return;
@@ -562,7 +619,6 @@ void _start(void) { sys(93, main()); }
 
 const ATOMIC_MARCHES: &[&str] = &["rv64ima_zicsr", "rv64imac_zcb_zicsr"];
 
-#[test]
 fn freestanding_atomics() {
     if !have_tools() {
         return;
@@ -580,7 +636,6 @@ fn freestanding_atomics() {
     }
 }
 
-#[test]
 fn freestanding_atomic_edge_cases() {
     if !have_tools() {
         return;
@@ -673,7 +728,6 @@ int main(void) {
 void _start(void) { sys(93, main(), 0, 0); }
 "#;
 
-#[test]
 fn freestanding_bitmanip() {
     if !have_tools() {
         return;
@@ -784,7 +838,6 @@ const BITMANIP_ASM_CASES: &[(&str, &str)] = &[
     ),
 ];
 
-#[test]
 fn freestanding_bitmanip_edge_cases() {
     if !have_tools() {
         return;
@@ -1005,7 +1058,6 @@ int main(void) {
 void _start(void) { sys(93, main(), 0, 0); }
 "#;
 
-#[test]
 fn freestanding_float() {
     if !have_tools() {
         return;
@@ -1135,7 +1187,6 @@ const FLOAT_ASM_CASES: &[(&str, &str)] = &[
     ),
 ];
 
-#[test]
 fn freestanding_float_edge_cases() {
     if !have_tools() {
         return;
@@ -1163,7 +1214,6 @@ const COREMARK_MARCHES: &[(&str, &str)] = &[
 /// list, matrix and state kernels, and its clock is the instruction counter,
 /// so the whole output must match the oracle.
 ///
-#[test]
 fn coremark() {
     if !have_tools() || !testutil::need_coremark() {
         return;
@@ -1186,7 +1236,6 @@ fn build_asm(body: &str, march: &str) -> PathBuf {
     build_freestanding(&format!("__asm__(\"{code}\");\n"), march, "")
 }
 
-#[test]
 fn freestanding_edge_cases() {
     if !have_tools() {
         return;
@@ -1199,7 +1248,6 @@ fn freestanding_edge_cases() {
     }
 }
 
-#[test]
 fn freestanding_compressed_edge_cases() {
     if !have_tools() {
         return;
@@ -1210,7 +1258,6 @@ fn freestanding_compressed_edge_cases() {
     }
 }
 
-#[test]
 fn freestanding_edge_case_timeouts() {
     if !have_tools() {
         return;
@@ -1232,7 +1279,6 @@ fn freestanding_edge_case_timeouts() {
     }
 }
 
-#[test]
 fn hello_world_c() {
     if !have_tools() {
         return;
@@ -1247,20 +1293,30 @@ fn hello_world_c() {
     diff_with(&elf, &[], &["World"]);
 }
 
-#[test]
-fn prebuilt_fixtures() {
+fn prebuilt_fixture(name: &str) {
     if !testutil::need_reference() {
         return;
     }
-    for name in [
-        "newlib-rv64gb-hello-world",
-        "rust-riscv64-hello-world",
-        "zig-riscv64-hello-world",
-    ] {
-        diff(&testutil::cpp_fixture(name));
+    diff(&testutil::cpp_fixture(name));
+}
+fn prebuilt_newlib() {
+    prebuilt_fixture("newlib-rv64gb-hello-world");
+}
+fn prebuilt_rust() {
+    prebuilt_fixture("rust-riscv64-hello-world");
+}
+fn prebuilt_zig() {
+    prebuilt_fixture("zig-riscv64-hello-world");
+}
+
+/// The Go runtime's scheduling depends on time: its instruction count
+/// varies from run to run, also under the oracle, so only the output is
+/// compared (interpreter only).
+#[test]
+fn prebuilt_go() {
+    if !testutil::need_reference() {
+        return;
     }
-    // The Go runtime's scheduling depends on time: its instruction count
-    // varies from run to run, also under the oracle.
     let go = testutil::cpp_fixture("golang-riscv64-hello-world");
     let reference = testutil::run_reference(&go, &[]).unwrap_or_else(|e| panic!("{e}"));
     let rust = testutil::run_rust(rvlinux(), &go, &[]).unwrap_or_else(|e| panic!("{e}"));
@@ -1283,7 +1339,6 @@ const GLIBC_COREMARK_MARCHES: &[(&str, &str)] = &[
 /// CoreMark as a regular Linux executable (`testutil::build_coremark_linux`:
 /// upstream's POSIX port, static glibc), a short run. Its clock is the
 /// instruction counter, so the whole output must match the oracle.
-#[test]
 fn coremark_glibc() {
     if !have_tools() || !testutil::need_coremark() {
         return;
@@ -1336,7 +1391,6 @@ fn build_glibc(code: &str, lang: testutil::Lang) -> PathBuf {
     testutil::build(code, "-O2 -static -pthread", lang).unwrap_or_else(|e| panic!("{e}"))
 }
 
-#[test]
 fn glibc_program() {
     if !have_tools() {
         return;
@@ -1346,21 +1400,21 @@ fn glibc_program() {
     assert!(out.stdout.contains("sorted sum="), "{}", out.stdout);
 }
 
-#[test]
-fn glibc_timeouts() {
+fn glibc_timeouts(fuels: &[u64]) {
     if !have_tools() {
         return;
     }
     let elf = build_glibc(GLIBC_PROGRAM, testutil::Lang::C);
-    for fuel in [1, 100, 1000, 5000, 20_000, 100_000, 250_000, 1_000_000] {
+    for fuel in fuels {
         diff_with(&elf, &["--fuel", &fuel.to_string()], &["first"]);
     }
 }
 
 /// `tests/unit/threads/test_threads.cpp` of C++ libriscv: pthreads,
 /// `sched_yield`, `pthread_join` and C++ `std::thread`.
-#[test]
-fn glibc_threads() {
+/// Run to completion without `fuel`, otherwise time out after `fuel`
+/// instructions.
+fn glibc_threads(fuel: Option<u64>) {
     if !have_tools() {
         return;
     }
@@ -1368,15 +1422,18 @@ fn glibc_threads() {
     let code =
         std::fs::read_to_string(&source).unwrap_or_else(|e| panic!("{}: {e}", source.display()));
     let elf = build_glibc(&code, testutil::Lang::Cxx);
-    let out = diff(&elf);
-    assert_eq!(out.exit_code, Some(123_666_123), "{}", out.stdout);
-    for fuel in [10_000, 300_000, 1_000_000] {
-        diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+    match fuel {
+        None => {
+            let out = diff(&elf);
+            assert_eq!(out.exit_code, Some(123_666_123), "{}", out.stdout);
+        }
+        Some(fuel) => {
+            diff_with(&elf, &["--fuel", &fuel.to_string()], &[]);
+        }
     }
 }
 
 /// Condition variables, mutexes and joins across eight threads.
-#[test]
 fn glibc_condvars() {
     if !have_tools() {
         return;
@@ -1435,7 +1492,6 @@ int main(int argc, char** argv) {
 }
 "#;
 
-#[test]
 fn glibc_cxx() {
     if !have_tools() {
         return;
@@ -1446,7 +1502,6 @@ fn glibc_cxx() {
 }
 
 /// abort(): SIGABRT through tgkill, without a handler.
-#[test]
 fn glibc_abort() {
     if !have_tools() {
         return;
@@ -1465,7 +1520,6 @@ fn glibc_abort() {
 /// after the exception, like C++ `run_sighandler`. (An illegal instruction,
 /// which falls back to the SIGSEGV handler: the data of a protection fault
 /// differs from the paging oracle, see PORTING.md.)
-#[test]
 fn glibc_segfault_handler() {
     if !have_tools() {
         return;
@@ -1493,7 +1547,6 @@ fn build_dynamic(code: &str, lang: testutil::Lang, libs: &str) -> PathBuf {
     testutil::build(code, &format!("-O2 -pthread {libs}"), lang).unwrap_or_else(|e| panic!("{e}"))
 }
 
-#[test]
 fn dynamic_glibc_program() {
     if !have_tools() {
         return;
@@ -1507,7 +1560,6 @@ fn dynamic_glibc_program() {
     }
 }
 
-#[test]
 fn dynamic_glibc_cxx() {
     if !have_tools() {
         return;
@@ -1517,7 +1569,6 @@ fn dynamic_glibc_cxx() {
     assert_eq!(out.exit_code, Some(3), "{}", out.stdout);
 }
 
-#[test]
 fn dynamic_glibc_threads() {
     if !have_tools() {
         return;
@@ -1577,7 +1628,6 @@ int main(int argc, char** argv) {
 }
 "#;
 
-#[test]
 fn runtime_code() {
     if !have_tools() {
         return;
@@ -1645,7 +1695,6 @@ int main() {
 }
 "#;
 
-#[test]
 fn page_accounting() {
     if !have_tools() {
         return;
@@ -1664,7 +1713,6 @@ fn page_accounting() {
 /// `Calling function`) through buffered stdio but the guest's output
 /// directly, so on a pipe they come out in a different order: compare the
 /// guest's lines in order, and the emulator's lines separately.
-#[test]
 fn vmcall_after_exit() {
     if !have_tools() {
         return;
@@ -1715,10 +1763,8 @@ int main(int argc, char** argv) {
         emulator.sort();
         (guest, emulator)
     }
-    let rust_modes: Vec<Vec<&str>> = if cfg!(feature = "jit") {
-        vec![vec![], vec!["--jit"], vec!["--jit", "--no-background"]]
-    } else {
-        vec![vec![]]
+    let Some(extra) = mode_flags(&elf) else {
+        return;
     };
     for func in ["hello", "no_such_function"] {
         let flags = ["--call", func];
@@ -1745,18 +1791,55 @@ int main(int argc, char** argv) {
                 "{reference:?}"
             );
         }
-        for extra in &rust_modes {
-            let rust = std::process::Command::new(rvlinux())
-                .arg("--accurate")
-                .args(extra)
-                .args(flags)
-                .arg(&elf)
-                .arg("state")
-                .stdin(std::process::Stdio::null())
-                .output()
-                .unwrap();
-            assert!(rust.status.success(), "{rust:?}");
-            assert_eq!(split(&rust), expected, "--call {func} {extra:?}");
-        }
+        let rust = std::process::Command::new(rvlinux())
+            .arg("--accurate")
+            .args(extra)
+            .args(flags)
+            .arg(&elf)
+            .arg("state")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(rust.status.success(), "{rust:?}");
+        assert_eq!(split(&rust), expected, "--call {func} {extra:?}");
     }
 }
+
+difftests!(
+    freestanding_compute,
+    freestanding_timeouts,
+    freestanding_atomics,
+    freestanding_atomic_edge_cases,
+    freestanding_bitmanip,
+    freestanding_bitmanip_edge_cases,
+    freestanding_float,
+    freestanding_float_edge_cases,
+    coremark,
+    freestanding_edge_cases,
+    freestanding_compressed_edge_cases,
+    freestanding_edge_case_timeouts,
+    hello_world_c,
+    prebuilt_newlib,
+    prebuilt_rust,
+    prebuilt_zig,
+    coremark_glibc,
+    glibc_program,
+    glibc_timeouts_early = glibc_timeouts(&[1, 100]),
+    glibc_timeouts_startup = glibc_timeouts(&[1000, 5000]),
+    glibc_timeouts_main = glibc_timeouts(&[20_000, 100_000]),
+    glibc_timeouts_late = glibc_timeouts(&[250_000, 1_000_000]),
+    glibc_threads = glibc_threads(None),
+    glibc_threads_timeout_10k = glibc_threads(Some(10_000)),
+    glibc_threads_timeout_300k = glibc_threads(Some(300_000)),
+    glibc_threads_timeout_1m = glibc_threads(Some(1_000_000)),
+    glibc_condvars,
+    glibc_cxx,
+    glibc_abort,
+    glibc_segfault_handler,
+    dynamic_glibc_program,
+    dynamic_glibc_cxx,
+    dynamic_glibc_threads,
+    runtime_code,
+    page_accounting,
+    vmcall_after_exit,
+);

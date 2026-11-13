@@ -88,6 +88,13 @@ fn basic_page_protections() {
         m.memory.gather_buffers(V, VLEN, 16).unwrap_err().kind,
         fault
     );
+    assert_eq!(
+        m.memory
+            .membuffer(V, VLEN, libriscv::MEMVIEW_MAX)
+            .unwrap_err()
+            .kind,
+        fault
+    );
     assert_eq!(m.memory.memview(V, VLEN).unwrap_err().kind, fault);
     assert_eq!(m.memory.memstring(V).unwrap_err().kind, fault);
     // V is not writable anymore

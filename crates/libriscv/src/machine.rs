@@ -10,7 +10,8 @@
 //!   [`Machine::try_simulate`] (timeout returns `Ok(false)`).
 //!
 //! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
-//! `signals.rs`, VM calls in `vmcall.rs`. Not ported yet: typed `sysargs`,
+//! `signals.rs`, VM calls in `vmcall.rs`, typed `sysargs`/`set_result` in
+//! `sysargs.rs`. Not ported yet:
 //! userdata and serialization (Phase 3) and the native heap (Phase 5).
 
 use std::io::Write;
@@ -362,10 +363,6 @@ impl Machine {
     /// Integer system call argument `idx` (`a0 + idx`).
     pub const fn sysarg(&self, idx: u32) -> u64 {
         self.cpu.reg(REG_ARG0.wrapping_add(idx))
-    }
-    /// Set the system call result (`a0`).
-    pub const fn set_result(&mut self, value: u64) {
-        self.cpu.set_reg(REG_ARG0, value);
     }
     /// The guest's return value (`a0`).
     pub const fn return_value(&self) -> u64 {

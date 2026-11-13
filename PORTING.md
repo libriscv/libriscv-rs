@@ -634,7 +634,7 @@ Phase 5) and `insert_non_owned_memory`.
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
 | Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
-| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits) |
+| Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark. Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
 | Fuzz | `fuzz/` (`cargo fuzz`, a separate workspace; see `fuzz/README.md`) | Port of `../libriscv/fuzz/fuzz.cpp`: `vmfuzzer` (instruction set), `elffuzzer` (ELF loader + Linux system calls, seeded with the prebuilt RV64 ELFs), `syshelperfuzzer` (system call memory helpers). Built with debug assertions and overflow checks; any panic is a bug. `FUZZ_NAT` waits for the native heap |
@@ -956,6 +956,16 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   `~0xF`.
 - EBREAK isn't a block end, so a handler's `stop()` only takes effect at
   the next check (C++ `basic.cpp` accepts both 51 and 25 EBREAKs).
+- The host-side `membuffer`, `memstring_view` and `try_memmove` take the
+  arena fast path after checking only the arena's size, not its read or
+  write windows or page attributes (`memstring_view` even below
+  `RWREAD_BEGIN`), and `memcpy_from` uses the arena's write window for its
+  source. `memcmp` doesn't check that the start is readable on its arena
+  fast path, only the end.
+- Not reproduced (C++ bug): the slow path of `memcmp(const void*,
+  address_t, size_t)` compares the host byte as a signed `char`, flipping
+  the result for bytes above 0x7F; here every path compares unsigned bytes
+  (and returns an `Ordering`, since only `memcmp`'s sign is meaningful).
 - Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number
@@ -980,15 +990,15 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 ### Phase 3 — Embedding API
 
-- [ ] `install_syscall_handler`, `sysargs`, `set_result(_or_error)`
+- [x] `install_syscall_handler`, typed `sysarg`/`sysargs`/`return_value`, `set_result(_or_error)` (`sysargs.rs`: `SysArg`/`SysResult` traits, tuples of up to 8; `ByPointer<T>` for C++'s pointer-to-struct arguments)
 - [x] `address_of` (ELF symbols), `vmcall`, `preempt` (restoring and clobbering), `setup_call`, `default_exit_function`, `rvlinux --call` (`machine_vmcall.hpp`, `machine_inline.hpp`, `CPU::preempt_internal`); see "VM calls"
 - [ ] Call-depth handling
 - [ ] `PreparedCall` (`prepared_call.hpp`)
-- [ ] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push`
+- [x] Guest memory views, `copy_to/from_guest`, `memstring`, `stack_push` (`memory/helpers.rs`: `Buffer`/`membuffer`, `strlen`, `memstring_view`, `memview`/`memview_mut` with `maxlen`, typed `memarray`/`memspan`/`try_memarray` as `GuestSlice`/`GuestSliceMut` over `GuestPod`, `try_memmove`, both `memcmp`s, machine-to-machine `memcpy_from`, `read_value`/`write_value`; `stack_push_value`)
 - [ ] Printer / stdin / rdtime hooks
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
-- [ ] Ports of `tests/unit/{custom,dynamic,exceptions,examples,checksum,pcrel,png,rvbuffer}.cpp` (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
+- [ ] Ports of `tests/unit/{dynamic,exceptions,examples,checksum,pcrel,png}.cpp` (`rvbuffer.cpp` and `custom.cpp`'s "Take custom system arguments": done, `tests/guest_memory.rs`; "Custom instruction" needs custom instruction handlers and userdata) (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
 
 ### Phase 4 — Performance
 
@@ -1035,13 +1045,13 @@ phase starts; names below are the intended targets.
 | `memory.hpp`, `memory.cpp`, `memory_inline.hpp`, `memory_rw.cpp` | `memory/` | 1, 3, 5 | ✅ arena + paging + fork (serialization: Phase 3) |
 | `page.hpp` | `memory/page.rs` | 5 | ✅ (memory traps: Phase 5) |
 | `memory_mmap.cpp`, `mmap_cache.hpp` | `memory/mmap.rs` | 2 | ✅ (+ flat-arena `memdiscard`, `memstring`, `flush_execute_segments`) |
-| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp` | `memory/paging.rs` | 3, 5 | ✅ incl. page caches and fork page tables |
+| `memory_helpers_paging.hpp`, `memory_inline_pages.hpp` | `memory/paging.rs`, `memory/helpers.rs` | 3, 5 | ✅ incl. page caches, fork page tables and the host-side helpers (`membuffer`, `memarray`, `memspan`, ...) |
 | `cached_address.hpp` (`CachedAddress`) | — | 3 | not yet (a cached `address_of`) |
 | `registers.hpp`, `rvv_registers.hpp` | `registers.rs` | 1–2 | ✅ integer, FP (raw bits) + FCSR (the `fp64reg` views are in `isa/rvfd.rs`; vector: Phase 5) |
 | `cpu.hpp`, `cpu.cpp`, `cpu_inline.hpp` | `cpu.rs` | 1 | ✅ (debugger/breakpoint helpers: Phase 5) |
 | `tailcall_dispatch.cpp` | `dispatch.rs` | 1, 4 | ✅ |
 | `cpu_dispatch.cpp`, `threaded_dispatch.cpp`, `cpu_inaccurate_dispatch.cpp`, `threaded_inaccurate_dispatch.cpp` | — | — | superseded by tail-call dispatch; `cpu_dispatch.cpp` defines the observable semantics (see "Dispatch") |
-| `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅ |
+| `machine.hpp`, `machine.cpp`, `machine_inline.hpp` | `machine.rs`, `sysargs.rs` | 1–3 | Phase 1 part ✅ (`system()`, syscalls, simulate), fork ✅, typed `sysargs`/`set_result` ✅ |
 | `machine_vmcall.hpp`, `prepared_call.hpp` | `vmcall.rs` | 3 | ✅ `vmcall`/`preempt` (`PreparedCall`: not yet) |
 | `instruction_list.hpp`, `instr_decoding.inc`, `instr_helpers.hpp`, `safe_instr_loader.hpp` | `decode.rs` | 1–2 | ✅ RV64IMAFDC + Zcb + B + Zfhmin/Zfa (`safe_instr_loader.hpp` is in `decoder_cache.rs`) |
 | `rvi_instr.cpp`, `rv64i.cpp` | `isa/rvi.rs` | 1–2 | ✅ I + M + Zba/Zbb/Zbc/Zbs/Zicond/Zbkb (Zbkb's ZIP/UNZIP are RV32-only and unimplemented, as in C++) |
@@ -1073,7 +1083,7 @@ phase starts; names below are the intended targets.
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
 | `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |
 | `util/crc32*.{hpp,cpp}` | `decoder_cache.rs` (`crc32c`) | 4 | ✅ CRC32-C (plain CRC32: not needed yet) |
-| `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
+| `util/buffer.hpp` | `memory/helpers.rs` | 3 | ✅ `Buffer` |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
 | `emulator/src/main.cpp` | `crates/rvlinux` | 0–2, 5 | ✅ static and dynamic Linux guests (`full_linux_guest`), `--call` (without the system call 500 symbol helper, which needs userdata); debugger, GDB: later |
 | `tr_*`, `amd64/`, `win32/`, `rv128i*`, `rva128_instr.cpp` | — | — | out of scope |

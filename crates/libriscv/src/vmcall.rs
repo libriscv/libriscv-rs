@@ -27,6 +27,7 @@
 
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::machine::Machine;
+use crate::memory::GuestPod;
 use crate::registers::{REG_ARG0, REG_RA, REG_SP};
 
 /// C++ `REG_FA0`.
@@ -164,35 +165,6 @@ impl VmCallArg for str {
 impl VmCallArg for String {
     fn pass(&self, m: &mut Machine, regs: &mut ArgRegs) -> Result<()> {
         self.as_str().pass(m, regs)
-    }
-}
-
-/// A value with a fixed guest memory layout, which can be copied onto the
-/// guest stack (C++ passes standard-layout types by pushing their bytes).
-/// Implemented for the integer and floating-point types and arrays of
-/// them; implement it for `#[repr(C)]` structs by writing each field (and
-/// any padding) in order.
-pub trait GuestPod {
-    /// Append the value's guest representation (little-endian).
-    fn write_guest(&self, out: &mut Vec<u8>);
-}
-
-macro_rules! pod {
-    ($($t:ty),*) => {$(
-        impl GuestPod for $t {
-            fn write_guest(&self, out: &mut Vec<u8>) {
-                out.extend_from_slice(&self.to_le_bytes());
-            }
-        }
-    )*};
-}
-pod!(i8, i16, i32, i64, u8, u16, u32, u64, f32, f64);
-
-impl<T: GuestPod, const N: usize> GuestPod for [T; N] {
-    fn write_guest(&self, out: &mut Vec<u8>) {
-        for v in self {
-            v.write_guest(out);
-        }
     }
 }
 

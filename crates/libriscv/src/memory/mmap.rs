@@ -197,7 +197,7 @@ impl Memory {
             penalty = penalty.wrapping_add((hi - lo) / 4);
             let same = segment
                 .exec_bytes(lo, hi)
-                .is_some_and(|code| self.memcmp(code, lo).unwrap_or(false));
+                .is_some_and(|code| self.memcmp(code, lo).is_ok_and(|o| o.is_eq()));
             if !same {
                 segment.set_stale(true);
             }

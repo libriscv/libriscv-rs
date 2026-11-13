@@ -79,6 +79,7 @@ pub mod memory;
 mod options;
 pub mod registers;
 mod signals;
+mod sysargs;
 mod syscalls;
 #[cfg(test)]
 mod tail_call_tests;
@@ -93,13 +94,14 @@ pub use linux::auxv;
 pub use machine::{
     Machine, Printer, Rdtime, Stdin, SyscallHandler, UnhandledCsr, UnhandledSyscall,
 };
-pub use memory::{Memory, PAGE_SIZE};
+pub use memory::{Buffer, GuestPod, GuestSlice, GuestSliceMut, MEMVIEW_MAX, Memory, PAGE_SIZE};
 pub use options::MachineOptions;
 pub use registers::Registers;
 pub use signals::{SignalAction, SignalPerThread, SignalStack, Signals};
+pub use sysargs::{ArgCursor, ByPointer, SysArg, SysResult};
 pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, StatFilter, Target};
 pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
-pub use vmcall::{ArgRegs, CallTarget, GuestPod, OnStack, VmCallArg, VmCallArgs};
+pub use vmcall::{ArgRegs, CallTarget, OnStack, VmCallArg, VmCallArgs};
 
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;
