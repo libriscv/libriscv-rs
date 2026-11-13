@@ -365,6 +365,17 @@ mod tests {
         fuzz_fork(INPUT);
     }
 
+    /// The first `libcfuzzer` finding: a loop falling through into a
+    /// patched `rawmemchr` (which found its byte at once, so cost 0) wasn't
+    /// counted, and ran past the instruction limit forever.
+    #[test]
+    fn a_loop_through_a_patched_function_ends() {
+        const INPUT: &[u8] = include_bytes!("../regressions/libcfuzzer-uncounted-loop.bin");
+        let mut m = libc_machine(INPUT).unwrap();
+        let err = m.simulate(MAX_CYCLES).unwrap_err();
+        assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
+    }
+
     #[test]
     fn forks_are_compared() {
         // Store and advance forever.

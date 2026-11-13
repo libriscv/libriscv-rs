@@ -493,15 +493,36 @@ impl DecodedSegment {
                 block_begin_addr,
             ));
         }
+        // The instructions of the block before `addr` (with the C
+        // extension, where an entry's instruction count isn't its distance).
+        let mut starts: Vec<u64> = Vec::new();
+        if COMPRESSED {
+            let mut a = block_begin_addr;
+            while a < addr {
+                starts.push(a);
+                a = a.wrapping_add(if self.read_u16(a) & 3 != 3 { 2 } else { 4 });
+            }
+        }
         // 3. Correct the block length of every entry in the block.
         let mut patched_addr = block_begin_addr;
         for dd in current..last {
             let i = self.index(patched_addr);
+            if COMPRESSED {
+                // The instructions from here to the end of the block,
+                // including the new last one, as without the C extension
+                // (`idxend + 1`). C++ sets 0 here ("TODO: C-extension icount
+                // for breakpoints"), and then a loop falling through into a
+                // breakpoint or a libc fast-path function wasn't counted at
+                // all, so it ran past any instruction limit (found by
+                // libcfuzzer). Counting them differs from C++ only where
+                // code reaches the entry by falling through into it.
+                let n = starts.iter().filter(|&&s| s >= patched_addr).count() + 1;
+                if let Some(p) = self.cache.get_mut(i) {
+                    p.icount = u8::try_from(n).unwrap_or(u8::MAX);
+                }
+            }
             if let Some(p) = self.cache.get_mut(i) {
                 p.idxend = (last - dd) as u16;
-                if COMPRESSED {
-                    p.icount = 0; // TODO in C++: C-extension icount for breakpoints
-                }
             }
             patched_addr = patched_addr.wrapping_add(DIVISOR);
         }

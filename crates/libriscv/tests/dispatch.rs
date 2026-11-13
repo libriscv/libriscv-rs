@@ -227,3 +227,41 @@ fn random_code_never_panics() {
         let _ = m.simulate_precise();
     }
 }
+
+/// Instructions in a block before a breakpoint (or a libc fast-path
+/// function, which ends its block the same way) are counted. With the C
+/// extension they used to count 0, as in C++, so a loop falling through
+/// into the breakpoint ran past any instruction limit; found by
+/// `libcfuzzer`.
+#[test]
+#[cfg(feature = "ext-c")]
+fn instructions_before_a_breakpoint_are_counted() {
+    // V: c.addi a0, 1; c.addi a0, 1; V+4: breakpoint (c.nop); c.j back.
+    let code: Vec<u8> = [0x0505u16, 0x0505, 0x0001, 0xbff5]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    let options = MachineOptions {
+        memory_max: 1 << 20,
+        ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 4)],
+        ..Default::default()
+    };
+    let mut m = Machine::new(&[], options).unwrap();
+    m.init_execute_area(&code, V).unwrap();
+    // The breakpoint loops back to V, as a fast-path function returning to
+    // its caller does.
+    m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| m.cpu.jump(V));
+    m.cpu.jump(V).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = m.simulate(3000);
+        let _ = tx.send((result.map_err(|e| e.kind), m.cpu.reg(REG_ARG0)));
+    });
+    let (result, a0) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the loop ran past the instruction limit");
+    assert_eq!(result, Err(ExceptionKind::MaxInstructionsReached));
+    // Three instructions per round (the two before it and the breakpoint),
+    // as without the C extension.
+    assert_eq!(a0, 2 * 1000);
+}
