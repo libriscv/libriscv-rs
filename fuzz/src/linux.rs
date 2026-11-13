@@ -244,6 +244,13 @@ fn run_for(m: &mut Machine, fuel: u64, stack_top: u64) -> Snapshot {
 /// The machines have only the system calls a fork also gets: the minimal
 /// set and the native memory ones (a fork has no file descriptors,
 /// signals or native heap, so those would legitimately diverge).
+///
+/// A fork also has its own memory budget: the pages it was loaned don't
+/// count against it (C++ marks them non-owning, and its page fault
+/// handler counts owned pages), so a parent at its limit runs out of
+/// memory where its fork goes on. A fork never owns more pages than its
+/// parent, so only the parent can run out first: when it does, the forks
+/// still run, but aren't compared.
 pub fn fuzz_fork(data: &[u8]) {
     let _ = fork_and_compare(data);
 }
@@ -276,6 +283,10 @@ fn fork_and_compare(data: &[u8]) -> Option<()> {
     let fuel = u64::from(second) * 16 + 1;
     let expected = run_for(&mut parent, fuel, stack_top);
     let got = run_for(&mut fork, fuel, stack_top);
+    if matches!(expected.result, Some((ExceptionKind::OutOfMemory, _))) {
+        let _ = run_for(&mut grandchild, fuel, stack_top);
+        return None;
+    }
     assert_eq!(got, expected, "a fork diverged from its parent");
     let untouched = snapshot(&grandchild, None, stack_top);
     assert_eq!(
@@ -343,6 +354,15 @@ mod tests {
         m.copy_to_guest(a0, b"hello\0").unwrap();
         m.simulate(MAX_CYCLES).unwrap();
         assert_eq!(m.return_value(), 5);
+    }
+
+    /// The first `forkfuzzer` findings (2026-11-13): the parent ran out of
+    /// memory at its page limit, the fork (with its own budget) went on
+    /// and faulted elsewhere. Not a divergence; see `fuzz_fork`.
+    #[test]
+    fn a_parent_out_of_memory_is_not_a_divergence() {
+        const INPUT: &[u8] = include_bytes!("../regressions/forkfuzzer-parent-oom.bin");
+        fuzz_fork(INPUT);
     }
 
     #[test]
