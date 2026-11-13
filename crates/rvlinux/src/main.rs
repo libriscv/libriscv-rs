@@ -22,6 +22,7 @@ struct CliArgs {
     allowed_files: Vec<String>,
     fuel: Option<u64>,
     memory_mib: Option<u64>,
+    call_function: Option<String>,
     program: PathBuf,
     guest_args: Vec<String>,
 }
@@ -41,6 +42,7 @@ fn usage(name: &str) {
         "  -P, --proxy        Enable proxy mode, allowing access to all files (disabling the sandbox)"
     );
     println!("  -A, --allow file   Allow file to be opened by the guest");
+    println!("  -c, --call func    Call a function after loading the program");
     if cfg!(feature = "jit") {
         println!("  -j, --jit          Compile to native code with the Cranelift JIT");
         println!("  -B, --background   Compile in the background while interpreting (default)");
@@ -83,6 +85,15 @@ fn parse_args() -> Result<CliArgs, String> {
             "--nbit-address-space" if cfg!(feature = "jit") => args.nbit = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
             "-m" | "--memory" => args.memory_mib = Some(num(&mut it, "--memory")?),
+            "-c" | "--call" => {
+                let func = it
+                    .next()
+                    .ok_or_else(|| "--call requires a value".to_owned())?;
+                if args.verbose {
+                    println!("* Function to VMCall: {func}");
+                }
+                args.call_function = Some(func);
+            }
             s if s.starts_with('-') => return Err(format!("Unknown option: {s}")),
             _ => {
                 args.program = PathBuf::from(arg);
@@ -217,6 +228,22 @@ fn main() -> ExitCode {
                 "Runtime: {:.3}ms   (Use --accurate for instruction counting)",
                 runtime * 1000.0
             );
+        }
+    }
+    if let Some(func) = &args.call_function {
+        // C++ also falls back to asking the guest's symbol function (system
+        // call 500); not ported, as that needs userdata.
+        let addr = machine.address_of(func).unwrap_or(0);
+        if addr != 0 {
+            println!("Calling function {func} @ 0x{addr:X}");
+            if let Err(e) = machine.vmcall(addr, ()) {
+                // An uncaught exception terminates the C++ emulator.
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                eprintln!("Exception: {e}");
+                return ExitCode::FAILURE;
+            }
+        } else {
+            println!("Error: Function {func} not found, not able to call");
         }
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());

@@ -55,6 +55,18 @@ pub struct MachineOptions {
     /// arenas qualify; otherwise (reported with `verbose_loader`) the
     /// accesses stay checked. The interpreter is unaffected.
     pub jit_automatic_nbit_address_space: bool,
+    /// The ELF symbol of a program-provided function to use as the exit
+    /// address of VM calls (the return address [`Machine::vmcall`] sets up)
+    /// instead of the injected host code page (C++
+    /// `default_exit_function`). The function should end the call with the
+    /// STOP instruction (`.insn i SYSTEM, 0, x0, x0, 0x7ff`). Returning to
+    /// code in the program's own execute segment avoids a segment switch.
+    /// If the symbol isn't found, the host page is used. Like C++, the host
+    /// page (and with it the signal return trampoline) is then not
+    /// installed.
+    ///
+    /// [`Machine::vmcall`]: crate::Machine::vmcall
+    pub default_exit_function: Option<String>,
 }
 
 impl Default for MachineOptions {
@@ -75,6 +87,7 @@ impl Default for MachineOptions {
             jit_background: false,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
+            default_exit_function: None,
         }
     }
 }

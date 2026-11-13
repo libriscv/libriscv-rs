@@ -1653,3 +1653,105 @@ fn page_accounting() {
         assert!(out.stdout.contains("far discarded"), "{}", out.stdout);
     }
 }
+
+/// `--call`: a VM call after the program exits, from the program's final
+/// state (C++ `main.cpp`). C++ prints its own lines (the summary and
+/// `Calling function`) through buffered stdio but the guest's output
+/// directly, so on a pipe they come out in a different order: compare the
+/// guest's lines in order, and the emulator's lines separately.
+#[test]
+fn vmcall_after_exit() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build_glibc(
+        r#"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static char message[64];
+static int calls = 0;
+
+__attribute__((used, retain))
+void hello(void) {
+	calls++;
+	char buf[96];
+	int n = snprintf(buf, sizeof(buf), "hello from vmcall: %s (%d)\n", message, calls);
+	write(1, buf, n);
+}
+
+int main(int argc, char** argv) {
+	strcpy(message, argc > 1 ? argv[1] : "no args");
+	printf("main says %s\n", message);
+	return 7;
+}
+"#,
+        testutil::Lang::C,
+    );
+    /// (guest lines, emulator lines that both print).
+    fn split(out: &std::process::Output) -> (Vec<String>, Vec<String>) {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (mut guest, mut emulator) = (Vec::new(), Vec::new());
+        for line in stdout.lines() {
+            if line.starts_with("Pages in use") {
+                continue;
+            }
+            if let Some(i) = line.find("  Runtime:") {
+                emulator.push(line[..i].to_owned());
+            } else if line.starts_with(">>> ")
+                || line.starts_with("Calling function")
+                || line.starts_with("Error: Function")
+            {
+                emulator.push(line.to_owned());
+            } else {
+                guest.push(line.to_owned());
+            }
+        }
+        emulator.sort();
+        (guest, emulator)
+    }
+    let rust_modes: Vec<Vec<&str>> = if cfg!(feature = "jit") {
+        vec![vec![], vec!["--jit"], vec!["--jit", "--no-background"]]
+    } else {
+        vec![vec![]]
+    };
+    for func in ["hello", "no_such_function"] {
+        let flags = ["--call", func];
+        let reference = std::process::Command::new(testutil::reference_emulator())
+            .args(["--no-translate", "--accurate"])
+            .args(flags)
+            .arg(&elf)
+            .arg("state")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let expected = split(&reference);
+        assert!(
+            expected
+                .1
+                .iter()
+                .any(|l| l.starts_with(">>> Program exited")),
+            "{reference:?}"
+        );
+        if func == "hello" {
+            assert_eq!(
+                expected.0,
+                ["main says state", "hello from vmcall: state (1)"],
+                "{reference:?}"
+            );
+        }
+        for extra in &rust_modes {
+            let rust = std::process::Command::new(rvlinux())
+                .arg("--accurate")
+                .args(extra)
+                .args(flags)
+                .arg(&elf)
+                .arg("state")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(rust.status.success(), "{rust:?}");
+            assert_eq!(split(&rust), expected, "--call {func} {extra:?}");
+        }
+    }
+}

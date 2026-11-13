@@ -10,7 +10,7 @@
 //!   [`Machine::try_simulate`] (timeout returns `Ok(false)`).
 //!
 //! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
-//! `signals.rs`. Not ported yet: vmcall/preempt, typed `sysargs`,
+//! `signals.rs`, VM calls in `vmcall.rs`. Not ported yet: typed `sysargs`,
 //! userdata, fork and serialization (Phase 3) and the native heap
 //! (Phase 5).
 
@@ -179,7 +179,12 @@ impl Machine {
         Ok(stopped)
     }
 
-    fn simulate_or_timeout(&mut self, max_instructions: u64, counter: u64, pc: u64) -> Result<()> {
+    pub(crate) fn simulate_or_timeout(
+        &mut self,
+        max_instructions: u64,
+        counter: u64,
+        pc: u64,
+    ) -> Result<()> {
         let c = self.dispatch_simulate(pc, counter, max_instructions)?;
         self.counter = c.value;
         if c.max == 0 {

@@ -83,6 +83,7 @@ mod syscalls;
 #[cfg(test)]
 mod tail_call_tests;
 mod threads;
+mod vmcall;
 
 pub use cpu::Cpu;
 pub use decoder_cache::DecodedSegment;
@@ -98,6 +99,7 @@ pub use registers::Registers;
 pub use signals::{SignalAction, SignalPerThread, SignalStack, Signals};
 pub use syscalls::fds::{FileDescriptors, IoctlFilter, OpenFile, PathFilter, StatFilter, Target};
 pub use threads::{MAIN_THREAD_TID, MultiThreading, Thread};
+pub use vmcall::{ArgRegs, CallTarget, GuestPod, OnStack, VmCallArg, VmCallArgs};
 
 /// The default [`MachineOptions::jit_background_slice`].
 pub const JIT_BACKGROUND_SLICE: u64 = 1 << 20;

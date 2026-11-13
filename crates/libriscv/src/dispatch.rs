@@ -636,12 +636,21 @@ impl Machine {
     /// stops. Returns the final counters; a limit of zero means the machine
     /// stopped (C++: "stopped normally"). Sets PC, but like C++ leaves
     /// recording the counter to the caller.
+    ///
+    /// Reentrant: a system call handler may run the machine again (a
+    /// `preempt`), which gets its own slicing state.
     pub(crate) fn dispatch_simulate(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
+        let outer = self.dispatch.slice.take();
         #[cfg(feature = "jit")]
-        if self.memory.jit_pending() {
-            return self.dispatch_sliced(pc, counter, max);
-        }
-        self.dispatch_run(pc, counter, max)
+        let result = if self.memory.jit_pending() {
+            self.dispatch_sliced(pc, counter, max)
+        } else {
+            self.dispatch_run(pc, counter, max)
+        };
+        #[cfg(not(feature = "jit"))]
+        let result = self.dispatch_run(pc, counter, max);
+        self.dispatch.slice = outer;
+        result
     }
 
     /// `dispatch_simulate` while background compilations are pending: run in
