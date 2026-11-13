@@ -376,6 +376,31 @@ mod tests {
         assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
     }
 
+    /// libcfuzzer timeouts of the second fryer run (2026-11-13): `strcpy`
+    /// at 4 and `rawmemchr` at 8, called with `ra` = 4. `strcpy` returns
+    /// to itself, which falls through to `rawmemchr`, which returns to
+    /// `strcpy`: both free (empty strings), so the loop never reached the
+    /// instruction limit.
+    #[test]
+    fn functions_returning_to_themselves_are_counted() {
+        let offsets = {
+            let mut o = [0u8; 15];
+            o[5] = 2; // rawmemchr at 8
+            o[10] = 1; // strcpy at 4
+            o
+        };
+        let code = words(&[jal(1, 4), addi(0, 0, 0), addi(0, 0, 0)]);
+        let inputs: [&[u8]; 2] = [
+            &[&offsets[..], &code].concat(),
+            include_bytes!("../regressions/libcfuzzer-self-return-loop.bin"),
+        ];
+        for input in inputs {
+            let mut m = libc_machine(input).unwrap();
+            let err = m.simulate(MAX_CYCLES).unwrap_err();
+            assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
+        }
+    }
+
     #[test]
     fn forks_are_compared() {
         // Store and advance forever.

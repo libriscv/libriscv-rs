@@ -1276,11 +1276,22 @@ Differences from C++:
   leaves native code in front of a patched entry and the interpreter runs
   it. (C++ asmjit translates the segment before the patches are
   applied.)
-- Like C++, a patched function's entry block (and a breakpoint's) counts
-  0 instructions with the C extension (`create_block_ending_entry_at`'s
-  TODO), and the patch only finds the block start through entries in
-  front of it, not through the second half of a preceding 4-byte
-  instruction.
+- Not reproduced (C++ bugs, found by `libcfuzzer`; each let a guest loop
+  past the instruction limit forever):
+  - With the C extension, C++ gives the entries in front of a patched
+    function (or a breakpoint) in its block an instruction count of 0
+    (`create_block_ending_entry_at`'s TODO), so code falling through into
+    it wasn't counted. Here they count the instructions up to and
+    including the patched entry. The patched entry itself still counts 0,
+    as in C++, so calls count exactly as there.
+  - C++ only finds the block start through entries in front of the patch,
+    stopping at the second half of a preceding 4-byte instruction (the
+    function was then never recognised). Here the search steps over it.
+  - A patched function returning to its own entry (`ra` = its address,
+    which no real caller does) falls through to the next instruction,
+    since PC didn't change, and the call counts nothing. Here such a call
+    counts one instruction, so a cycle of patched functions can't run
+    for free.
 
 ### Phase 2 — Linux userspace parity
 

@@ -208,7 +208,18 @@ pub(crate) fn libc_fastpath_ebreak_handler(m: &mut Machine) -> Result<()> {
         run_libc_fastpath(m, id)?;
         // Return to the caller. The SYSTEM handler notices that PC moved
         // and resumes there instead of after the EBREAK.
-        m.cpu.regs.pc = m.cpu.reg(REG_RA);
+        let ra = m.cpu.reg(REG_RA);
+        if ra == pc {
+            // Returning to its own entry point, which no real caller does
+            // (the return address follows the call). The SYSTEM handler
+            // sees no PC change and falls through to the next instruction,
+            // and the call itself counts no instructions, so a run of
+            // patched functions returning here could loop forever without
+            // reaching the instruction limit. Count the call. (C++ has the
+            // same loop; elsewhere the counts match it exactly.)
+            m.penalize(1);
+        }
+        m.cpu.regs.pc = ra;
         return Ok(());
     }
     // Not one of ours: this is a real breakpoint.
