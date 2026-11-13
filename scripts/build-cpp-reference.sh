@@ -5,11 +5,13 @@
 #   target/cpp-ref/threaded/rvlinux   computed goto (C++ default, fastest interpreter)
 #   target/cpp-ref/tailcall/rvlinux   clang musttail + preserve_none (what the Rust port mirrors)
 #   target/cpp-ref/switch/rvlinux     plain switch (baseline)
+#   target/cpp-ref/asmjit/rvlinux     threaded + asmjit native code (only when asked for:
+#                                     fetches asmjit unless RISCV_ASMJIT_SOURCE_DIR is set)
 #
 # Binary translation is disabled in all of them. Run with --accurate for
 # instruction counts.
 #
-#   scripts/build-cpp-reference.sh [threaded|tailcall|switch ...]
+#   scripts/build-cpp-reference.sh [threaded|tailcall|switch|asmjit ...]
 #
 # Env: LIBRISCV_CPP (default ../libriscv), CLANGXX (default: newest clang++-NN found).
 set -euo pipefail
@@ -42,7 +44,11 @@ for mode in "${MODES[@]}"; do
 			flags+=(-DRISCV_TAILCALL_DISPATCH=ON -DCMAKE_CXX_COMPILER="$(find_clang)")
 			expect="Tail-call dispatch enabled" ;;
 		switch) flags+=(-DRISCV_THREADED=OFF -DRISCV_TAILCALL_DISPATCH=OFF); expect="Switch-based dispatch enabled" ;;
-		*) echo "Unknown mode: $mode (threaded|tailcall|switch)" >&2; exit 2 ;;
+		asmjit)
+			flags+=(-DRISCV_THREADED=ON -DRISCV_TAILCALL_DISPATCH=OFF -DRISCV_LIBTCC=OFF -DRISCV_ASMJIT=ON)
+			[ -n "${RISCV_ASMJIT_SOURCE_DIR:-}" ] && flags+=(-DRISCV_ASMJIT_SOURCE_DIR="$RISCV_ASMJIT_SOURCE_DIR")
+			expect="Threaded dispatch enabled" ;;
+		*) echo "Unknown mode: $mode (threaded|tailcall|switch|asmjit)" >&2; exit 2 ;;
 	esac
 	build="$OUT/$mode"
 	echo "==> $mode"

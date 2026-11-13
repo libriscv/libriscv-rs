@@ -44,3 +44,7 @@ workspace = true
 [[bench]]
 name = "fork"
 harness = false
+
+[[bench]]
+name = "vmcall"
+harness = false

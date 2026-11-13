@@ -403,6 +403,12 @@ pub fn reference_emulator_variant(mode: CppDispatch) -> PathBuf {
         .join("rvlinux")
 }
 
+/// Path to the C++ `rvlinux` with asmjit built by
+/// `scripts/build-cpp-reference.sh asmjit` (`target/cpp-ref/asmjit/rvlinux`).
+pub fn reference_asmjit_emulator() -> PathBuf {
+    target_dir().join("cpp-ref").join("asmjit").join("rvlinux")
+}
+
 /// Skip-or-fail helper for tests that diff against the C++ emulator.
 pub fn need_reference() -> bool {
     let emu = reference_emulator();

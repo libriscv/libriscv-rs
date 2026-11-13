@@ -6,12 +6,14 @@
 //! cargo bench -p rvlinux --bench coremark                      # interpreter
 //! cargo bench -p rvlinux --features jit --bench coremark       # + JIT
 //! COREMARK_ITERATIONS=4000 COREMARK_RUNS=5 cargo bench ...     # defaults: 4000, 3
+//! COREMARK_ONLY="asmjit,Rust JIT" cargo bench ...              # variants whose name contains one
 //! ```
 //!
 //! Needs the RISC-V cross compiler and the CoreMark sources (`../coremark` or
 //! `$COREMARK_DIR`). C++ emulators are used where they exist: the reference
 //! (`$LIBRISCV_CPP_EMULATOR`), the dispatch variants from
-//! `scripts/build-cpp-reference.sh`, and `$LIBRISCV_CPP/emulator/rvlinux-asmjit`.
+//! `scripts/build-cpp-reference.sh`, and its `asmjit` build (falling back to
+//! `$LIBRISCV_CPP/emulator/rvlinux-asmjit`).
 //!
 //! Two builds of CoreMark: freestanding (our port in
 //! `crates/testutil/guests/coremark`, minimal system calls) and a regular
@@ -59,7 +61,10 @@ struct Variant {
     name: String,
     emulator: PathBuf,
     flags: Vec<&'static str>,
-    /// Whether its instruction count must match the others.
+    /// Whether its instruction count must match the others. A variant that
+    /// doesn't count exactly (asmjit: its count only bounds execution) can
+    /// read a stale `rdinstret`, which is CoreMark's clock here, and then
+    /// fail the 10-second rule; for it only the CRC checks decide.
     exact: bool,
 }
 
@@ -106,9 +111,12 @@ fn variants() -> Vec<Variant> {
         "C++ tailcall",
         testutil::reference_emulator_variant(CppDispatch::Tailcall),
     );
-    let asmjit = testutil::cpp_source_dir()
-        .join("emulator")
-        .join("rvlinux-asmjit");
+    let mut asmjit = testutil::reference_asmjit_emulator();
+    if !asmjit.exists() {
+        asmjit = testutil::cpp_source_dir()
+            .join("emulator")
+            .join("rvlinux-asmjit");
+    }
     if asmjit.exists() {
         v.push(Variant {
             name: "C++ asmjit (up front)".into(),
@@ -133,8 +141,18 @@ fn env_num(var: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// One run: wall time and the reported instruction count.
-fn run(variant: &Variant, elf: &Path) -> (Duration, Option<u64>) {
+/// CoreMark's own checks without its time limit: the seeds are known
+/// (`crcfinal` printed) and no list/matrix/state CRC is wrong.
+fn crcs_validated(stdout: &str) -> bool {
+    stdout.contains("crcfinal")
+        && !stdout.contains("Cannot validate operation")
+        && !stdout.contains("]ERROR!")
+}
+
+/// One run: wall time, the reported instruction count, and whether CoreMark
+/// validated (a failing run is reported, with its output, but doesn't stop
+/// the other variants).
+fn run(variant: &Variant, elf: &Path) -> (Duration, Option<u64>, bool) {
     let start = Instant::now();
     let out = Command::new(&variant.emulator)
         .args(&variant.flags)
@@ -145,13 +163,15 @@ fn run(variant: &Variant, elf: &Path) -> (Duration, Option<u64>) {
     let elapsed = start.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed = testutil::parse_run_output(&stdout, &String::from_utf8_lossy(&out.stderr));
-    assert!(
-        parsed.stdout.contains("Correct operation validated."),
-        "{} failed on {}:\n{stdout}",
-        variant.name,
-        elf.display()
-    );
-    (elapsed, parsed.instructions)
+    let valid = if variant.exact {
+        parsed.stdout.contains("Correct operation validated.")
+    } else {
+        crcs_validated(&parsed.stdout)
+    };
+    if !valid {
+        eprintln!("{} failed on {}:\n{stdout}", variant.name, elf.display());
+    }
+    (elapsed, parsed.instructions, valid)
 }
 
 fn main() {
@@ -160,7 +180,10 @@ fn main() {
     }
     let iterations = env_num("COREMARK_ITERATIONS", 4000);
     let runs = env_num("COREMARK_RUNS", 3).max(1);
-    let variants = variants();
+    let mut variants = variants();
+    if let Ok(only) = std::env::var("COREMARK_ONLY") {
+        variants.retain(|v| only.split(',').any(|f| v.name.contains(f.trim())));
+    }
     println!("CoreMark, {iterations} iterations, best of {runs} (wall-clock ms per process)\n");
     let mut header = format!("| {:<26} |", "");
     for &(glibc, march, _) in BUILDS {
@@ -185,13 +208,19 @@ fn main() {
         })
         .collect();
     let mut counts: Vec<Option<u64>> = vec![None; elfs.len()];
+    let mut failed = false;
     for variant in &variants {
         let mut line = format!("| {:<26} |", variant.name);
         for (col, elf) in elfs.iter().enumerate() {
             let mut best = Duration::MAX;
+            let mut valid = true;
             for _ in 0..runs {
-                let (t, count) = run(variant, elf);
+                let (t, count, ok) = run(variant, elf);
                 best = best.min(t);
+                if !ok {
+                    valid = false;
+                    break;
+                }
                 if variant.exact {
                     let expected = *counts[col].get_or_insert(count.unwrap_or(0));
                     assert_eq!(
@@ -205,7 +234,12 @@ fn main() {
             }
             let ms = best.as_secs_f64() * 1e3;
             let score = f64::from(iterations) / best.as_secs_f64();
-            line += &format!(" {ms:>9.1} ms ({score:>7.0} it/s) |");
+            if valid {
+                line += &format!(" {ms:>9.1} ms ({score:>7.0} it/s) |");
+            } else {
+                failed = true;
+                line += &format!(" {ms:>9.1} ms (  FAILED) |");
+            }
         }
         println!("{line}");
     }
@@ -214,4 +248,5 @@ fn main() {
         line += &format!(" {:>28} |", count.map_or("-".into(), |c| c.to_string()));
     }
     println!("{line}");
+    assert!(!failed, "some runs failed to validate (output above)");
 }

@@ -243,28 +243,32 @@ LCG loop, 206.8M instructions, same machine and date:
 | C++ tailcall | ~1080 | −2% |
 | Rust (release) | ~708 | −36% |
 
-CoreMark (`cargo bench -p rvlinux --features jit --bench coremark`):
-freestanding, built with our port (`crates/testutil/guests/coremark`, from
-`../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
+CoreMark (`cargo bench -p rvlinux --features jit --bench coremark`): a
+fixed workload rather than a CoreMark 1.0 run (see "CoreMark 1.0" below for
+that). Freestanding, built with our port (`crates/testutil/guests/coremark`,
+from `../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
 iterations, `-O2`, wall-clock time of the whole process, best of 5, on
-2026-11-13, with the bytecodes (see "Bytecodes"). The C++ builds include
-C++'s C.LD and SRAIW bytecodes (staged in `../libriscv`, not yet committed
-there), which made C++ threaded ~12% faster. All runs validate, and all
-exact-counting variants report the same instruction counts
-(1442120574 / 1442122541 / 1272208341):
+2026-11-13, with the bytecodes (see "Bytecodes"). C++ is upstream
+`e806d460` (with its C.LD and SRAIW bytecodes, which made C++ threaded ~12%
+faster), asmjit built by `scripts/build-cpp-reference.sh asmjit`. All runs
+validate, and all exact-counting variants report the same instruction
+counts (1442120574 / 1442122541 / 1272208341):
 
 | | rv64imc | rv64imafdc | rv64imafdc_zba_zbb_zbs |
 |---|---|---|---|
-| Rust interpreter | 1692 ms | 1640 ms | 1419 ms |
-| Rust JIT (up front) | 310 ms | 311 ms | 309 ms |
-| Rust JIT (background) | 305 ms | 306 ms | 300 ms |
-| C++ threaded | 1626 ms | 1677 ms | 1703 ms |
-| C++ tailcall | 1830 ms | 1699 ms | 1652 ms |
-| C++ asmjit (up front) | 291 ms | 292 ms | 745 ms* |
-| C++ asmjit (background) | 292 ms | 291 ms | 755 ms* |
+| Rust interpreter | 1648 ms | 1615 ms | 1516 ms |
+| Rust JIT (up front) | 313 ms | 317 ms | 311 ms |
+| Rust JIT (background) | 307 ms | 308 ms | 303 ms |
+| C++ threaded | 1709 ms | 1624 ms | 1630 ms |
+| C++ tailcall | 1751 ms | 1806 ms | 1718 ms |
+| C++ asmjit (up front) | 238 ms | 240 ms | 239 ms |
+| C++ asmjit (background) | 237 ms | 239 ms | 239 ms |
 
-\* The local `rvlinux-asmjit` binary predates the reference commit and
-doesn't compile Zba/Zbb/Zbs.
+The guest's clock is `rdinstret`, so its output is deterministic (the same
+ELFs are difftests), and CoreMark's 10-second rule passes on a nominal
+clock. asmjit's instruction count only bounds execution: `rdinstret` read
+from native code can be stale, which stops CoreMark's clock and fails that
+rule, so variants that don't count exactly are validated by their CRCs only.
 
 Wall-clock differences of a few percent are noise on the dev machine; by
 `perf stat` (rv64imc) the Rust interpreter takes 9.26G cycles and 28.6G host
@@ -279,17 +283,40 @@ exact-counting variants report 1435905543 / 1266007356 instructions:
 
 | | glibc rv64imafdc | glibc rv64imafdc_zba_zbb_zbs |
 |---|---|---|
-| Rust interpreter | 1681 ms | 1435 ms |
-| Rust JIT (up front) | 2155 ms | 2150 ms |
-| Rust JIT (background) | 1680 ms | 1531 ms |
-| C++ threaded | 1696 ms | 1667 ms |
-| C++ tailcall | 1747 ms | 1717 ms |
-| C++ asmjit (up front) | 1647 ms | 2104 ms |
-| C++ asmjit (background) | 1643 ms | 2062 ms |
+| Rust interpreter | 1700 ms | 1511 ms |
+| Rust JIT (up front) | 2196 ms | 2191 ms |
+| Rust JIT (background) | 1699 ms | 1546 ms |
+| C++ threaded | 1712 ms | 1659 ms |
+| C++ tailcall | 1726 ms | 1715 ms |
+| C++ asmjit (up front) | 401 ms | 401 ms |
+| C++ asmjit (background) | 378 ms | 374 ms |
 
-The JITs don't pay off here: the executable segment holds all of libc
+The Rust JIT doesn't pay off here: the executable segment holds all of libc
 (460 KB), and compiling it takes ~1.9 s with Cranelift, after which
-CoreMark runs in ~260 ms. Lazy compilation (see Phase 4) is what fixes this.
+CoreMark runs in ~260 ms. asmjit compiles it in ~150 ms. Lazy compilation
+(see Phase 4) is what fixes this.
+
+### CoreMark 1.0
+
+The prebuilt RV64 ELFs in `../coremark` are real CoreMark 1.0 runs
+(`ITERATIONS=0`, calibrating to at least 10 s of wall-clock time from
+`clock_gettime`/`gettimeofday`). CoreMark's own Iterations/Sec, one run
+each, `--accurate`, the JITs with `--fuel 10000000000000` (the default 30G
+instruction limit stops a JIT before 10 s), same date and C++ builds:
+
+| ELF | Rust interpreter | C++ threaded | C++ tailcall | Rust JIT | C++ asmjit |
+|---|---:|---:|---:|---:|---:|
+| coremark-rv64g | 2354 | 2555 | 2377 | 14682 | 18559 |
+| coremark-rv64gc | 2159 | 2279 | 2220 | 15038 | 19336 |
+| coremark-rv64g_b | 2608 | 2704 | 2532 | 15194 | 20103 |
+| coremark.rv64gb.gcc14.2.elf | 2690 | 2884 | 2549 | 15581 | 19022 |
+| coremark-rv64g_zba_zbb | 2543 | 2727 | 2540 | 15848 | 19451 |
+
+The Rust interpreter is 4-8% behind C++ threaded on every ELF (level with
+tailcall), the Rust JIT 18-24% behind asmjit. With background compilation
+the JIT can arrive after CoreMark has calibrated on the interpreter, which
+then picks too few iterations and fails the 10-second rule; the Rust JIT
+column is up front where that happened (rv64gc, rv64g_zba_zbb; same score).
 
 ## JIT
 
@@ -876,7 +903,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 ### Phase 4 — Performance
 
-- [x] Benchmark harness: CoreMark (`crates/rvlinux/benches/coremark.rs`) vs the C++ reference, `target/cpp-ref/{threaded,tailcall}` and `rvlinux-asmjit`
+- [x] Benchmark harness: CoreMark (`crates/rvlinux/benches/coremark.rs`) vs the C++ reference, `target/cpp-ref/{threaded,tailcall,asmjit}`; VM calls (`crates/libriscv/benches/vmcall.rs`)
 - [ ] Benchmark harness: dhrystone, STREAM
 - [x] Specialised bytecodes (`decode_bytecodes.cpp`, `threaded_rewriter.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`); see "Bytecodes"
 - [x] `extern "rust-preserve-none"` handlers
