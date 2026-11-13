@@ -227,3 +227,81 @@ fn random_code_never_panics() {
         let _ = m.simulate_precise();
     }
 }
+
+/// Instructions in a block before a breakpoint (or a libc fast-path
+/// function, which ends its block the same way) are counted. With the C
+/// extension they used to count 0, as in C++, so a loop falling through
+/// into the breakpoint ran past any instruction limit; found by
+/// `libcfuzzer`.
+#[test]
+#[cfg(feature = "ext-c")]
+fn instructions_before_a_breakpoint_are_counted() {
+    // V: c.addi a0, 1; c.addi a0, 1; V+4: breakpoint (c.nop); c.j back.
+    let code: Vec<u8> = [0x0505u16, 0x0505, 0x0001, 0xbff5]
+        .iter()
+        .flat_map(|h| h.to_le_bytes())
+        .collect();
+    let options = MachineOptions {
+        memory_max: 1 << 20,
+        ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 4)],
+        ..Default::default()
+    };
+    let mut m = Machine::new(&[], options).unwrap();
+    m.init_execute_area(&code, V).unwrap();
+    // The breakpoint loops back to V, as a fast-path function returning to
+    // its caller does.
+    m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| m.cpu.jump(V));
+    m.cpu.jump(V).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = m.simulate(3000);
+        let _ = tx.send((result.map_err(|e| e.kind), m.cpu.reg(REG_ARG0)));
+    });
+    let (result, a0) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the loop ran past the instruction limit");
+    assert_eq!(result, Err(ExceptionKind::MaxInstructionsReached));
+    // Three instructions per round (the two before it and the breakpoint),
+    // as without the C extension.
+    assert_eq!(a0, 2 * 1000);
+}
+
+/// A breakpoint (or libc fast-path function) after a 4-byte instruction
+/// in the same block ends the block too. With the C extension the look-back
+/// for the block's start stopped at the empty second half of the 4-byte
+/// instruction, as in C++, leaving the breakpoint in the middle of its
+/// block: its handler saw the block's last PC, so a fast-path function
+/// there wasn't recognised. Found while investigating a `libcfuzzer`
+/// finding.
+#[test]
+#[cfg(feature = "ext-c")]
+fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {
+    // V: addi a0, a0, 1; V+4: c.addi a0, 1; V+6: breakpoint (c.nop);
+    // V+8: c.j back.
+    let mut code = 0x0015_0513u32.to_le_bytes().to_vec();
+    for half in [0x0505u16, 0x0001, 0xbfe5] {
+        code.extend(half.to_le_bytes());
+    }
+    let options = MachineOptions {
+        memory_max: 1 << 20,
+        ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 6)],
+        ..Default::default()
+    };
+    let mut m = Machine::new(&[], options).unwrap();
+    m.init_execute_area(&code, V).unwrap();
+    m.set_userdata(std::sync::atomic::AtomicU64::new(0));
+    m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| {
+        let pc = m.cpu.pc();
+        if let Some(seen) = m.userdata::<std::sync::atomic::AtomicU64>() {
+            seen.store(pc, std::sync::atomic::Ordering::Relaxed);
+        }
+        m.cpu.jump(V)
+    });
+    m.cpu.jump(V).unwrap();
+    let err = m.simulate(3000).unwrap_err();
+    assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
+    let seen = m.userdata::<std::sync::atomic::AtomicU64>().unwrap();
+    assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), V + 6);
+    // Three instructions per round, the breakpoint included.
+    assert_eq!(m.cpu.reg(REG_ARG0), 2 * 1000);
+}

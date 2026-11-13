@@ -1314,31 +1314,43 @@ impl Memory {
     /// pages instead of writing to them. Here host pages that are already
     /// zero are skipped, so a guest discarding (or mapping) a huge range
     /// doesn't make the host commit memory for it.
+    ///
+    /// A range past the top of the address space ends there. C++ wraps
+    /// around instead: a range that wraps back into its own first page
+    /// takes the page-by-page path with an end before its start, and a
+    /// range ending exactly at 2^64 gets an end of 0. Both are undefined
+    /// behaviour in C++ (a huge `madvise`/`memset`) and overflowed here
+    /// (found by `linuxfuzzer`, through `madvise(MADV_DONTNEED)`).
     pub fn memdiscard(&mut self, dst: u64, len: u64, ignore_protections: bool) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
+        // At most up to 2^64: dst + len - 1 doesn't overflow.
+        let len = if dst == 0 {
+            len
+        } else {
+            len.min(dst.wrapping_neg())
+        };
+        let last = dst + (len - 1);
         let first = dst / PAGE_SIZE;
-        let end_page = dst.wrapping_add(len - 1) / PAGE_SIZE + 1;
-        if end_page.wrapping_sub(first) > self.pages_active() as u64 {
+        let end_page = last / PAGE_SIZE + 1;
+        if end_page - first > self.pages_active() as u64 {
             // A range larger than the page table: wipe the arena part, then
             // visit only the pages that exist.
-            let end = dst.wrapping_add(len);
-            if dst < end.min(self.arena_size) {
-                self.zero_arena(dst, end);
+            if dst < self.arena_size {
+                self.zero_arena(dst, last.saturating_add(1));
             }
-            if first < end_page {
-                let existing: Vec<u64> = self.paging.pagenos_in(first, end_page);
-                for pageno in existing {
-                    let pbegin = dst.max(pageno * PAGE_SIZE);
-                    let pend = end.min((pageno + 1).saturating_mul(PAGE_SIZE));
-                    self.discard_page(
-                        pageno,
-                        (pbegin & PAGE_MASK) as usize,
-                        pend.wrapping_sub(pbegin) as usize,
-                        ignore_protections,
-                    )?;
-                }
+            let existing: Vec<u64> = self.paging.pagenos_in(first, end_page);
+            for pageno in existing {
+                let page_start = pageno * PAGE_SIZE;
+                let pbegin = dst.max(page_start);
+                let plast = last.min(page_start + (PAGE_SIZE - 1));
+                self.discard_page(
+                    pageno,
+                    (pbegin & PAGE_MASK) as usize,
+                    (plast - pbegin + 1) as usize,
+                    ignore_protections,
+                )?;
             }
             return Ok(());
         }
@@ -1353,7 +1365,7 @@ impl Memory {
                 if size == PAGE_SIZE {
                     // Whole missing arena pages: madvise the rest of the
                     // whole pages in one go.
-                    let new_dst = dst.wrapping_add(len & !PAGE_MASK).min(self.arena_size);
+                    let new_dst = dst.saturating_add(len & !PAGE_MASK).min(self.arena_size);
                     self.zero_arena(dst, new_dst);
                     let new_size = new_dst - dst;
                     dst = new_dst;

@@ -39,15 +39,21 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Lint the fuzz crate
+      - name: Lint and test the fuzz crate
         working-directory: fuzz
         run: |
           cargo fmt --check
           cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features jit -- -D warnings
+          cargo clippy --all-targets --no-default-features -- -D warnings
+          cargo test
 
       - name: Build the fuzzers
         working-directory: fuzz
-        run: cargo fuzz build $FUZZ_FLAGS
+        run: |
+          cargo fuzz build $FUZZ_FLAGS
+          cargo fuzz build $FUZZ_FLAGS --features jit --target-dir target/jit jitdifffuzzer
+          cargo fuzz build $FUZZ_FLAGS --no-default-features --target-dir target/no-c vmfuzzer
 
       # elffuzzer spends the whole run failing ELF header validation from an
       # empty corpus; do_fuzz.sh seeds it with the RV64 binaries here.
@@ -63,7 +69,8 @@ jobs:
           LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
         run: |
           status=0
-          for target in vmfuzzer elffuzzer nativefuzzer syshelperfuzzer; do
+          for target in vmfuzzer elffuzzer nativefuzzer syshelperfuzzer \
+              linuxfuzzer libcfuzzer forkfuzzer guestfuzzer vmcallfuzzer jitdifffuzzer; do
             echo "::group::$target (${FUZZ_SECONDS}s)"
             ./do_fuzz.sh "$target" -- \
               -max_total_time="$FUZZ_SECONDS" \
@@ -71,6 +78,12 @@ jobs:
               || { echo "::error::$target found a crash"; status=1; }
             echo "::endgroup::"
           done
+          # The 4-byte decoder layout (no C extension).
+          echo "::group::vmfuzzer without the C extension (${FUZZ_SECONDS}s)"
+          FUZZ_FLAGS="$FUZZ_FLAGS --no-default-features --target-dir target/no-c" \
+            ./do_fuzz.sh vmfuzzer -- -max_total_time="$FUZZ_SECONDS" -print_final_stats=1 \
+            || { echo "::error::vmfuzzer (no C extension) found a crash"; status=1; }
+          echo "::endgroup::"
           exit $status
 
       - name: Upload crash artifacts

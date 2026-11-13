@@ -7,6 +7,21 @@
 //!
 //! `FUZZ_NAT` (`fuzz_native_syscalls`) runs without the native thread
 //! system calls, which aren't ported.
+//!
+//! The other harnesses have no C++ counterpart: the Linux personality and
+//! the libc fast path, forks ([`linux`]), the guest C++ containers
+//! ([`guest`]), VM calls and dyncalls ([`vmcall`]) and the JIT against the
+//! interpreter ([`jitdiff`]).
+
+pub mod elf;
+pub mod guest;
+#[cfg(feature = "jit")]
+pub mod jitdiff;
+pub mod linux;
+pub mod vmcall;
+
+#[cfg(test)]
+mod tests;
 
 use libriscv::memory::PageAttributes;
 use libriscv::{Machine, MachineOptions};
@@ -19,11 +34,28 @@ const FUZZ_SYSTEM_CALLS: bool = true;
 const S: u64 = 0x1000;
 /// Code page of the instruction set fuzzer (C++ `V`).
 const V: u64 = 0x2000;
+/// The guest heap of the harnesses without a program. C++ (and this port,
+/// until 2026-11-13) used `mmap_allocate`, which returns 0 without a
+/// program: the heap then covered the code page and the first `malloc`
+/// returned 0.
+pub(crate) const HEAP: u64 = 0x10_0000;
+/// Its size.
+pub(crate) const HEAP_SIZE: u64 = 2 << 20;
 
 fn options() -> MachineOptions {
     MachineOptions {
         jit: cfg!(feature = "jit"),
         ..MachineOptions::default()
+    }
+}
+
+/// [`options`] with a 1 MiB arena: the instruction set fuzzer only uses
+/// two pages, and creating the default 64 MiB arena for every input cost
+/// most of its time (3.4k instead of 44k executions per second).
+fn small_options() -> MachineOptions {
+    MachineOptions {
+        memory_max: 1 << 20,
+        ..options()
     }
 }
 
@@ -37,7 +69,7 @@ fn loader_options() -> MachineOptions {
     }
 }
 
-fn quiet(m: &mut Machine) {
+pub(crate) fn quiet(m: &mut Machine) {
     m.set_on_unhandled_syscall(|_, _| Ok(()));
     // The fuzzer occasionally tries to invoke write/writev.
     m.set_printer(|_, _| {});
@@ -48,7 +80,7 @@ fn quiet(m: &mut Machine) {
 /// instructions.
 pub fn fuzz_instruction_set(data: &[u8]) {
     let run = || -> libriscv::Result<()> {
-        let mut machine = Machine::new(&[], options())?;
+        let mut machine = Machine::new(&[], small_options())?;
         machine
             .memory
             .set_page_attr(S, 0x1000, PageAttributes::default())?;
@@ -145,8 +177,6 @@ pub fn fuzz_syscall_helpers(data: &[u8]) {
     };
     quiet(&mut machine);
     let mut run = || -> libriscv::Result<()> {
-        // Allocate a custom guest heap.
-        let _heap = machine.memory.mmap_allocate(2 << 20);
         machine.install_syscall_handler(1, syscall_helpers);
         machine.setup_argv(&["program"], &["LC_ALL=C"])?;
         machine.init_execute_area(data, V)?;
@@ -172,10 +202,8 @@ pub fn fuzz_native_syscalls(data: &[u8]) {
     };
     quiet(&mut machine);
     let mut run = || -> libriscv::Result<()> {
-        // Allocate a custom guest heap.
-        let heap = machine.memory.mmap_allocate(2 << 20);
         machine.setup_native_memory(100);
-        machine.setup_native_heap(200, heap, 2 << 20)?;
+        machine.setup_native_heap(200, HEAP, HEAP_SIZE)?;
         machine.setup_argv(&["program"], &["LC_ALL=C"])?;
         machine.init_execute_area(code, V)?;
         machine.cpu.jump(V)?;

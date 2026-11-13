@@ -1,0 +1,14 @@
+# libcfuzzer: calls and returns (the patched functions are called with jal).
+# Generated once with Python: instruction words are little-endian.
+
+ecall="\x73\x00\x00\x00"
+ret="\x67\x80\x00\x00"
+ebreak="\x73\x00\x10\x00"
+fence_i="\x0f\x10\x00\x00"
+li_a7_exit="\x93\x08\xd0\x05"
+jal_ra_4="\xef\x00\x40\x00"
+jal_ra_8="\xef\x00\x80\x00"
+jal_ra_16="\xef\x00\x00\x01"
+jal_ra_32="\xef\x00\x00\x02"
+jal_ra_64="\xef\x00\x00\x04"
+li_a2_4096="\x13\x06\xf0\x7f"

@@ -136,14 +136,74 @@ impl<K, V, H> GuestPod for GuestStdUnorderedMap<K, V, H> {
 fn floor_size(value: f64) -> u64 {
     if value > 0.0 { value as u64 } else { 0 }
 }
-/// std::ceil for non-negative values.
+/// std::ceil for non-negative values. An infinite value (a guest's zero
+/// load factor) wraps around to 0, like C++'s `size_t` arithmetic.
 fn ceil_size(value: f64) -> u64 {
     let result = floor_size(value);
     if (result as f64) < value {
-        result + 1
+        result.wrapping_add(1)
     } else {
         result
     }
+}
+
+fn corrupt_list() -> crate::MachineError {
+    container_error("Guest std::unordered_map: corrupt node list")
+}
+
+/// Cycle detection for a walk over guest nodes (Brent's algorithm). The
+/// guest controls the `_M_nxt` pointers, and bounding a walk by the
+/// guest's element count isn't enough: a cyclic list with a huge count
+/// kept the host busy (and collecting entries) all but forever. Not in
+/// C++, which loops there. Constant memory; a list without a cycle never
+/// fails the check.
+struct CycleCheck {
+    tortoise: u64,
+    power: u64,
+    steps: u64,
+}
+
+impl CycleCheck {
+    const fn new(start: u64) -> Self {
+        Self {
+            tortoise: start,
+            power: 1,
+            steps: 0,
+        }
+    }
+    /// Called with each node the walk moves to: an error once it has come
+    /// back to a node it visited.
+    fn step(&mut self, addr: u64) -> Result<()> {
+        if addr != 0 && addr == self.tortoise {
+            return Err(corrupt_list());
+        }
+        self.steps += 1;
+        if self.steps == self.power {
+            self.tortoise = addr;
+            self.power = self.power.saturating_mul(2);
+            self.steps = 0;
+        }
+        Ok(())
+    }
+}
+
+/// The number of nodes in the list starting at `first`, which must be
+/// acyclic and no longer than `max` (the element count). The walks that
+/// change nodes as they go check the list with this first: their own
+/// writes could change where a cycle leads.
+fn node_list_len(m: &Machine, first: u64, max: u64) -> Result<u64> {
+    let mut check = CycleCheck::new(first);
+    let mut addr = first;
+    let mut len = 0u64;
+    while addr != 0 {
+        len += 1;
+        if len > max {
+            return Err(corrupt_list());
+        }
+        addr = read_u64(m, addr)?;
+        check.step(addr)?;
+    }
+    Ok(len)
 }
 
 impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestStdUnorderedMap<K, V, H> {
@@ -248,6 +308,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestType for GuestStdUnor
     }
     fn free_value(&mut self, m: &mut Machine) -> Result<()> {
         let mut addr = self.before_begin;
+        let limit = node_list_len(m, addr, self.element_cnt)?;
         let mut freed = 0u64;
         while addr != 0 {
             let next = read_u64(m, addr)?;
@@ -256,10 +317,8 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestType for GuestStdUnor
             guest_free(m, addr)?;
             addr = next;
             freed += 1;
-            if freed > self.element_cnt {
-                return Err(container_error(
-                    "Guest std::unordered_map: corrupt node list",
-                ));
+            if freed > limit {
+                return Err(corrupt_list());
             }
         }
         if self.bucket_cnt != 1 && self.buckets != 0 {
@@ -401,6 +460,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
             return Ok(0);
         }
         let mut addr = self.next(m, prev)?;
+        let mut check = CycleCheck::new(addr);
         while addr != 0 {
             if self.node_equals(m, addr, key, code)? {
                 return Ok(prev);
@@ -412,6 +472,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
             }
             prev = addr;
             addr = next;
+            check.step(addr)?;
         }
         Ok(0)
     }
@@ -454,6 +515,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
     pub fn entries(&self, m: &Machine) -> Result<Vec<(K, GuestPtr<V>)>> {
         let mut out = Vec::with_capacity(self.element_cnt(m)?.min(1 << 20) as usize);
         let mut addr = self.before_begin(m)?;
+        let mut check = CycleCheck::new(addr);
         while addr != 0 {
             out.push((
                 self.key_at(m, addr)?,
@@ -461,10 +523,9 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
             ));
             addr = self.next(m, addr)?;
             // A corrupt (cyclic) list must still end.
+            check.step(addr)?;
             if out.len() as u64 > self.element_cnt(m)? {
-                return Err(container_error(
-                    "Guest std::unordered_map: corrupt node list",
-                ));
+                return Err(corrupt_list());
             }
         }
         Ok(out)
@@ -585,7 +646,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
     pub fn clear(&self, m: &mut Machine) -> Result<()> {
         let mut addr = self.before_begin(m)?;
         let mut freed = 0u64;
-        let limit = self.element_cnt(m)?;
+        let limit = node_list_len(m, addr, self.element_cnt(m)?)?;
         while addr != 0 {
             let next = self.next(m, addr)?;
             K::free_at(m, addr.wrapping_add(Map::<K, V, H>::KEY_OFF))?;
@@ -594,9 +655,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
             addr = next;
             freed += 1;
             if freed > limit {
-                return Err(container_error(
-                    "Guest std::unordered_map: corrupt node list",
-                ));
+                return Err(corrupt_list());
             }
         }
         self.set_field(m, BEFORE_BEGIN_OFF, 0)?;
@@ -702,7 +761,10 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
         let min_buckets = elements as f64 / max_load;
         let bucket_cnt = self.bucket_cnt(m)?;
         if min_buckets >= bucket_cnt as f64 {
-            let want = (floor_size(min_buckets) + 1).max(bucket_cnt.wrapping_mul(2));
+            // A guest's zero load factor makes this infinite, then 0.
+            let want = floor_size(min_buckets)
+                .wrapping_add(1)
+                .max(bucket_cnt.wrapping_mul(2));
             let count = self.next_bucket_count(m, want)?;
             self.rehash_buckets(m, count)?;
             return Ok(true);
@@ -741,6 +803,9 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
     /// Move every node into a new bucket array (`_M_rehash_aux` for unique
     /// keys).
     fn rehash_buckets(&self, m: &mut Machine, count: u64) -> Result<()> {
+        // Before anything changes: relinking could turn a cycle into a
+        // walk that never repeats.
+        let limit = node_list_len(m, self.before_begin(m)?, self.element_cnt(m)?)?;
         let me = self.address();
         let bbegin = me.wrapping_add(BEFORE_BEGIN_OFF);
         let new_buckets = if count == 1 {
@@ -761,7 +826,6 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
         let mut addr = self.before_begin(m)?;
         self.set_field(m, BEFORE_BEGIN_OFF, 0)?;
         let mut bbegin_bkt = 0;
-        let limit = self.element_cnt(m)?;
         let mut moved = 0u64;
         while addr != 0 {
             let next = self.next(m, addr)?;
@@ -784,9 +848,7 @@ impl<K: GuestHashKey, V: GuestType, H: HashPolicy<K>> GuestPtr<Map<K, V, H>> {
             addr = next;
             moved += 1;
             if moved > limit {
-                return Err(container_error(
-                    "Guest std::unordered_map: corrupt node list",
-                ));
+                return Err(corrupt_list());
             }
         }
         let old = self.field(m, BUCKETS)?;

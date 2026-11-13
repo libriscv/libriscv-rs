@@ -9,12 +9,18 @@ license = "BSD-3-Clause"
 cargo-fuzz = true
 
 [features]
-# Run the targets with the Cranelift JIT (`MachineOptions::jit`).
+default = ["compressed"]
+# The C extension (libriscv's `ext-c`). Without it (`--no-default-features`)
+# the decoder uses its 4-byte layout, which CI also tests.
+compressed = ["libriscv/ext-c"]
+# Run the targets with the Cranelift JIT (`MachineOptions::jit`), and build
+# `jitdifffuzzer`.
 jit = ["libriscv/jit"]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-libriscv = { path = "../crates/libriscv" }
+# libriscv's defaults except ext-c, which is the `compressed` feature here.
+libriscv = { path = "../crates/libriscv", default-features = false, features = ["ext-a", "ext-f", "ext-v"] }
 
 # Not part of the main workspace: cargo-fuzz needs nightly sanitizer flags
 # and libFuzzer, which `cargo test` shouldn't build.
@@ -58,3 +64,46 @@ path = "fuzz_targets/nativefuzzer.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "linuxfuzzer"
+path = "fuzz_targets/linuxfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "libcfuzzer"
+path = "fuzz_targets/libcfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forkfuzzer"
+path = "fuzz_targets/forkfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "guestfuzzer"
+path = "fuzz_targets/guestfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vmcallfuzzer"
+path = "fuzz_targets/vmcallfuzzer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jitdifffuzzer"
+path = "fuzz_targets/jitdifffuzzer.rs"
+test = false
+doc = false
+bench = false
+required-features = ["jit"]
