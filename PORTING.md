@@ -243,9 +243,9 @@ LCG loop, 206.8M instructions, same machine and date:
 | C++ tailcall | ~1080 | −2% |
 | Rust (release) | ~708 | −36% |
 
-CoreMark (`cargo bench -p rvlinux --features jit --bench coremark`): a
-fixed workload rather than a CoreMark 1.0 run (see "CoreMark 1.0" below for
-that). Freestanding, built with our port (`crates/testutil/guests/coremark`,
+Fixed-workload CoreMark, measured with the bench before it became a
+CoreMark 1.0 run (see "CoreMark 1.0" below), by wall-clock time of the
+whole process. Freestanding, built with our port (`crates/testutil/guests/coremark`,
 from `../coremark` or `$COREMARK_DIR`, eembc/coremark `eefc986e`), 4000
 iterations, `-O2`, wall-clock time of the whole process, best of 5, on
 2026-11-13, with the bytecodes (see "Bytecodes"). C++ is upstream
@@ -268,7 +268,8 @@ The guest's clock is `rdinstret`, so its output is deterministic (the same
 ELFs are difftests), and CoreMark's 10-second rule passes on a nominal
 clock. asmjit's instruction count only bounds execution: `rdinstret` read
 from native code can be stale, which stops CoreMark's clock and fails that
-rule, so variants that don't count exactly are validated by their CRCs only.
+rule, so variants that don't count exactly had to be validated by their
+CRCs only.
 
 Wall-clock differences of a few percent are noise on the dev machine; by
 `perf stat` (rv64imc) the Rust interpreter takes 9.26G cycles and 28.6G host
@@ -298,11 +299,18 @@ CoreMark runs in ~260 ms. asmjit compiles it in ~150 ms. Lazy compilation
 
 ### CoreMark 1.0
 
-The prebuilt RV64 ELFs in `../coremark` are real CoreMark 1.0 runs
-(`ITERATIONS=0`, calibrating to at least 10 s of wall-clock time from
-`clock_gettime`/`gettimeofday`). CoreMark's own Iterations/Sec, one run
-each, `--accurate`, the JITs with `--fuel 10000000000000` (the default 30G
-instruction limit stops a JIT before 10 s), same date and C++ builds:
+`cargo bench -p rvlinux --features jit --bench coremark` runs real
+CoreMark 1.0: the POSIX port of `$COREMARK_DIR`, static glibc, `-O3`,
+`ITERATIONS=0` (`testutil::build_coremark_timed`), so CoreMark calibrates
+itself to at least 10 s of real time from `clock_gettime`/`gettimeofday`
+and its own Iterations/Sec is the score. All variants run `--accurate`
+with `--fuel 10000000000000` (the default 30G instruction limit stops a
+JIT before 10 s), the JITs compile up front, and every run must validate.
+`COREMARK_ELFS` adds prebuilt ELFs as columns. The difftests keep the
+deterministic fixed-iteration builds above.
+
+The prebuilt RV64 ELFs in `../coremark` are built the same way. CoreMark's
+own Iterations/Sec, one run each, same date and C++ builds:
 
 | ELF | Rust interpreter | C++ threaded | C++ tailcall | Rust JIT | C++ asmjit |
 |---|---:|---:|---:|---:|---:|

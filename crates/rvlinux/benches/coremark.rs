@@ -1,13 +1,26 @@
-//! CoreMark: the Rust `rvlinux` (interpreter and JIT) against the C++
-//! emulators, by wall-clock time of the whole process (loading, compiling
-//! and running).
+//! CoreMark 1.0: the Rust `rvlinux` (interpreter and JIT) against the C++
+//! emulators, scored by CoreMark itself.
 //!
 //! ```sh
 //! cargo bench -p rvlinux --bench coremark                      # interpreter
 //! cargo bench -p rvlinux --features jit --bench coremark       # + JIT
-//! COREMARK_ITERATIONS=4000 COREMARK_RUNS=5 cargo bench ...     # defaults: 4000, 3
+//! COREMARK_RUNS=3 cargo bench ...                              # best of 3 (default 1)
 //! COREMARK_ONLY="asmjit,Rust JIT" cargo bench ...              # variants whose name contains one
+//! COREMARK_ELFS=../coremark/coremark-rv64gc,... cargo bench ... # extra prebuilt columns
 //! ```
+//!
+//! Each column is a CoreMark 1.0 executable: the POSIX port linked
+//! statically against glibc (`testutil::build_coremark_timed`), with
+//! `ITERATIONS=0`, so CoreMark calibrates itself to at least 10 seconds of
+//! real time (`clock_gettime`/`gettimeofday`) and reports Iterations/Sec,
+//! which is the score printed here (best of `COREMARK_RUNS`). Every run must
+//! print "Correct operation validated". Each run takes 10+ seconds, so the
+//! instruction limit is raised (`--fuel`): the default 30G instructions stop
+//! a JIT before then.
+//!
+//! The JITs compile up front: compiled in the background, the code can
+//! arrive after CoreMark has calibrated on the interpreter, which then picks
+//! too few iterations and fails the 10-second rule.
 //!
 //! Needs the RISC-V cross compiler and the CoreMark sources (`../coremark` or
 //! `$COREMARK_DIR`). C++ emulators are used where they exist: the reference
@@ -15,16 +28,8 @@
 //! `scripts/build-cpp-reference.sh`, and its `asmjit` build (falling back to
 //! `$LIBRISCV_CPP/emulator/rvlinux-asmjit`).
 //!
-//! Two builds of CoreMark: freestanding (our port in
-//! `crates/testutil/guests/coremark`, minimal system calls) and a regular
-//! Linux executable (upstream's POSIX port, static glibc:
-//! `testutil::build_coremark_linux`), which only exists for `lp64d`.
-//!
-//! Every run must print "Correct operation validated", and every variant
-//! that counts instructions exactly must report the same count (asmjit's
-//! counts are approximate and not compared). The guest's own timing is the
-//! instruction counter in both builds, so its "Iterations/Sec" is not a
-//! speed; the score printed here is iterations per wall-clock second.
+//! The difftests use different CoreMark builds (fixed iteration counts,
+//! `rdinstret` as the clock), whose output is deterministic.
 
 #![allow(
     clippy::panic,
@@ -35,37 +40,22 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use testutil::CppDispatch;
 
-/// The columns: `(glibc, march, abi)`.
-const BUILDS: &[(bool, &str, &str)] = &[
-    (false, "rv64imc_zicsr", "lp64"),
-    (false, "rv64imafdc_zicsr", "lp64d"),
-    (false, "rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
-    (true, "rv64imafdc_zicsr", "lp64d"),
-    (true, "rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
+/// The built columns: `(march, abi)`. Static glibc only exists for `lp64d`.
+const BUILDS: &[(&str, &str)] = &[
+    ("rv64imafdc_zicsr", "lp64d"),
+    ("rv64imafdc_zba_zbb_zbs_zicsr", "lp64d"),
 ];
 
-fn column_name(glibc: bool, march: &str) -> String {
-    let march = march.trim_end_matches("_zicsr");
-    if glibc {
-        format!("glibc {march}")
-    } else {
-        march.to_owned()
-    }
-}
+/// Enough instructions for 10+ seconds of JIT-compiled CoreMark.
+const FUEL: &str = "10000000000000";
 
 struct Variant {
     name: String,
     emulator: PathBuf,
     flags: Vec<&'static str>,
-    /// Whether its instruction count must match the others. A variant that
-    /// doesn't count exactly (asmjit: its count only bounds execution) can
-    /// read a stale `rdinstret`, which is CoreMark's clock here, and then
-    /// fail the 10-second rule; for it only the CRC checks decide.
-    exact: bool,
 }
 
 fn variants() -> Vec<Variant> {
@@ -73,31 +63,21 @@ fn variants() -> Vec<Variant> {
     let mut v = vec![Variant {
         name: "Rust interpreter".into(),
         emulator: rust.clone(),
-        flags: vec!["--accurate"],
-        exact: true,
+        flags: vec!["--accurate", "--fuel", FUEL],
     }];
     if cfg!(feature = "jit") {
         v.push(Variant {
-            name: "Rust JIT (up front)".into(),
-            emulator: rust.clone(),
-            flags: vec!["--accurate", "--jit", "--no-background"],
-            exact: true,
-        });
-        v.push(Variant {
-            name: "Rust JIT (background)".into(),
+            name: "Rust JIT".into(),
             emulator: rust,
-            flags: vec!["--accurate", "--jit"],
-            exact: true,
+            flags: vec!["--accurate", "--fuel", FUEL, "--jit", "--no-background"],
         });
     }
-    let interp = vec!["--no-translate", "--accurate"];
     let mut cpp_interp = |name: &str, path: PathBuf| {
         if path.exists() {
             v.push(Variant {
                 name: name.into(),
                 emulator: path,
-                flags: interp.clone(),
-                exact: true,
+                flags: vec!["--no-translate", "--accurate", "--fuel", FUEL],
             });
         }
     };
@@ -119,134 +99,108 @@ fn variants() -> Vec<Variant> {
     }
     if asmjit.exists() {
         v.push(Variant {
-            name: "C++ asmjit (up front)".into(),
-            emulator: asmjit.clone(),
-            flags: vec!["--accurate", "--no-background"],
-            exact: false,
-        });
-        v.push(Variant {
-            name: "C++ asmjit (background)".into(),
+            name: "C++ asmjit".into(),
             emulator: asmjit,
-            flags: vec!["--accurate", "--background"],
-            exact: false,
+            flags: vec!["--accurate", "--fuel", FUEL, "--no-background"],
         });
     }
     v
 }
 
-fn env_num(var: &str, default: u32) -> u32 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// CoreMark's own checks without its time limit: the seeds are known
-/// (`crcfinal` printed) and no list/matrix/state CRC is wrong.
-fn crcs_validated(stdout: &str) -> bool {
-    stdout.contains("crcfinal")
-        && !stdout.contains("Cannot validate operation")
-        && !stdout.contains("]ERROR!")
-}
-
-/// One run: wall time, the reported instruction count, and whether CoreMark
-/// validated (a failing run is reported, with its output, but doesn't stop
-/// the other variants).
-fn run(variant: &Variant, elf: &Path) -> (Duration, Option<u64>, bool) {
-    let start = Instant::now();
+/// One run: CoreMark's Iterations/Sec, or `None` (with the output printed)
+/// if the run didn't validate.
+fn run(variant: &Variant, elf: &Path) -> Option<f64> {
     let out = Command::new(&variant.emulator)
         .args(&variant.flags)
         .arg(elf)
         .stdin(Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("{}: {e}", variant.emulator.display()));
-    let elapsed = start.elapsed();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let parsed = testutil::parse_run_output(&stdout, &String::from_utf8_lossy(&out.stderr));
-    let valid = if variant.exact {
-        parsed.stdout.contains("Correct operation validated.")
-    } else {
-        crcs_validated(&parsed.stdout)
-    };
-    if !valid {
-        eprintln!("{} failed on {}:\n{stdout}", variant.name, elf.display());
+    let score = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("Iterations/Sec"))
+        .and_then(|l| l.trim_start_matches([' ', ':']).trim().parse().ok());
+    match score {
+        Some(score) if stdout.contains("Correct operation validated.") => Some(score),
+        _ => {
+            eprintln!(
+                "{} failed on {}:\n{stdout}{}",
+                variant.name,
+                elf.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
     }
-    (elapsed, parsed.instructions, valid)
 }
 
 fn main() {
     if !testutil::need_compiler() || !testutil::need_coremark() {
         return;
     }
-    let iterations = env_num("COREMARK_ITERATIONS", 4000);
-    let runs = env_num("COREMARK_RUNS", 3).max(1);
+    let runs = std::env::var("COREMARK_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1u32)
+        .max(1);
     let mut variants = variants();
     if let Ok(only) = std::env::var("COREMARK_ONLY") {
         variants.retain(|v| only.split(',').any(|f| v.name.contains(f.trim())));
     }
-    println!("CoreMark, {iterations} iterations, best of {runs} (wall-clock ms per process)\n");
-    let mut header = format!("| {:<26} |", "");
-    for &(glibc, march, _) in BUILDS {
-        header += &format!(" {:>28} |", column_name(glibc, march));
+
+    let mut columns: Vec<(String, PathBuf)> = BUILDS
+        .iter()
+        .map(|&(march, abi)| {
+            let elf = testutil::build_coremark_timed(march, abi).unwrap_or_else(|e| panic!("{e}"));
+            (march.trim_end_matches("_zicsr").to_owned(), elf)
+        })
+        .collect();
+    if let Ok(elfs) = std::env::var("COREMARK_ELFS") {
+        for elf in elfs.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let elf = PathBuf::from(elf);
+            let name = elf.file_name().map_or_else(
+                || elf.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            columns.push((name, elf));
+        }
+    }
+
+    println!("CoreMark 1.0, Iterations/Sec, best of {runs}\n");
+    let mut header = format!("| {:<18} |", "");
+    for (name, _) in &columns {
+        header += &format!(" {name:>28} |");
     }
     println!("{header}");
     println!(
         "|{}|{}",
-        "-".repeat(28),
-        format!("{}:|", "-".repeat(29)).repeat(BUILDS.len())
+        "-".repeat(20),
+        format!("{}:|", "-".repeat(29)).repeat(columns.len())
     );
-
-    let elfs: Vec<PathBuf> = BUILDS
-        .iter()
-        .map(|&(glibc, march, abi)| {
-            let built = if glibc {
-                testutil::build_coremark_linux(march, abi, iterations)
-            } else {
-                testutil::build_coremark(march, abi, iterations)
-            };
-            built.unwrap_or_else(|e| panic!("{e}"))
-        })
-        .collect();
-    let mut counts: Vec<Option<u64>> = vec![None; elfs.len()];
     let mut failed = false;
     for variant in &variants {
-        let mut line = format!("| {:<26} |", variant.name);
-        for (col, elf) in elfs.iter().enumerate() {
-            let mut best = Duration::MAX;
-            let mut valid = true;
+        let mut line = format!("| {:<18} |", variant.name);
+        for (_, elf) in &columns {
+            let mut best: Option<f64> = None;
             for _ in 0..runs {
-                let (t, count, ok) = run(variant, elf);
-                best = best.min(t);
-                if !ok {
-                    valid = false;
-                    break;
-                }
-                if variant.exact {
-                    let expected = *counts[col].get_or_insert(count.unwrap_or(0));
-                    assert_eq!(
-                        count,
-                        Some(expected),
-                        "{}: instruction count differs on {}",
-                        variant.name,
-                        column_name(BUILDS[col].0, BUILDS[col].1)
-                    );
+                match run(variant, elf) {
+                    Some(score) => best = Some(best.map_or(score, |b| b.max(score))),
+                    None => {
+                        best = None;
+                        break;
+                    }
                 }
             }
-            let ms = best.as_secs_f64() * 1e3;
-            let score = f64::from(iterations) / best.as_secs_f64();
-            if valid {
-                line += &format!(" {ms:>9.1} ms ({score:>7.0} it/s) |");
-            } else {
-                failed = true;
-                line += &format!(" {ms:>9.1} ms (  FAILED) |");
+            match best {
+                Some(score) => line += &format!(" {score:>28.1} |"),
+                None => {
+                    failed = true;
+                    line += &format!(" {:>28} |", "FAILED");
+                }
             }
         }
         println!("{line}");
     }
-    let mut line = format!("| {:<26} |", "Instructions");
-    for count in &counts {
-        line += &format!(" {:>28} |", count.map_or("-".into(), |c| c.to_string()));
-    }
-    println!("{line}");
     assert!(!failed, "some runs failed to validate (output above)");
 }

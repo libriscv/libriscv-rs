@@ -148,12 +148,49 @@ pub fn build_coremark(march: &str, abi: &str, iterations: u32) -> Result<PathBuf
     build_with_sources(&code, &sources, &args, Lang::C)
 }
 
-/// Build CoreMark as a regular Linux executable: upstream's unmodified
-/// POSIX port (`posix/core_portme.c`) linked statically against glibc,
+/// CoreMark 1.0 as a regular Linux executable, for benchmarking: the POSIX
+/// port of `$COREMARK_DIR` (`posix/core_portme.c`) linked statically
+/// against glibc, `-O3`, performance run parameters and `ITERATIONS=0`, so
+/// CoreMark calibrates itself to at least 10 seconds of real time (from
+/// `clock_gettime`/`gettimeofday` system calls) and its "Iterations/Sec"
+/// is the score. The output is not deterministic: for difftests use
+/// [`build_coremark_linux`].
+pub fn build_coremark_timed(march: &str, abi: &str) -> Result<PathBuf, BuildError> {
+    let dir = coremark_dir();
+    // The port's text is part of the cache key, so that editing it (a
+    // checkout may carry local changes) rebuilds the ELF.
+    let mut code = String::from("/* CoreMark 1.0, posix port:\n");
+    for file in ["posix/core_portme.c", "posix/core_portme.h"] {
+        let text = std::fs::read_to_string(dir.join(file))?;
+        code.push_str(&text.replace("*/", "* /"));
+    }
+    code.push_str("*/\n");
+    let sources = [
+        "core_list_join.c",
+        "core_main.c",
+        "core_matrix.c",
+        "core_state.c",
+        "core_util.c",
+        "posix/core_portme.c",
+    ]
+    .map(|file| dir.join(file));
+    let flags = format!("-march={march} -mabi={abi} -O3 -static");
+    let args = format!(
+        "{flags} -I{} -I{} -DPERFORMANCE_RUN=1 -DITERATIONS=0 -DFLAGS_STR=\"{}\"",
+        dir.join("posix").display(),
+        dir.display(),
+        flags.replace(' ', ","),
+    );
+    build_with_sources(&code, &sources, &args, Lang::C)
+}
+
+/// Build CoreMark as a regular Linux executable for difftests: the POSIX
+/// port (`posix/core_portme.c`) linked statically against glibc,
 /// performance run parameters, `iterations` iterations. Time comes from
 /// `clock()`, which is redirected to `rdinstret` so that the output (and
 /// the instruction count) is deterministic and can be compared with the
-/// C++ emulator; its "Iterations/Sec" is therefore not a speed.
+/// C++ emulator; its "Iterations/Sec" is therefore not a speed. To
+/// benchmark, use [`build_coremark_timed`].
 pub fn build_coremark_linux(
     march: &str,
     abi: &str,
