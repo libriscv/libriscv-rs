@@ -13,7 +13,7 @@
 // Every test runs a glibc guest, and the distribution's glibc is RV64GC.
 #![cfg(all(feature = "ext-a", feature = "ext-c", feature = "ext-f"))]
 
-use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libriscv::registers::{REG_ARG0, REG_RA, REG_SP};
 use libriscv::{ExceptionKind, GuestPod, Machine, MachineOptions, OnStack};
@@ -46,17 +46,35 @@ fn machine(binary: &[u8]) -> Machine {
     machine_with(binary, MachineOptions::default())
 }
 
-thread_local! {
-    static HELLO_WORLD: Cell<bool> = const { Cell::new(false) };
+/// The C++ tests' `State`, as userdata. The printer only gets `&Machine`,
+/// hence the atomic.
+#[derive(Default)]
+struct State {
+    output_is_hello_world: AtomicBool,
 }
 
 /// C++: `state->output_is_hello_world = (text == "Hello World!")`.
-fn hello_printer(_: &Machine, data: &[u8]) {
-    HELLO_WORLD.set(data == b"Hello World!");
+fn hello_printer(m: &Machine, data: &[u8]) {
+    let state = m.userdata::<State>().unwrap();
+    state
+        .output_is_hello_world
+        .store(data == b"Hello World!", Ordering::Relaxed);
 }
 
-fn hello_world() -> bool {
-    HELLO_WORLD.get()
+/// C++ `machine.set_userdata(&state); machine.set_printer(...)`.
+fn catch_hello(m: &mut Machine) {
+    m.set_userdata(State::default());
+    m.set_printer(hello_printer);
+}
+
+fn reset_hello(m: &Machine) {
+    let state = m.userdata::<State>().unwrap();
+    state.output_is_hello_world.store(false, Ordering::Relaxed);
+}
+
+fn hello_world(m: &Machine) -> bool {
+    let state = m.userdata::<State>().unwrap();
+    state.output_is_hello_world.load(Ordering::Relaxed)
 }
 
 #[test]
@@ -77,17 +95,16 @@ fn vm_function_call() {
 	}"#,
     );
     let mut machine = machine(&binary);
-    HELLO_WORLD.set(false);
-    machine.set_printer(hello_printer);
+    catch_hello(&mut machine);
     machine.simulate(MAX_INSTRUCTIONS).unwrap();
     assert_eq!(machine.return_value() as i32, 666);
-    assert!(!hello_world());
+    assert!(!hello_world(&machine));
 
     let hello_address = machine.address_of("hello").unwrap();
     assert_ne!(hello_address, 0);
 
     machine.vmcall(hello_address, ()).unwrap();
-    assert!(hello_world());
+    assert!(hello_world(&machine));
 }
 
 #[test]
@@ -342,15 +359,14 @@ fn vm_function_call_in_fork() {
         let mut fork = machine.fork().unwrap();
         assert!(!fork.memory.uses_flat_memory_arena());
 
-        HELLO_WORLD.set(false);
-        fork.set_printer(hello_printer);
+        catch_hello(&mut fork);
 
         let hello_address = fork.address_of("hello").unwrap();
         assert_ne!(hello_address, 0);
 
         // Execute guest function
         fork.vmcall(hello_address, ()).unwrap();
-        assert!(hello_world());
+        assert!(hello_world(&fork));
 
         assert_eq!(fork.vmcall("str", "Hello").unwrap(), 1);
         assert_eq!(fork.vmcall("str", String::from("Hello")).unwrap(), 1);
@@ -421,22 +437,21 @@ fn preempt_handler(m: &mut Machine) -> libriscv::Result<()> {
 }
 
 fn vm_call_and_preemption_in(mut machine: Machine) {
-    HELLO_WORLD.set(false);
-    machine.set_printer(hello_printer);
+    catch_hello(&mut machine);
     machine.install_syscall_handler(500, preempt_handler);
 
-    assert!(!hello_world());
+    assert!(!hello_world(&machine));
     machine.simulate(MAX_INSTRUCTIONS).unwrap();
-    assert!(hello_world());
+    assert!(hello_world(&machine));
     assert_eq!(machine.return_value() as i32, 666);
 
     for _ in 0..10 {
-        HELLO_WORLD.set(false);
+        reset_hello(&machine);
         let func = machine.address_of("start").unwrap();
         assert_ne!(func, 0);
         let r = machine.vmcall_limited(15_000, func, ()).unwrap();
         assert_eq!(r as i32, 1);
-        assert!(hello_world());
+        assert!(hello_world(&machine));
     }
 }
 
@@ -491,8 +506,7 @@ fn vm_call_and_stop_instruction() {
 	}"#,
     );
     let mut machine = machine(&binary);
-    HELLO_WORLD.set(false);
-    machine.set_printer(hello_printer);
+    catch_hello(&mut machine);
     machine.install_syscall_handler(500, |m| {
         assert_eq!(m.sysarg(0) as i32, 1_234_567);
         let func = m.address_of("preempt").unwrap();
@@ -502,18 +516,18 @@ fn vm_call_and_stop_instruction() {
         Ok(())
     });
 
-    assert!(!hello_world());
+    assert!(!hello_world(&machine));
     machine.simulate(MAX_INSTRUCTIONS).unwrap();
-    assert!(hello_world());
+    assert!(hello_world(&machine));
     assert_eq!(machine.return_value() as i32, 777);
 
     for _ in 0..10 {
-        HELLO_WORLD.set(false);
+        reset_hello(&machine);
         let func = machine.address_of("start").unwrap();
         assert_ne!(func, 0);
         machine.vmcall_limited(15_000, func, ()).unwrap();
         assert_eq!(machine.return_value() as i32, 1234);
-        assert!(hello_world());
+        assert!(hello_world(&machine));
     }
 }
 
@@ -892,8 +906,7 @@ fn preemption_during_background_slice() {
             ..Default::default()
         },
     );
-    HELLO_WORLD.set(false);
-    m.set_printer(hello_printer);
+    catch_hello(&mut m);
     m.install_syscall_handler(500, |m| {
         m.wait_for_jit();
         let remaining = m.max_instructions() - m.instruction_counter();
@@ -902,6 +915,6 @@ fn preemption_during_background_slice() {
         Ok(())
     });
     m.simulate(MAX_INSTRUCTIONS).unwrap();
-    assert!(hello_world());
+    assert!(hello_world(&m));
     assert_eq!(m.return_value() as i32, 666);
 }

@@ -11,9 +11,14 @@
 //!
 //! Linux setup is in `linux.rs`, threads in `threads.rs` and signals in
 //! `signals.rs`, VM calls in `vmcall.rs`, typed `sysargs`/`set_result` in
-//! `sysargs.rs`. Not ported yet:
-//! userdata and serialization (Phase 3) and the native heap (Phase 5).
+//! `sysargs.rs`. Not ported yet: serialization (Phase 3).
+//!
+//! C++'s `set_userdata(T*)` / `get_userdata<T>()` user pointer is an owned
+//! `Box<dyn Any + Send + Sync>` here ([`Machine::set_userdata`]), checked
+//! by type on access. To share state with the host the way the C++ pointer
+//! does, store an `Arc` of it.
 
+use std::any::Any;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,6 +68,8 @@ pub struct Machine {
     pub(crate) mt: Option<Box<crate::threads::MultiThreading>>,
     /// Signal handlers, created on first use (C++ `m_signals`).
     pub(crate) signals: Option<Box<crate::signals::Signals>>,
+    /// C++ `m_userdata`.
+    userdata: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl core::fmt::Debug for Machine {
@@ -137,6 +144,7 @@ impl Machine {
             fds: None,
             mt: None,
             signals: None,
+            userdata: None,
         };
         if let Some(segment) = first_segment {
             machine.cpu.exec = segment;
@@ -163,8 +171,8 @@ impl Machine {
     /// registers, instruction counter and limit, and threads.
     ///
     /// Like C++, a fork does not get this machine's printer, stdin and
-    /// rdtime callbacks (it has the defaults), file descriptors or signal
-    /// handlers. The callbacks for unhandled system calls and CSRs are
+    /// rdtime callbacks (it has the defaults), file descriptors, signal
+    /// handlers or userdata. The callbacks for unhandled system calls and CSRs are
     /// kept (C++ has them per process).
     ///
     /// Unlike C++, this machine may be changed or dropped while forks
@@ -201,6 +209,7 @@ impl Machine {
             fds: None,
             mt: self.mt.clone(),
             signals: None,
+            userdata: None,
         })
     }
 
@@ -349,6 +358,38 @@ impl Machine {
     /// Charge extra instructions (C++ `penalize`).
     pub const fn penalize(&mut self, value: u64) {
         self.counter = self.counter.wrapping_add(value);
+    }
+
+    /// Attach a value of your own to the machine, replacing any previous
+    /// one (C++ `set_userdata`). It's available to everything that gets the
+    /// machine: system call handlers, printers, custom instructions. A
+    /// printer only gets `&Machine`, so state it changes needs interior
+    /// mutability (an atomic or a `Mutex`). Store an `Arc` to keep a handle
+    /// on the host side, like the C++ user pointer.
+    pub fn set_userdata<T: Any + Send + Sync>(&mut self, data: T) {
+        self.userdata = Some(Box::new(data));
+    }
+    /// The userdata, if there is some of type `T` (C++ `get_userdata<T>`,
+    /// which can't check the type).
+    pub fn userdata<T: Any>(&self) -> Option<&T> {
+        self.userdata.as_deref()?.downcast_ref()
+    }
+    /// The userdata, mutably, if there is some of type `T`.
+    pub fn userdata_mut<T: Any>(&mut self) -> Option<&mut T> {
+        self.userdata.as_deref_mut()?.downcast_mut()
+    }
+    /// Remove and return the userdata, if it is of type `T` (otherwise it
+    /// stays).
+    pub fn take_userdata<T: Any>(&mut self) -> Option<T> {
+        if !self.userdata.as_deref()?.is::<T>() {
+            return None;
+        }
+        let data: Box<dyn Any> = self.userdata.take()?;
+        data.downcast().ok().map(|b| *b)
+    }
+    /// True if there is userdata (of any type).
+    pub fn has_userdata(&self) -> bool {
+        self.userdata.is_some()
     }
 
     /// Copy host data into guest memory.
