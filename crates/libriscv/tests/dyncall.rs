@@ -209,21 +209,25 @@ fn counted_calls(word: u32) {
 }
 
 #[test]
+#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
 fn counted_integer_call_without_fp() {
     counted_calls(Dyncall::encode(500, 1, 1, false));
 }
 
 #[test]
+#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
 fn counted_call_with_fp() {
     counted_calls(Dyncall::encode(500, 1, 1, true));
 }
 
 #[test]
+#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
 fn legacy_call() {
     counted_calls((500 << 20) | Dyncall::OPCODE);
 }
 
 #[test]
+#[cfg_attr(not(feature = "ext-f"), ignore = "the guest uses D")]
 fn integer_call_to_fp_handler_is_unimplemented() {
     counted_calls(Dyncall::encode(501, 1, 1, false));
 }
@@ -231,7 +235,7 @@ fn integer_call_to_fp_handler_is_unimplemented() {
 /// A counted call that stops the machine leaves it after the dyncall with
 /// the exact count, so resuming finishes like an uninterrupted run.
 #[test]
-#[cfg(feature = "jit")]
+#[cfg(all(feature = "jit", feature = "ext-f"))]
 fn stop_in_counted_call_resumes_exactly() {
     if !testutil::need_compiler() {
         return;

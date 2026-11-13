@@ -94,7 +94,10 @@ fn custom_machine(binary: &[u8]) -> Machine {
 }
 
 #[test]
-#[cfg(all(feature = "ext-a", feature = "ext-c", feature = "ext-f"))]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn custom_instruction() {
     if !testutil::need_compiler() {
         return;

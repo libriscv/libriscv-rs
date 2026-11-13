@@ -658,7 +658,7 @@ Phase 5) and `insert_non_owned_memory`.
 | Layer | Where | What |
 |---|---|---|
 | Unit | `#[cfg(test)]` in each module | Decoding, helpers, edge cases |
-| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
+| Integration | `crates/libriscv/tests/` | Ports of `../libriscv/tests/unit/*.cpp` (Catch2 → `#[test]`); guests built with `testutil::build_and_load`. `linux.rs`: `security.cpp`, Linux cases of `protections.cpp`, threads, signals, the file sandbox, and every system call with random arguments. `paging.rs`: the memory cases of `protections.cpp`, `va_execute.cpp` (code on mprotected and high pages, FENCE.I/`riscv_flush_icache`, constant pools) and `dynamic.cpp` (PIE). `vmcall.rs`: `vmcall.cpp` (the fork case included) and preemption (restoring, clobbering, errors, shared budget, nested under background JIT). `custom.rs`: `custom.cpp`'s custom instruction, and userdata. `dyncall.rs`: `dyncall.cpp` (interpreter and JIT). `native.rs`: `native.cpp` (native heap system calls and the guest C++ containers). `brutal.rs`: `brutal.cpp` (forks, stepping a few instructions at a time, copy-on-write and page cache cases) plus fork snapshots, forks of forks, forking from threads and fork page accounting |
 | Differential | `crates/rvlinux/tests/difftest.rs`, `scripts/difftest.sh` | Same ELF under Rust and C++ `rvlinux`: stdout, exit code, instruction count and the `>>> Machine exception` line must match, also at `--fuel` timeouts. Static and dynamic glibc C and C++ programs (stdio, malloc, threads incl. `test_threads.cpp`, condvars, abort, a fault with a signal handler, timeouts; dynamic ones run under `ld.so`), code generated at runtime (mprotect, FENCE.I, pages far outside the arena, `dlopen`, an execute fault), `getrusage`'s page accounting, the prebuilt Rust/Zig/newlib fixtures (Go: output only, its count varies under the oracle too) and glibc CoreMark, and `--libc-fastpath` (the guest of `libc_fastpath.cpp` calling every patched function, the glibc C and C++ programs, timeouts, and faults inside patched functions). Freestanding RV64IM, RV64IMC and RV64IMC+Zcb guests, including one assembly program per dispatcher and compressed-decoder edge case; RV64IMA and RV64IMAC+Zcb for atomics; RV64IM and RV64IMC+Zcb with Zba/Zbb/Zbc/Zbs/Zicond/Zbkb for bit manipulation; RV64IMFD and RV64IMAFDC+Zcb with Zfhmin/Zfa for floating point; CoreMark (soft-float, F/D, F/D+B), whose clock is the instruction counter so its whole output is compared. `rvlinux --call` (a VM call after the program exits). Each scenario is one test per Rust configuration (`<name>::interp`, `::jit`, `::jit_upfront`), and long fuel loops are split, so the harness runs them concurrently |
 | Instruction | ports of `../libriscv/tests/instructions/` | Per-instruction checks incl. RVC (`test_rv32c.cpp` → `tests/rvc.rs`, widened to RV64) |
 | ISA | `../libriscv/tests/rva23/` | Needs a full RVA23 toolchain; run by hand |
@@ -1066,6 +1066,42 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] `rvlinux` parity: `setup_linux` + Linux syscalls + threads for every guest, `--sandbox`/`--proxy`/`--allow`, the C++ open/readlink filters, `run_sighandler` after a fault; Linux difftests enabled
 - [x] Dynamic executables: `rvlinux` loads the interpreter (`ld.so`), code mapped at runtime becomes execute segments (virtual paging, moved up from Phase 5); dynamic difftests incl. `dlopen`
 
+### Guest containers
+
+`guest/` ports the host-side views of libstdc++'s `std::string`,
+`std::vector`, `std::unordered_map` and `std::variant` (64-bit layouts
+only). C++ reinterprets guest memory as the mirror structs and changes
+them in place through pointers; a string (SSO) and a map (`before_begin`,
+`single_bucket`) point back into themselves. Without `unsafe` there are
+no references into guest memory, so:
+
+- The containers are `GuestPod` value types with the guest layout
+  (`GuestStdString`, `GuestStdVector<T>`, `GuestStdUnorderedMap<K, V, H>`,
+  `GuestStdVariant<E>`): readable, copyable (shallow, like C++), nestable,
+  passable to `vmcall` by value (pushed and relocated, as `setup_call`).
+- Every change happens in place in guest memory, through a typed handle
+  `GuestPtr<T>` (C++ `GuestRef`/`memarray` pointer). The map's routines
+  read and write its fields at its address, so the self-pointers can't go
+  stale. Handles don't borrow the machine; methods take it.
+- C++'s type-trait dispatch becomes traits: `GuestType` (`free_at`,
+  `relocate_at`, `free_value`: `free_guest_object`,
+  `relocate_guest_object`, `free()` on a host copy), `GuestInit<T>`
+  (`construct_guest_object` from a host value: `&str` for a string, a
+  slice for a vector, a `HashMap` or pairs for a map), `GuestHashKey` /
+  `GuestKeyArg<K>` (`GuestStdHash`), `ToHost` (`guest_host_type`).
+- The map's `CacheHashCode` parameter is a type, `StdHash` (follows
+  `std::hash<K>`) or `CustomHash` (no cached hash codes), as Rust const
+  generic defaults can't depend on `K`.
+- A variant's alternatives are a Rust enum declared with
+  `guest_variant!`; `VariantAlternative<E>` gives `index_of`, `get`,
+  `get_if`, `holds_alternative`, and `GuestPtr::emplace<T>` constructs an
+  alternative from a host value. C++'s converting `set(Arg)` (picking the
+  alternative from a host value's type) has no equivalent: the caller
+  names the alternative.
+- `ScopedArenaObject<T>` owns a `T` on the native heap. Its destructor
+  can't reach the machine, so it has `free(machine)` instead (and is
+  `#[must_use]`).
+
 ### Phase 3 — Embedding API
 
 - [x] `install_syscall_handler`, typed `sysarg`/`sysargs`/`return_value`, `set_result(_or_error)` (`sysargs.rs`: `SysArg`/`SysResult` traits, tuples of up to 8; `ByPointer<T>` for C++'s pointer-to-struct arguments)
@@ -1099,8 +1135,8 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 
 - [ ] V extension (`rvv.hpp`, `rvv_instr.cpp`, `rvv_registers.hpp`)
 - [ ] Native threads (`native_threads.cpp`); POSIX threads are done (Phase 2)
-- [x] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`; see "Native heap and libc fast path"), breakpoints (`ebreak_locations`); tests: `heaptest.cpp`, `heap_invariants.cpp`, `libc_fastpath.cpp` (`tests/heap.rs`, `tests/libc_fastpath.rs`), the native heap cases of `native.cpp` (`tests/native.rs`), `exceptions.cpp`, difftests with `--libc-fastpath`
-- [ ] Guest datatypes (`guest/`, `guest_datatypes.hpp`)
+- [x] Native heap and libc fast paths (`native_heap.hpp`, `native_libc.cpp`; see "Native heap and libc fast path"), breakpoints (`ebreak_locations`); tests: `heaptest.cpp`, `heap_invariants.cpp`, `libc_fastpath.cpp` (`tests/heap.rs`, `tests/libc_fastpath.rs`), `native.cpp` (`tests/native.rs`, with the container cases), `exceptions.cpp`, difftests with `--libc-fastpath`
+- [x] Guest datatypes, C++ containers (`guest_datatypes.hpp`, `guest/guest_{common,arena_object,cpp_*}.hpp`); see "Guest containers". The Rust containers (`guest/guest_rust_*.hpp`, `tests/unit/native_rust.cpp`): not yet
 - [x] Dynamic calls (`dyncall.hpp`): the encoding, counted calls in the JIT (see "JIT")
 - [ ] Disassembler (`rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp`)
 - [ ] CLI debugger (`debug.cpp`, `debug.hpp`)
@@ -1157,7 +1193,7 @@ phase starts; names below are the intended targets.
 | `rv_printer.hpp`, `rvv_printer.hpp`, `rv_disassembly.hpp` | `disasm/` | 5 | |
 | `rsp_server.hpp`, `linux/rsp_server.hpp` | `rsp.rs` | 5 | |
 | `dyncall.hpp` | `dyncall.rs` | 5 | ✅ (JIT side in `jit/`, see "JIT") |
-| `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | |
+| `guest/`, `guest_datatypes.hpp` | `guest/` | 5 | ✅ C++ containers (`guest_rust_*.hpp`: not yet) |
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
 | `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |

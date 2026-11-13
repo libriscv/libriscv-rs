@@ -58,6 +58,10 @@ const HELLO: &[u8] = b"hello world!\0";
 
 /// rvbuffer.cpp "Sequential buffer".
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn sequential_buffer() {
     let Some(mut machine) = linux_machine(RETURN_666, "vmcall") else {
         return;
@@ -78,6 +82,10 @@ fn sequential_buffer() {
 
 /// rvbuffer.cpp "Boundary buffer": pages past the arena aren't contiguous.
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn boundary_buffer() {
     let Some(mut machine) = linux_machine(RETURN_666, "vmcall") else {
         return;
@@ -505,6 +513,10 @@ fn perform_system_function(name: &str, argc: usize, args: &mut [SystemArg; 4]) -
 
 /// custom.cpp "Take custom system arguments".
 #[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
 fn take_custom_system_arguments() {
     let code = format!(
         "{CUSTOM_HPP}{}",

@@ -70,6 +70,7 @@ mod dispatch;
 mod dyncall;
 mod elf;
 mod error;
+pub mod guest;
 pub mod instruction;
 mod isa;
 #[cfg(feature = "jit")]
