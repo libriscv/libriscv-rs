@@ -887,6 +887,7 @@ fn fp_special_values_match_up_to_nan() {
         0xFFF0_0000_0000_0000,
         0x7FF0_0000_0000_0123,
         0x7FF8_0000_0000_0123,
+        0xFFF8_0000_0000_0001,
         0x41DF_FFFF_FFE0_0000,
         0x43E0_0000_0000_0000,
         boxed(0x8000_0000),
@@ -896,11 +897,13 @@ fn fp_special_values_match_up_to_nan() {
         boxed(1),
         boxed(0xFF80_0000),
         boxed(0x7F80_0123),
+        boxed(0xFFC0_0001),
         boxed(0x4F00_0000),
         boxed(0xBF00_0000),
         0x1234_5678_3F80_0000,
     ];
-    // (instruction, double, integer result); results go to a0 or ft3.
+    // (instruction, double, exact: an integer result, or a NaN the
+    // interpreter defines); results go to a0 or ft3.
     let mut ops = Vec::new();
     for fmt in 0..2 {
         let dbl = fmt == 1;
@@ -915,7 +918,8 @@ fn fp_special_values_match_up_to_nan() {
             ops.push((fp(0x14, fmt, f3, 10, 0, 1), dbl, true)); // FLE/FLT/FEQ
         }
         ops.push((fp(0x0B, fmt, 0, 3, 0, 0), dbl, false)); // FSQRT
-        ops.push((fp(0x08, fmt, 0, 3, 0, fmt ^ 1), dbl, false)); // FCVT.S.D/D.S
+        // FCVT.S.D/D.S: a NaN converts to the canonical NaN.
+        ops.push((fp(0x08, fmt, 0, 3, 0, fmt ^ 1), dbl, true));
         ops.push((fp(0x1C, fmt, 0, 10, 0, 0), dbl, true)); // FMV.X
         ops.push((fp(0x1C, fmt, 1, 10, 0, 0), dbl, true)); // FCLASS
         for kind in 0..4 {
@@ -947,7 +951,7 @@ fn fp_special_values_match_up_to_nan() {
             f32::from_bits(v as u32).is_nan() && v >> 32 == 0x5555_5555
         }
     };
-    for (w, dbl, int) in ops {
+    for (w, dbl, exact) in ops {
         let code = words(&[w, jtype(0, 0)]);
         let (mut interp, mut jit) = (machine(&code, false), machine(&code, true));
         assert!(
@@ -959,7 +963,7 @@ fn fp_special_values_match_up_to_nan() {
                 for (c, frm) in [(0, 0), (0x3FF0_0000_0000_0000, 2), (boxed(0x3F80_0000), 4)] {
                     let x = run(&mut interp, a, b, c, frm);
                     let y = run(&mut jit, a, b, c, frm);
-                    let ok = x == y || (!int && x.0 == y.0 && nan(x.1, dbl) && nan(y.1, dbl));
+                    let ok = x == y || (!exact && x.0 == y.0 && nan(x.1, dbl) && nan(y.1, dbl));
                     assert!(
                         ok,
                         "{w:#010x} a={a:#x} b={b:#x} c={c:#x} frm={frm}: \

@@ -27,7 +27,7 @@
 //! that lead to each segment's code and metadata. The code is the image
 //! as the JIT links it, with its libcalls as `R_X86_64_GOTPCREL`
 //! relocations against the C library's functions. The metadata is
-//! little-endian `u64`s: [`META_MAGIC`], the key (see [`CacheKey::write`]),
+//! little-endian `u64`s: [`META_MAGIC`], the key (see [`NativeKey::words`]),
 //! the trampoline offset, the entry count and the entries (`u32`, see
 //! [`Image::entries`]), then the patch count and the patched decoder
 //! indices (`u32`).
@@ -40,100 +40,38 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use cranelift_codegen::ir::LibCall;
 use libriscv_jit_rt::{
-    CachedUnit, CodeMemory, LinkedCode, MemoryLayout, RECORD_MAGIC, RECORD_WORDS, SECTION,
-    TABLE_MAGIC, TABLE_SYMBOL,
+    CachedUnit, CodeMemory, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, TABLE_MAGIC,
+    TABLE_SYMBOL,
 };
 
 use super::emit::{Compiled, Image, build_fingerprint, libcall_symbol};
+use crate::codegen::NativeKey;
 
 /// First word of a unit's metadata ("RVJITM01").
 const META_MAGIC: u64 = u64::from_le_bytes(*b"RVJITM01");
 
-pub(crate) use crate::codegen::hash64;
-
 /// What cached code is looked up by: everything the code compiled for a
-/// segment depends on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey {
-    /// [`build_fingerprint`].
-    pub build: u64,
-    pub vaddr: u64,
-    pub len: u64,
-    pub crc32c: u32,
-    /// [`hash64`] of the code.
-    pub hash: u64,
-    pub execute_only: bool,
-    /// The libc fast path patched the segment.
-    pub libc_fastpath: bool,
-    pub layout: MemoryLayout,
+/// segment depends on, with [`build_fingerprint`] as its build.
+pub(crate) type CacheKey = NativeKey;
+
+/// The cache key of the segment `segment` describes, or `None` where the
+/// JIT isn't supported.
+pub(crate) fn cache_key(segment: NativeKey) -> Option<CacheKey> {
+    Some(segment.with_build(build_fingerprint()?))
 }
 
-impl CacheKey {
-    /// The key of the segment `code` at `vaddr` (whose CRC32-C is
-    /// `crc32c`), or `None` where the JIT isn't supported.
-    pub(crate) fn new(
-        code: &[u8],
-        vaddr: u64,
-        crc32c: u32,
-        execute_only: bool,
-        libc_fastpath: bool,
-        layout: MemoryLayout,
-    ) -> Option<Self> {
-        Some(Self {
-            build: build_fingerprint()?,
-            vaddr,
-            len: code.len() as u64,
-            crc32c,
-            hash: hash64(code),
-            execute_only,
-            libc_fastpath,
-            layout,
-        })
+fn write_key(key: &CacheKey, out: &mut Vec<u8>) {
+    for w in key.words() {
+        out.extend_from_slice(&w.to_le_bytes());
     }
+}
 
-    const WORDS: usize = 11;
-
-    fn write(&self, out: &mut Vec<u8>) {
-        let flags = u64::from(self.execute_only) | u64::from(self.libc_fastpath) << 1;
-        let l = &self.layout;
-        for w in [
-            self.build,
-            self.vaddr,
-            self.len,
-            u64::from(self.crc32c),
-            self.hash,
-            flags,
-            l.mask,
-            l.read.0,
-            l.read.1,
-            l.write.0,
-            l.write.1,
-        ] {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
+fn read_key(r: &mut Reader<'_>) -> Option<CacheKey> {
+    let mut w = [0u64; NativeKey::WORDS];
+    for x in &mut w {
+        *x = r.u64()?;
     }
-
-    fn read(r: &mut Reader<'_>) -> Option<Self> {
-        let mut w = [0u64; Self::WORDS];
-        for x in &mut w {
-            *x = r.u64()?;
-        }
-        let [build, vaddr, len, crc, hash, flags, mask, rb, rl, wb, wl] = w;
-        Some(Self {
-            build,
-            vaddr,
-            len,
-            crc32c: u32::try_from(crc).ok()?,
-            hash,
-            execute_only: flags & 1 != 0,
-            libc_fastpath: flags & 2 != 0,
-            layout: MemoryLayout {
-                mask,
-                read: (rb, rl),
-                write: (wb, wl),
-            },
-        })
-    }
+    NativeKey::from_words(w)
 }
 
 /// Reads metadata, refusing anything truncated.
@@ -162,7 +100,7 @@ impl Reader<'_> {
 fn metadata(key: &CacheKey, image: &Image) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&META_MAGIC.to_le_bytes());
-    key.write(&mut out);
+    write_key(key, &mut out);
     out.extend_from_slice(&(image.trampoline as u64).to_le_bytes());
     out.extend_from_slice(&(image.entries.len() as u64).to_le_bytes());
     for &e in &image.entries {
@@ -196,7 +134,7 @@ fn parse(meta: &[u8]) -> Option<(CacheKey, Meta)> {
     if r.u64()? != META_MAGIC {
         return None;
     }
-    let key = CacheKey::read(&mut r)?;
+    let key = read_key(&mut r)?;
     let trampoline = usize::try_from(r.u64()?).ok()?;
     let n = r.count()?;
     let entries = (0..n).map(|_| r.u32()).collect::<Option<Vec<_>>>()?;
@@ -679,14 +617,9 @@ fn write_elf(units: &[(CacheKey, Image)]) -> io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use libriscv_jit_rt::MemoryLayout;
 
-    #[test]
-    fn hash_tells_lengths_and_contents_apart() {
-        assert_ne!(hash64(b""), hash64(b"\0"));
-        assert_ne!(hash64(b"abcdefgh"), hash64(b"abcdefgi"));
-        assert_ne!(hash64(&[0; 8]), hash64(&[0; 16]));
-    }
+    use super::*;
 
     #[test]
     fn metadata_round_trips_and_truncation_is_refused() {

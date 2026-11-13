@@ -542,27 +542,33 @@ impl Memory {
         let (layout, verbose) = (self.native_layout(), self.jit_verbose);
         let (patches, binary) = (&self.patches, &self.binary);
         let libc_fastpath = initial && patches.libc_fastpath;
-        // Translations ahead of time: segments with breakpoints are never
-        // translated or looked up (nor shared), and machines translating
-        // make every segment themselves.
+        // Native code from translations ahead of time (`aot`) and the JIT
+        // cache: segments with breakpoints are never translated, cached or
+        // looked up (nor shared), and machines saving translate or compile
+        // every segment themselves.
         #[cfg(feature = "aot")]
-        let (aot_key, aot_save) = {
+        let (aot_saving, aot_lookup) = {
             let saving = self.aot_output.is_some();
-            let lookup = self.aot && !saving && crate::aot::any();
-            let key = ((saving || lookup) && patches.ebreak_locations.is_empty()).then(|| {
-                crate::aot::AotKey::new(code, vaddr, crc32c, execute_only, libc_fastpath, layout)
-            });
-            let save = self.aot_output.clone().zip(key).filter(|_| saving);
-            (key.filter(|_| lookup), save)
+            (saving, self.aot && !saving && crate::aot::any())
         };
-        // The JIT cache: segments with breakpoints are never cached (nor
-        // shared), and machines saving code compile everything themselves.
+        #[cfg(all(feature = "jit", not(feature = "aot")))]
+        let (aot_saving, aot_lookup) = (false, false);
         #[cfg(feature = "jit")]
-        let (cache_key, save) = {
+        let (jit_saving, jit_lookup) = {
             let saving = jit && self.jit_cache_output.is_some();
-            let lookup = self.jit_cache && !saving && crate::jit::cache::any();
-            let key = if (saving || lookup) && patches.ebreak_locations.is_empty() {
-                crate::jit::cache::CacheKey::new(
+            (
+                saving,
+                self.jit_cache && !saving && crate::jit::cache::any(),
+            )
+        };
+        #[cfg(all(feature = "aot", not(feature = "jit")))]
+        let (jit_saving, jit_lookup) = (false, false);
+        // Both keys share this one, which hashes the code: once per segment.
+        #[cfg(any(feature = "jit", feature = "aot"))]
+        let native_key = (patches.ebreak_locations.is_empty()
+            && (aot_saving || aot_lookup || jit_saving || jit_lookup))
+            .then(|| {
+                crate::codegen::NativeKey::new(
                     code,
                     vaddr,
                     crc32c,
@@ -570,17 +576,33 @@ impl Memory {
                     libc_fastpath,
                     layout,
                 )
-            } else {
-                None
-            };
+            });
+        // `aot_found`: there is a translation to install. A segment without
+        // one runs as on a machine without `aot`, and shares its segment.
+        // (Translations are never unregistered: `install` will find it.)
+        #[cfg(feature = "aot")]
+        let (aot_key, aot_found, aot_save) = {
+            let key = native_key
+                .filter(|_| aot_saving || aot_lookup)
+                .map(crate::aot::key);
+            let save = self.aot_output.clone().zip(key).filter(|_| aot_saving);
+            let lookup = key.filter(|_| aot_lookup);
+            let found = lookup.as_ref().is_some_and(crate::aot::registered);
+            (lookup, found, save)
+        };
+        #[cfg(feature = "jit")]
+        let (cache_key, save) = {
+            let key = native_key
+                .filter(|_| jit_saving || jit_lookup)
+                .and_then(crate::jit::cache::cache_key);
             let save = match (&self.jit_cache_output, key) {
-                (Some(output), Some(key)) if saving => Some(crate::jit::Save {
+                (Some(output), Some(key)) if jit_saving => Some(crate::jit::Save {
                     key,
                     output: output.clone(),
                 }),
                 _ => None,
             };
-            (key.filter(|_| lookup), save)
+            (key.filter(|_| jit_lookup), save)
         };
         let build = |shared| {
             let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
@@ -595,7 +617,7 @@ impl Memory {
             }
             #[cfg(feature = "aot")]
             let translated = aot_key.is_some_and(|key| {
-                let found = crate::aot::install(&key, &mut segment);
+                let found = aot_found && crate::aot::install(&key, &mut segment);
                 if verbose {
                     let found = if found { "Found" } else { "No" };
                     eprintln!(
@@ -659,7 +681,7 @@ impl Memory {
                 #[cfg(feature = "jit")]
                 jit: (jit || cache_key.is_some()).then_some(layout),
                 #[cfg(feature = "aot")]
-                aot: aot_key.map(|_| layout),
+                aot: aot_found.then_some(layout),
             };
             decoder_cache::shared_segment(key, code, build)?
         } else {
@@ -770,10 +792,15 @@ impl Memory {
 
 /// Whether native code masks guest addresses
 /// (`MachineOptions::jit_automatic_nbit_address_space`, with something that
-/// makes native code).
+/// makes native code). Any machine that compiles, translates or looks up
+/// native code must agree: the mask is part of the code's key.
 #[cfg(any(feature = "jit", feature = "aot"))]
 const fn uses_nbit_address_space(options: &MachineOptions) -> bool {
-    (options.jit || options.jit_cache || options.aot)
+    #[cfg(feature = "aot")]
+    let translating = options.aot_output.is_some();
+    #[cfg(not(feature = "aot"))]
+    let translating = false;
+    (options.jit || options.jit_cache || options.aot || translating)
         && options.jit_automatic_nbit_address_space
         && options.use_memory_arena
 }
@@ -828,6 +855,32 @@ const fn jit_arena_mask(options: &MachineOptions, arena_size: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine only translating (`aot: false`) keys its translations
+    /// with the mask the machines running them use.
+    #[test]
+    #[cfg(feature = "aot")]
+    fn translating_machines_use_the_nbit_mask() {
+        let arena = 1 << 20;
+        let neither = MachineOptions {
+            jit: false,
+            jit_cache: false,
+            aot: false,
+            jit_automatic_nbit_address_space: true,
+            ..Default::default()
+        };
+        assert_eq!(jit_arena_mask(&neither, arena), 0);
+        let translating = MachineOptions {
+            aot_output: Some(crate::aot::AotOutput::new()),
+            ..neither.clone()
+        };
+        let running = MachineOptions {
+            aot: true,
+            ..neither
+        };
+        assert_eq!(jit_arena_mask(&translating, arena), arena - 1);
+        assert_eq!(jit_arena_mask(&running, arena), arena - 1);
+    }
 
     fn empty_memory(memory_max: u64) -> Memory {
         let options = MachineOptions {

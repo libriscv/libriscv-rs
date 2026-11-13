@@ -218,24 +218,11 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
         ] {
             text.push_str(&format!(" {offset}"));
         }
-        // What decides the generated code. A change to any of them may
-        // change what a segment compiles to, also without a version bump.
-        for source in [
-            include_str!("emit.rs"),
-            include_str!("mod.rs"),
-            include_str!("../codegen/region.rs"),
-            include_str!("../codegen/classify.rs"),
-            include_str!("../native_code.rs"),
-            include_str!("../decoder_cache.rs"),
-            include_str!("../decode.rs"),
-            include_str!("../bytecode.rs"),
-        ] {
-            text.push_str(&format!(
-                " {:016x}",
-                super::cache::hash64(source.as_bytes())
-            ));
-        }
-        Some(super::cache::hash64(text.as_bytes()))
+        // What decides the generated code, besides `codegen::SHARED_SOURCES`.
+        Some(crate::codegen::fingerprint(
+            text,
+            &[include_str!("emit.rs"), include_str!("mod.rs")],
+        ))
     })
 }
 
@@ -1344,11 +1331,18 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             }
             JOp::FCvtFF { to_dbl, rd, rs1 } => {
                 let a = self.fval(rs1, !to_dbl);
-                let v = if to_dbl {
-                    self.b.ins().fpromote(F64, a)
+                // A NaN converts to the canonical NaN (the interpreter's
+                // `FCvtFF`); the host's conversion keeps sign and payload.
+                let ins = &mut self.b;
+                let (v, canonical) = if to_dbl {
+                    let c = ins.ins().f64const(Ieee64::with_bits(0x7FF8_0000_0000_0000));
+                    (ins.ins().fpromote(F64, a), c)
                 } else {
-                    self.b.ins().fdemote(F32, a)
+                    let c = ins.ins().f32const(Ieee32::with_bits(0x7FC0_0000));
+                    (ins.ins().fdemote(F32, a), c)
                 };
+                let nan = ins.ins().fcmp(FloatCC::Unordered, a, a);
+                let v = ins.ins().select(nan, canonical, v);
                 self.set_fval(rd, v);
             }
             JOp::FCmp {

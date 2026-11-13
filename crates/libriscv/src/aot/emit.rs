@@ -139,6 +139,16 @@ pub(crate) const RUNTIME: &str = r#"
     pub(super) fn fd(b: u64) -> f64 {
         f64::from_bits(b)
     }
+    /// FCVT.S.D: a NaN gives the canonical NaN.
+    #[inline(always)]
+    pub(super) fn cvt_s_d(x: f64) -> f32 {
+        if x.is_nan() { f32::from_bits(0x7FC0_0000) } else { x as f32 }
+    }
+    /// FCVT.D.S: a NaN gives the canonical NaN.
+    #[inline(always)]
+    pub(super) fn cvt_d_s(x: f32) -> f64 {
+        if x.is_nan() { f64::from_bits(0x7FF8_0000_0000_0000) } else { f64::from(x) }
+    }
     /// A single-precision result in the low half, keeping the upper one.
     #[inline(always)]
     pub(super) fn ss(old: u64, v: f32) -> u64 {
@@ -1197,10 +1207,12 @@ impl<'a> RegionWriter<'a> {
                 self.line(&set_fval(&f(rd), dbl, &v));
             }
             JOp::FCvtFF { to_dbl, rd, rs1 } => {
+                // A NaN converts to the canonical NaN (the interpreter's
+                // `FCvtFF`), not the host's sign- and payload-keeping one.
                 let v = if to_dbl {
-                    format!("f64::from({})", fval(rs1, false))
+                    format!("cvt_d_s({})", fval(rs1, false))
                 } else {
-                    format!("{} as f32", fval(rs1, true))
+                    format!("cvt_s_d({})", fval(rs1, true))
                 };
                 self.line(&set_fval(&f(rd), to_dbl, &v));
             }

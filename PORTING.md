@@ -610,8 +610,11 @@ is in use). The key is the segment (address, length, CRC32-C and a 64-bit
 hash of the code, execute-only, libc fast path), the memory layout baked
 into the code, and a build fingerprint: libriscv version, host ISA and
 Cranelift flags, extension features, `JitState` offsets and a hash of the
-code generator's sources (`jit/*.rs`, `decoder_cache.rs`, `decode.rs`,
-`bytecode.rs`). So code from another build, CPU or arena size is skipped,
+code generator's sources (`jit/{emit,mod}.rs` and `codegen::SHARED_SOURCES`:
+`codegen/*.rs`, `native_code.rs`, `decoder_cache.rs`, `decode.rs`,
+`bytecode.rs`, `instruction.rs`, `native/libc.rs`). The key type,
+`codegen::NativeKey`, is the one translations use; the code is hashed once
+per segment for both. So code from another build, CPU or arena size is skipped,
 not run (`verbose_loader` reports hits and misses). That protects against
 accidents, not malice: loading a shared object or linking an object runs
 its code, like any native library. Segments with breakpoints are never
@@ -689,7 +692,8 @@ translation` with `META` (keys, entries, patches as `u64`s) and `enter`
   no crate in that build has unsafe code. The including crate needs
   `feature(explicit_tail_calls, rust_preserve_none_cc)`.
 * **Shared object** (`AotOutput::write_shared_object`, `$RUSTC` or
-  `rustc`, `-C opt-level=3 -C target-cpu=native`, extra flags from
+  `rustc` with `RUSTUP_TOOLCHAIN` set to the toolchain libriscv was built
+  with, `-C opt-level=3 -C target-cpu=native`, extra flags from
   `$LIBRISCV_AOT_RUSTFLAGS`): the same source after a prologue with two
   `extern "C"` exports (`libriscv_aot_meta`, `libriscv_aot_enter`), whose
   few lines are the only unsafe code in it. Loading
@@ -698,15 +702,21 @@ translation` with `META` (keys, entries, patches as `u64`s) and `enter`
   built from borrows). Unlike JIT code, what runs behind the boundary is
   safe Rust that can only touch the registers and arena it is passed.
 
-Translations are keyed like the JIT cache (segment address, length,
-CRC32-C, 64-bit hash, execute-only, libc fast path; the memory layout;
-a fingerprint of the translator's and decoder's sources and the
-extension features) in a process-wide registry consulted when a segment
+Translations are keyed like the JIT cache (`codegen::NativeKey`: segment
+address, length, CRC32-C, 64-bit hash, execute-only, libc fast path; the
+memory layout; a fingerprint of `aot/*.rs`, `codegen::SHARED_SOURCES` and
+the extension features) in a process-wide registry consulted when a segment
 is created (`MachineOptions::aot`, default on). A hit installs the code
 instead of the JIT (`native_code::NativeSegment`, shared with the JIT,
 with `dispatch::native_enter`); with `verbose_loader`, hits and misses
 are reported. Machines translating don't share segments (like machines
-saving JIT code). The generated code doesn't depend on the host CPU.
+saving JIT code); a segment without a translation is shared with machines
+without `aot`. Translating machines key with the N-bit mask too, also with
+`aot` off. The generated source doesn't depend on the host CPU, but a
+shared object built with `target-cpu=native` does: `META` carries a word
+of the x86-64 target features the translation was compiled with
+(`cfg!(target_feature)`, evaluated where it is compiled; `ABI_VERSION` 2),
+and a CPU lacking any refuses it instead of dying of SIGILL.
 
 **Semantics.** Exactly the JIT's: the same instruction selection and
 regions (`codegen::{classify, region}`, moved out of `jit/`), the same
@@ -714,7 +724,9 @@ counting (block counts on entry, mid-block exits pre-subtract), the same
 exits (`native_code::EXIT_*`: halt, jump, indirect, slow access,
 misaligned jump, dyncall) back to `native_enter`. F/D use Rust's IEEE
 operations; FMIN/FMAX, FCVT to integers and FCLASS are written out like
-the interpreter's; which NaN comes out is the host's (as for the JIT).
+the interpreter's, and FCVT.S.D/D.S give the canonical NaN like the
+interpreter (as does the JIT); otherwise which NaN comes out is the
+host's (as for the JIT).
 
 **Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
 fn r<N>(s: &mut S, pc, counter)`. Guest registers it uses are locals,

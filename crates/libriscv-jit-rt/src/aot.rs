@@ -1,3 +1,6 @@
+//! Port of the `dlopen`/`dlsym` loading of translations in `tr_compiler.cpp`
+//! and `tr_translate.cpp`.
+//!
 //! Loading `libriscv`'s ahead-of-time translations from shared objects.
 //!
 //! `libriscv`'s `aot` module translates execute segments to safe Rust and

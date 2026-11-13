@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 pub(crate) use emit::Translation;
 
-use crate::codegen::{hash64, region};
+use crate::codegen::{NativeKey, region};
 use crate::decoder_cache::DecodedSegment;
 use crate::machine::Machine;
 use crate::native_code::{MemoryLayout, NativeCode, NativeExit, NativeSegment};
@@ -62,7 +62,84 @@ use crate::native_code::{MemoryLayout, NativeCode, NativeExit, NativeSegment};
 const META_MAGIC: u64 = u64::from_le_bytes(*b"RVAOTM01");
 /// The version of the interface between the host and translated code: the
 /// metadata format and the signature of `enter`.
-const ABI_VERSION: u64 = 1;
+const ABI_VERSION: u64 = 2;
+
+/// Declares [`X86_FEATURES`] and [`x86_detected`] from one list.
+macro_rules! x86_features {
+    ($($name:tt),* $(,)?) => {
+        /// The x86-64 target features a translation may be compiled with
+        /// (`-C target-cpu=native` for a shared object), by bit of the
+        /// metadata's feature word: what the code may need the CPU to have.
+        const X86_FEATURES: &[&str] = &[$($name),*];
+
+        /// Per [`X86_FEATURES`] entry, whether this CPU has it.
+        #[cfg(target_arch = "x86_64")]
+        fn x86_detected() -> Vec<bool> {
+            vec![$(std::is_x86_feature_detected!($name)),*]
+        }
+    };
+}
+x86_features!(
+    "sse3",
+    "ssse3",
+    "sse4.1",
+    "sse4.2",
+    "popcnt",
+    "avx",
+    "avx2",
+    "bmi1",
+    "bmi2",
+    "fma",
+    "lzcnt",
+    "f16c",
+    "movbe",
+    "aes",
+    "pclmulqdq",
+    "sha",
+    "adx",
+    "gfni",
+    "vaes",
+    "vpclmulqdq",
+    "avx512f",
+    "avx512bw",
+    "avx512cd",
+    "avx512dq",
+    "avx512vl",
+    "avx512vbmi",
+    "avx512vnni",
+);
+
+/// The metadata's feature word as a Rust expression, evaluated where the
+/// translation is compiled: the [`X86_FEATURES`] enabled there.
+fn features_expr() -> String {
+    let mut e = String::from("0");
+    for (bit, name) in X86_FEATURES.iter().enumerate() {
+        e.push_str(&format!(
+            " | (cfg!(all(target_arch = \"x86_64\", target_feature = \"{name}\")) as u64) << {bit}"
+        ));
+    }
+    e
+}
+
+/// The features of the feature word `features` this CPU lacks: a
+/// translation needing them would die of an illegal instruction.
+fn missing_features(features: u64) -> Vec<&'static str> {
+    #[cfg(target_arch = "x86_64")]
+    let detected = x86_detected();
+    #[cfg(not(target_arch = "x86_64"))]
+    let detected: Vec<bool> = Vec::new();
+    let mut missing = Vec::new();
+    for bit in 0..u64::BITS {
+        if features >> bit & 1 == 0 {
+            continue;
+        }
+        let n = bit as usize;
+        if !detected.get(n).copied().unwrap_or(false) {
+            missing.push(X86_FEATURES.get(n).copied().unwrap_or("unknown"));
+        }
+    }
+    missing
+}
 
 /// The entry function of a translation (`translation::enter`):
 /// `enter(segment, decoder_index, regs, fregs, arena, io)`, where `io` is
@@ -80,7 +157,7 @@ pub type AotEnter =
 pub fn fingerprint() -> u64 {
     static FINGERPRINT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *FINGERPRINT.get_or_init(|| {
-        let mut text = format!(
+        let text = format!(
             "libriscv-aot {} {ABI_VERSION} {:?}",
             env!("CARGO_PKG_VERSION"),
             [
@@ -91,96 +168,26 @@ pub fn fingerprint() -> u64 {
                 cfg!(feature = "debug-checks"),
             ],
         );
-        for source in [
-            include_str!("emit.rs"),
-            include_str!("structure.rs"),
-            include_str!("../codegen/region.rs"),
-            include_str!("../codegen/classify.rs"),
-            include_str!("../native_code.rs"),
-            include_str!("../decoder_cache.rs"),
-            include_str!("../decode.rs"),
-            include_str!("../bytecode.rs"),
-        ] {
-            text.push_str(&format!(" {:016x}", hash64(source.as_bytes())));
-        }
-        hash64(text.as_bytes())
+        // What decides the translation, besides `codegen::SHARED_SOURCES`:
+        // the translator and the metadata and `enter` protocol (this file).
+        crate::codegen::fingerprint(
+            text,
+            &[
+                include_str!("mod.rs"),
+                include_str!("emit.rs"),
+                include_str!("structure.rs"),
+            ],
+        )
     })
 }
 
-/// What a translation is looked up by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct AotKey {
-    /// [`fingerprint`].
-    pub build: u64,
-    pub vaddr: u64,
-    pub len: u64,
-    pub crc32c: u32,
-    /// [`hash64`] of the code.
-    pub hash: u64,
-    pub execute_only: bool,
-    /// The libc fast path patched the segment.
-    pub libc_fastpath: bool,
-    pub layout: MemoryLayout,
-}
+/// What a translation is looked up by: everything the code translated
+/// for a segment depends on, with [`fingerprint`] as its build.
+pub(crate) type AotKey = NativeKey;
 
-impl AotKey {
-    pub(crate) fn new(
-        code: &[u8],
-        vaddr: u64,
-        crc32c: u32,
-        execute_only: bool,
-        libc_fastpath: bool,
-        layout: MemoryLayout,
-    ) -> Self {
-        Self {
-            build: fingerprint(),
-            vaddr,
-            len: code.len() as u64,
-            crc32c,
-            hash: hash64(code),
-            execute_only,
-            libc_fastpath,
-            layout,
-        }
-    }
-
-    const WORDS: usize = 11;
-
-    fn words(&self) -> [u64; Self::WORDS] {
-        let flags = u64::from(self.execute_only) | u64::from(self.libc_fastpath) << 1;
-        let l = &self.layout;
-        [
-            self.build,
-            self.vaddr,
-            self.len,
-            u64::from(self.crc32c),
-            self.hash,
-            flags,
-            l.mask,
-            l.read.0,
-            l.read.1,
-            l.write.0,
-            l.write.1,
-        ]
-    }
-
-    fn from_words(w: [u64; Self::WORDS]) -> Option<Self> {
-        let [build, vaddr, len, crc, hash, flags, mask, rb, rl, wb, wl] = w;
-        Some(Self {
-            build,
-            vaddr,
-            len,
-            crc32c: u32::try_from(crc).ok()?,
-            hash,
-            execute_only: flags & 1 != 0,
-            libc_fastpath: flags & 2 != 0,
-            layout: MemoryLayout {
-                mask,
-                read: (rb, rl),
-                write: (wb, wl),
-            },
-        })
-    }
+/// The translation key of the segment `segment` describes.
+pub(crate) fn key(segment: NativeKey) -> AotKey {
+    segment.with_build(fingerprint())
 }
 
 /// How to enter a translation.
@@ -279,10 +286,13 @@ impl Reader<'_> {
 
 /// Add the segments described by `meta` to the registry, keeping existing
 /// translations for a key. Returns the number added, or `None` if `meta`
-/// isn't valid metadata.
+/// isn't valid metadata or the code needs CPU features this one lacks.
 fn add(meta: &[u64], module: &Module) -> Option<usize> {
     let mut r = Reader(meta);
     if r.word()? != META_MAGIC || r.word()? != ABI_VERSION {
+        return None;
+    }
+    if !missing_features(r.word()?).is_empty() {
         return None;
     }
     let count = r.usize()?;
@@ -358,6 +368,18 @@ pub fn register(meta: &'static [u64], enter: AotEnter) -> usize {
 pub fn load_shared_object(path: impl AsRef<Path>) -> io::Result<usize> {
     let lib = libriscv_jit_rt::aot::AotLibrary::load(path.as_ref())?;
     let meta = lib.meta().to_vec();
+    if let [META_MAGIC, ABI_VERSION, features, ..] = meta.as_slice() {
+        let missing = missing_features(*features);
+        if !missing.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the shared object was compiled for a CPU with features this one lacks: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+    }
     add(&meta, &Module::Shared(lib)).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -374,6 +396,14 @@ pub fn registered_segments() -> usize {
 /// True if any translation is registered.
 pub(crate) fn any() -> bool {
     HAS_UNITS.load(Ordering::Acquire)
+}
+
+/// True if a translation is registered for `key`.
+pub(crate) fn registered(key: &AotKey) -> bool {
+    any()
+        && registry()
+            .as_ref()
+            .is_some_and(|units| units.contains_key(key))
 }
 
 /// Install the registered translation for `key` in `exec` (a new segment,
@@ -541,7 +571,8 @@ pub mod translation {{
         );
         let _ = write!(
             o,
-            "    pub static META: &[u64] = &[{META_MAGIC:#x}, {ABI_VERSION}, {},",
+            "    pub static META: &[u64] = &[{META_MAGIC:#x}, {ABI_VERSION},\n        {},\n        {},",
+            features_expr(),
             units.len()
         );
         for (key, t) in units.iter() {
@@ -596,9 +627,12 @@ pub mod translation {{
     /// Compile the translation into a shared object for
     /// [`load_shared_object`], with `rustc` (`$RUSTC`, else `rustc`: a
     /// nightly with `explicit_tail_calls` and `rust_preserve_none_cc`, like
-    /// libriscv's own toolchain). Optimized for the host CPU
-    /// (`-C target-cpu=native`); `$LIBRISCV_AOT_RUSTFLAGS` adds flags.
-    /// The source is kept next to it, with `.rs` appended to its name.
+    /// libriscv's own toolchain, which rustup is asked for unless
+    /// `$RUSTUP_TOOLCHAIN` says otherwise). Optimized for the host CPU
+    /// (`-C target-cpu=native`): the shared object records the CPU features
+    /// it was compiled with, and [`load_shared_object`] refuses it on a CPU
+    /// without them. `$LIBRISCV_AOT_RUSTFLAGS` adds flags. The source is
+    /// kept next to it, with `.rs` appended to its name.
     pub fn write_shared_object(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let mut source = path.as_os_str().to_owned();
@@ -607,8 +641,19 @@ pub mod translation {{
         let mut text = String::from(SHARED_PROLOGUE);
         text.push_str(&self.source());
         std::fs::write(&source, text)?;
-        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let rustc = std::env::var_os("RUSTC");
+        let default = rustc.is_none();
+        let rustc = rustc.unwrap_or_else(|| "rustc".into());
         let mut cmd = std::process::Command::new(&rustc);
+        // The toolchain libriscv was built with (rustup's, when it ran the
+        // build) has the features the translation needs; the default one,
+        // outside this workspace, may well be a stable without them.
+        if default
+            && std::env::var_os("RUSTUP_TOOLCHAIN").is_none()
+            && let Some(toolchain) = option_env!("RUSTUP_TOOLCHAIN")
+        {
+            cmd.env("RUSTUP_TOOLCHAIN", toolchain);
+        }
         cmd.args([
             "--edition=2024",
             "--crate-type=cdylib",

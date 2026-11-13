@@ -1,3 +1,5 @@
+//! Port of the control-flow layout in `tr_emit.cpp` (which writes `goto`s).
+//!
 //! Laying out a region's control flow as structured Rust, after Norman
 //! Ramsey's "Beyond Relooper: Recursive Translation of Unstructured Control
 //! Flow to Structured Control Flow" (ICFP 2022), the algorithm WebAssembly
@@ -37,13 +39,25 @@ const MAX_GROWTH: usize = 8;
 
 /// The region's control flow as a `loop { match pc { .. } }` dispatcher:
 /// the root `match` adds the entry's block count, the inner one runs the
-/// arms, whose transfers set `pc` and continue it.
+/// arms, whose transfers set `pc` and continue it. An entry without an arm
+/// (which makes [`structure`] give up) counts its block and leaves with
+/// `EXIT_SLOW`: the interpreter runs the block with its own handlers, and
+/// doesn't count it again (`EXIT_JUMP` would, and would re-enter here
+/// through the patched entry, as would the entry table, `A::I`).
 pub(super) fn dispatch(arms: &[Arm], entry_counts: &[(u64, u64)]) -> String {
+    use crate::native_code::{EXIT_JUMP, EXIT_SLOW};
     let mut o = String::new();
     let _ = writeln!(o, "'e: loop {{");
     let _ = writeln!(o, "match pc {{");
     for &(pc, k) in entry_counts {
-        let _ = writeln!(o, "{pc:#x} => c = c.wrapping_add({k}),");
+        if arms.iter().any(|a| a.pc == pc) {
+            let _ = writeln!(o, "{pc:#x} => c = c.wrapping_add({k}),");
+        } else {
+            let _ = writeln!(
+                o,
+                "{pc:#x} => {{ c = c.wrapping_add({k}); break 'x A::X({EXIT_SLOW}, pc) }}"
+            );
+        }
     }
     let _ = writeln!(o, "_ => break 'x A::I(pc),");
     let _ = writeln!(o, "}}");
@@ -63,11 +77,7 @@ pub(super) fn dispatch(arms: &[Arm], entry_counts: &[(u64, u64)]) -> String {
         }
         let _ = writeln!(o, "}}");
     }
-    let _ = writeln!(
-        o,
-        "_ => break 'x A::X({}, pc),",
-        crate::native_code::EXIT_JUMP
-    );
+    let _ = writeln!(o, "_ => break 'x A::X({EXIT_JUMP}, pc),");
     let _ = writeln!(o, "}}\n}}\n}}");
     o
 }
@@ -594,4 +604,31 @@ pub(super) fn structure(arms: &[Arm], entry_counts: &[(u64, u64)]) -> Option<Str
     w.do_tree(0)?;
     w.out.push_str("}\n");
     Some(w.out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_code::EXIT_SLOW;
+
+    /// An entry without an arm: `structure` gives up, and `dispatch` counts
+    /// the entry's block once, then leaves for the interpreter's handlers.
+    #[test]
+    fn dispatch_counts_an_entry_without_an_arm_once() {
+        let arms = [Arm {
+            pc: 0x1000,
+            items: vec![Item::Branch(0x1000)],
+        }];
+        let entries = [(0x1000, 1), (0x2000, 3)];
+        assert!(structure(&arms, &entries).is_none());
+        let code = dispatch(&arms, &entries);
+        assert!(code.contains("0x1000 => c = c.wrapping_add(1),"), "{code}");
+        assert!(
+            code.contains(&format!(
+                "0x2000 => {{ c = c.wrapping_add(3); break 'x A::X({EXIT_SLOW}, pc) }}"
+            )),
+            "{code}"
+        );
+        assert_eq!(code.matches("wrapping_add(3)").count(), 1, "{code}");
+    }
 }

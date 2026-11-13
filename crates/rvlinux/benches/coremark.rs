@@ -65,15 +65,18 @@ struct Variant {
 }
 
 /// Translate `elf` to Rust and compile it into a shared object next to it
-/// (`--aot-save-shared`; again whenever `rvlinux` is newer, since another
-/// translator's code would be ignored): the flags that load it.
+/// (`--aot-save-shared`; again whenever `rvlinux` or the ELF is newer,
+/// since a translation of another translator or of other code would be
+/// ignored, and the column would time the interpreter): the flags that
+/// load it.
 fn prepare_aot(elf: &Path) -> Vec<String> {
     let rust = PathBuf::from(env!("CARGO_BIN_EXE_rvlinux"));
     let mut so = elf.as_os_str().to_owned();
     so.push(".aot.so");
     let so = PathBuf::from(so);
     let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    if modified(&so) < modified(&rust) {
+    let built = modified(&so);
+    if built < modified(&rust) || built < modified(elf) {
         let status = Command::new(&rust)
             .arg("-Q")
             .arg("--aot-save-shared")
