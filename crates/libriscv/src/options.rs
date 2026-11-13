@@ -67,6 +67,11 @@ pub struct MachineOptions {
     ///
     /// [`Machine::vmcall`]: crate::Machine::vmcall
     pub default_exit_function: Option<String>,
+    /// Share decoded execute segments, and their JIT-compiled code, between
+    /// all machines of the process that decode the same code at the same
+    /// address (C++ `use_shared_execute_segments`, default on). Forks share
+    /// their master's segments either way.
+    pub use_shared_execute_segments: bool,
 }
 
 impl Default for MachineOptions {
@@ -88,6 +93,7 @@ impl Default for MachineOptions {
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
             default_exit_function: None,
+            use_shared_execute_segments: true,
         }
     }
 }

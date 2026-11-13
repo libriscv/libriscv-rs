@@ -111,9 +111,11 @@ To decide at the start of the phase that needs them (recommendation given):
   disjointly. Avoid `Box<dyn Any>` downcasts on the hot path.
 - **Floating point.** Use `f32`/`f64` with explicit NaN-boxing helpers
   (`rvfd.hpp`). Rounding modes/flags only under the `fcsr` feature, like C++.
-- **Threads/fork.** No global state; `Machine` is `Send + Sync` (checked
-  at compile time), so a machine shared between threads can be forked
-  from. Fork shares pages via `Arc` (decided in Phase 3, see "Fork").
+- **Threads/fork.** `Machine` is `Send + Sync` (checked at compile time),
+  so a machine shared between threads can be forked from. Fork shares
+  pages via `Arc` (decided in Phase 3, see "Fork"). The only global state
+  is C++'s: the process-wide cache of shared execute segments (see
+  "Shared execute segments").
 
 ## Toolchain
 
@@ -365,11 +367,18 @@ that another thread may be executing needs shared mutable handlers, which
 safe Rust can't do without slowing every dispatch. Instead:
 
 - A `std::thread` compiles from an `Arc` of the segment (compilation only
-  reads it) and sends the result over a channel.
-- While anything is pending, `dispatch_simulate` runs in slices of
-  `jit_background_slice` instructions (default 2^20). Between slices it
-  installs finished code: a patched copy of the segment replaces the
-  original in `Memory` and as the current segment.
+  reads it) and publishes a patched copy *in the segment itself*
+  (`DecodedSegment::finish_background_jit`, a `OnceLock`). The
+  compilation belongs to the segment, not to the machine that started it:
+  every machine holding the segment (the creator, its forks, machines
+  sharing it through the process-wide cache) gets the native code, as
+  with C++'s live-patching of the shared segment. Nobody has to wait for
+  it, before forking or otherwise.
+- While one of a machine's segments has an outstanding compilation
+  (running, or finished but not switched to), `dispatch_simulate` runs in
+  slices of `jit_background_slice` instructions (default 2^20). Between
+  slices the machine switches its segments, and the current one, to
+  their published copies.
 - Slices end at the dispatcher's own instruction-limit checks, and the next
   slice begins the block there, exactly what the uninterrupted run does, so
   results and counts are the same whenever the code arrives. System calls
@@ -378,8 +387,11 @@ safe Rust can't do without slowing every dispatch. Instead:
   where an uninterrupted run would publish it (it's observable after a
   fault). `jit::tests` checks all of this with a compilation that never
   finishes.
-- Results for segments that went stale or were evicted meanwhile are
-  dropped. `Machine::wait_for_jit` blocks until everything is installed.
+- Results for segments that went stale meanwhile are dropped (the copy
+  shares the original's stale flag, so marking either marks both).
+  `Machine::wait_for_jit` blocks until the compilations of the machine's
+  segments have finished, whoever started them. A compilation that
+  panics publishes "nothing compiled", so nobody waits forever.
 
 **Testing.** The difftests run every guest a second time with `--jit` when
 `rvlinux` is built with the feature (`cargo test --workspace --features
@@ -671,15 +683,49 @@ Deliberate differences, all stricter than C++:
 - A loaned page made writable in a fork (`mprotect`) is copy-on-write,
   and `madvise(MADV_DONTNEED)` of a read-only loaned page zeroes a copy.
   C++ writes the master's page in both cases.
-- Segments still compiling in the background in the master stay
-  interpreted in the fork (`wait_for_jit()` before forking avoids that).
-  JIT code compiled for the master's N-bit arena never runs in a fork
-  (`libriscv-jit-rt` refuses it, so it's interpreted).
 
-Not ported: C++'s shared execute segments (Phase 4), so an execute
-segment a fork creates (e.g. the host exit page on its first VM call,
-if the master never made one) is decoded again by every fork. Do one VM
-call on the master before forking.
+Forks share the master's execute segments, including ones still being
+compiled in the background (see "Background compilation"), and segments
+a fork creates later (e.g. the host exit page on its first VM call) come
+from the process-wide cache, decoded once (see "Shared execute
+segments").
+
+Native code doesn't *run* in forks yet: a fork has no arena, and
+`JitState::new` refuses windows that don't fit in it, so `jit_enter`
+falls back to the interpreter (the same holds for the masters meant for
+forking, created with `use_memory_arena: false`). C++ asmjit runs in forks
+and reaches the page table from native code; the Cranelift JIT leaves
+native code for every access outside the arena (`EXIT_SLOW`), so it needs
+a page-table path in native code first. JIT code compiled for the
+master's N-bit arena would be refused in a fork anyway.
+
+### Shared execute segments
+
+Port of C++ `SharedExecuteSegments` (`decoder_cache.cpp`), on by default
+(`MachineOptions::use_shared_execute_segments`): machines of the process
+that decode the same code at the same address share one
+`Arc<DecodedSegment>`, with its native code. Keyed by address, length,
+CRC32-C (`crc32c`, slicing-by-8 instead of C++'s SSE4.2 instruction,
+which needs `unsafe`), execute-only, and whether and how the JIT compiles
+(none, or its N-bit mask). C++ also keys on the arena boundaries, which
+asmjit bakes into its code; Cranelift code reads them at run time. As in
+C++, the cache entry stays locked while a segment is decoded, so
+concurrent machines decode and compile it once, and a machine compiling
+up front waits for a background compilation of the same segment instead
+of starting its own.
+
+Differences from C++:
+
+- **The code is compared, not just the CRC.** CRC32-C collisions are
+  trivial to construct (the unit test forges one), and C++ hands the
+  registered segment to any machine whose code collides, i.e. one guest's
+  machine can end up executing code another guest supplied. Here a
+  collision gets its own, unshared segment.
+- Stale segments are never handed out; a new one replaces them in the
+  cache.
+- The cache holds segments weakly: they die with the last machine using
+  them (C++ `remove_if_unique` on eviction and destruction), and entries
+  nobody uses are pruned when the map has doubled.
 
 `crates/libriscv/benches/fork.rs` against the same scenario in C++
 (Release, threaded dispatch; master: static glibc, 637 pages), per
@@ -826,7 +872,7 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [ ] Printer / stdin / rdtime hooks
 - [x] Fork with CoW (`machine.cpp`, `cpu.cpp`, `memory.cpp` `machine_loader`), page caches; see "Fork". (C++ `Memory::reset()` is empty: nothing to port)
 - [ ] Serialize/deserialize (`serialize.cpp`)
-- [ ] Ports of `tests/unit/{custom,dynamic,exceptions,examples,checksum,crc32c,pcrel,png,rvbuffer}.cpp` (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
+- [ ] Ports of `tests/unit/{custom,dynamic,exceptions,examples,checksum,pcrel,png,rvbuffer}.cpp` (`crc32c.cpp`: the CRC32-C case, in `decoder_cache.rs`) (`vmcall.cpp`: done, `tests/vmcall.rs`; `brutal.cpp`: done except memory traps, `tests/brutal.rs`)
 
 ### Phase 4 — Performance
 
@@ -835,7 +881,8 @@ Exit criterion: all difftests pass, including Rust/Go/Zig/newlib fixtures.
 - [x] Specialised bytecodes (`decode_bytecodes.cpp`, `threaded_rewriter.cpp`, `bytecode_impl.cpp`, `threaded_bytecodes.hpp`); see "Bytecodes"
 - [x] `extern "rust-preserve-none"` handlers
 - [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
-- [ ] Shared execute segments across machines (`decoded_exec_segment.hpp`, `shared_rodata.cpp`)
+- [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
+- [ ] Shared read-only data (`shared_rodata.cpp`)
 - [ ] Bounds-check elimination audit (`cargo asm`)
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
@@ -888,7 +935,7 @@ phase starts; names below are the intended targets.
 | `rvv.hpp`, `rvv_instr.cpp` | `isa/rvv.rs` | 5 | |
 | `rvi_fuse.cpp` | — | — | dead code in C++ (`try_fuse` is never called) |
 | `instruction_counter.hpp` | `dispatch.rs` (`Counter`) | 1 | ✅ |
-| `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | Phase 1 part ✅ (shared segments: Phase 4) |
+| `decoder_cache.*`, `decoded_exec_segment.hpp` | `decoder_cache.rs` | 1, 4 | ✅ incl. shared segments (EBREAK locations, libc fast path: not yet) |
 | `decode_bytecodes.cpp`, `threaded_rewriter.cpp` | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–4 | ✅ RV64IMAFDC + Zcb + B |
 | `bytecode_impl.cpp`, `threaded_bytecodes.hpp` | `bytecode.rs` (slow-path and system bytecodes: `dispatch.rs`) | 4 | ✅ |
 | `bytecode_dispatch.cpp`, `threaded_bytecode_array.hpp` | — | — | superseded by tail-call dispatch |
@@ -909,7 +956,7 @@ phase starts; names below are the intended targets.
 | `livepatch.hpp` | — | — | evaluate (mostly JIT-related) |
 | `asmjit/aj_translate.cpp`, `aj_emit.cpp`, `aj_api.cpp` | `jit/` (Cranelift), `libriscv-jit-rt` | 4 | ✅ replaced, not ported |
 | `util/auxvec.hpp`, `Machine::setup_linux`/`setup_argv` | `linux.rs` | 2 | ✅ |
-| `util/crc32*.{hpp,cpp}` | `util/crc32.rs` | 3 | |
+| `util/crc32*.{hpp,cpp}` | `decoder_cache.rs` (`crc32c`) | 4 | ✅ CRC32-C (plain CRC32: not needed yet) |
 | `util/buffer.hpp` | `memory/buffer.rs` | 3 | |
 | `util/function.hpp`, `util/threadpool.h`, `util/load_binary_file.hpp` | `std` | — | not needed |
 | `emulator/src/main.cpp` | `crates/rvlinux` | 0–2, 5 | ✅ static and dynamic Linux guests (`full_linux_guest`), `--call` (without the system call 500 symbol helper, which needs userdata); debugger, GDB: later |

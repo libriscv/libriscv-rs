@@ -278,30 +278,43 @@ impl Machine {
         Ok(())
     }
 
-    /// Install background JIT compilations that have finished (with `wait`,
-    /// block until all of them have), switching the current execute segment
-    /// to its compiled copy.
+    /// Switch to the native code of background JIT compilations that have
+    /// finished (with `wait`, block until all of them have), the current
+    /// execute segment included.
     #[cfg(feature = "jit")]
-    pub(crate) fn install_background_jit(&mut self, wait: bool) {
-        for (old, new) in self.memory.install_background_jit(wait) {
-            if Arc::ptr_eq(&self.cpu.exec, &old) {
-                self.cpu.exec = new;
-            }
+    pub(crate) fn refresh_execute_segments(&mut self, wait: bool) {
+        #[cfg(test)]
+        if self.memory.jit_held() {
+            return;
+        }
+        self.memory.refresh_execute_segments(wait);
+        if self.cpu.exec.jit_outstanding() {
+            self.cpu.exec = if wait {
+                self.cpu.exec.wait_for_jit()
+            } else {
+                self.cpu.exec.latest()
+            };
         }
     }
 
-    /// Block until background JIT compilations (`MachineOptions::jit_background`)
-    /// have finished, and switch to their native code. Does nothing without
-    /// pending compilations.
+    /// Block until the background JIT compilations of this machine's execute
+    /// segments have finished, and switch to their native code. Does nothing
+    /// without pending compilations. The compilations belong to the
+    /// segments, not to the machine that started them: a fork, or a machine
+    /// sharing a segment (`use_shared_execute_segments`), waits for the same
+    /// compilation and gets the same native code.
     pub fn wait_for_jit(&mut self) {
         #[cfg(feature = "jit")]
-        self.install_background_jit(true);
+        self.refresh_execute_segments(true);
     }
 
-    /// True while background JIT compilations haven't been installed yet.
+    /// True while a background JIT compilation of one of this machine's
+    /// execute segments is running, or has finished and the machine hasn't
+    /// switched to its native code yet (it does at its next slice, see
+    /// `MachineOptions::jit_background`).
     pub fn jit_pending(&self) -> bool {
         #[cfg(feature = "jit")]
-        return self.memory.jit_pending();
+        return self.memory.jit_pending() || self.cpu.exec.jit_outstanding();
         #[cfg(not(feature = "jit"))]
         false
     }

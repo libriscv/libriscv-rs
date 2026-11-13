@@ -16,10 +16,21 @@
 //! and advances its `pc` to the last instruction of the block (C++
 //! `BEGIN_BLOCK`). Counter checks happen only at block ends.
 //!
-//! Not ported yet: shared segments and CRC32-C keys (Phase 4), EBREAK
-//! locations and the libc fast path.
+//! Segments are shared, as in C++: by forks (which copy the master's
+//! segment list), and between all machines of the process that decode the
+//! same code at the same address (C++ `SharedExecuteSegments`, keyed by the
+//! code's CRC32-C; see [`shared_segment`]). A background JIT compilation
+//! publishes its result in the segment itself (`jit_done`), so every
+//! machine holding the segment switches to the native code, not only the
+//! one that started the compilation (C++ live-patches the shared segment).
+//!
+//! Not ported yet: EBREAK locations and the libc fast path.
 
+use std::collections::BTreeMap;
+#[cfg(feature = "jit")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use crate::decode;
 use crate::dispatch::{self, Handler};
@@ -83,11 +94,26 @@ pub struct DecodedSegment {
     /// 4-byte read anywhere inside the segment stays in bounds.
     data: Box<[u8]>,
     pub(crate) cache: Box<[DecoderEntry]>,
-    stale: AtomicBool,
+    /// Shared with the segment's JIT-compiled copy, so that marking either
+    /// stale marks both, in every machine holding them.
+    stale: Arc<AtomicBool>,
     execute_only: bool,
+    /// CRC32-C of the code (C++ `crc32c_hash`).
+    crc32c: u32,
+    /// The process-wide cache entry this segment is registered in. Holding
+    /// it is what keeps the entry in the cache (see [`shared_segment`]).
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    shared: Option<Arc<SharedEntry>>,
     /// Native code for this segment, if the JIT compiled it.
     #[cfg(feature = "jit")]
     pub(crate) jit: Option<crate::jit::JitSegment>,
+    /// A background compilation of this segment was started.
+    #[cfg(feature = "jit")]
+    jit_started: AtomicBool,
+    /// Its result: the JIT-compiled copy of this segment that replaces it,
+    /// or `None` if nothing was compiled.
+    #[cfg(feature = "jit")]
+    jit_done: OnceLock<Option<Arc<DecodedSegment>>>,
 }
 
 impl DecodedSegment {
@@ -97,17 +123,24 @@ impl DecodedSegment {
             end: 0,
             data: Box::new([]),
             cache: Box::new([]),
-            stale: AtomicBool::new(false),
+            stale: Arc::new(AtomicBool::new(false)),
             execute_only: false,
+            crc32c: 0,
+            shared: None,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_started: AtomicBool::new(false),
+            #[cfg(feature = "jit")]
+            jit_done: OnceLock::new(),
         }
     }
 
     /// A copy of this segment without native code, for installing a
-    /// background compilation into.
+    /// background compilation into. It shares the original's stale flag
+    /// and cache entry.
     #[cfg(feature = "jit")]
-    pub(crate) fn duplicate(&self) -> Self {
+    fn duplicate(&self) -> Self {
         let cache = match &self.jit {
             // Undo patches from an earlier compilation.
             Some(jit) => self
@@ -126,10 +159,74 @@ impl DecodedSegment {
             end: self.end,
             data: self.data.clone(),
             cache,
-            stale: AtomicBool::new(self.is_stale()),
+            stale: Arc::clone(&self.stale),
             execute_only: self.execute_only,
+            crc32c: self.crc32c,
+            shared: self.shared.clone(),
             jit: None,
+            jit_started: AtomicBool::new(false),
+            jit_done: OnceLock::new(),
         }
+    }
+
+    /// Mark a background compilation of this segment as started. Until it
+    /// publishes its result ([`finish_background_jit`](Self::finish_background_jit)),
+    /// the segment is [outstanding](Self::jit_outstanding).
+    #[cfg(feature = "jit")]
+    pub(crate) fn begin_background_jit(&self) {
+        self.jit_started.store(true, Ordering::Release);
+    }
+
+    /// Publish the result of this segment's background compilation (C++
+    /// `livepatch.hpp`, minus the patching of running decoder entries):
+    /// a patched copy of the segment, which every machine holding this one
+    /// switches to at its next slice ([`latest`](Self::latest)), and which
+    /// replaces it in the process-wide cache. Results for stale segments
+    /// are dropped. Only the first call has an effect.
+    #[cfg(feature = "jit")]
+    pub(crate) fn finish_background_jit(self: &Arc<Self>, compiled: Option<crate::jit::Compiled>) {
+        let upgrade = compiled.filter(|_| !self.is_stale()).map(|compiled| {
+            let mut patched = self.duplicate();
+            crate::jit::JitSegment::install(&mut patched, compiled);
+            Arc::new(patched)
+        });
+        if self.jit_done.set(upgrade.clone()).is_err() {
+            return;
+        }
+        if let (Some(new), Some(entry)) = (upgrade, &self.shared) {
+            let mut registered = lock(&entry.segment);
+            if std::ptr::eq(registered.as_ptr(), Arc::as_ptr(self)) {
+                *registered = Arc::downgrade(&new);
+            }
+        }
+    }
+
+    /// True while a background compilation of this segment is running, or
+    /// has finished with native code the holder hasn't switched to yet.
+    #[cfg(feature = "jit")]
+    pub(crate) fn jit_outstanding(&self) -> bool {
+        self.jit_started.load(Ordering::Acquire) && !matches!(self.jit_done.get(), Some(None))
+    }
+
+    /// The newest version of this segment: its JIT-compiled copy, if a
+    /// background compilation has published one, or the segment itself.
+    #[cfg(feature = "jit")]
+    pub(crate) fn latest(self: &Arc<Self>) -> Arc<Self> {
+        let mut segment = self;
+        while let Some(Some(next)) = segment.jit_done.get() {
+            segment = next;
+        }
+        Arc::clone(segment)
+    }
+
+    /// Like [`latest`](Self::latest), but first blocks until a running
+    /// background compilation has finished.
+    #[cfg(feature = "jit")]
+    pub(crate) fn wait_for_jit(self: &Arc<Self>) -> Arc<Self> {
+        if self.jit_started.load(Ordering::Acquire) {
+            self.jit_done.wait();
+        }
+        self.latest()
     }
 
     /// True if `[addr, addr + len)` is inside the segment (C++ default `len = 2`).
@@ -156,6 +253,10 @@ impl DecodedSegment {
     }
     pub fn is_stale(&self) -> bool {
         self.stale.load(Ordering::Relaxed)
+    }
+    /// CRC32-C of the segment's code (C++ `crc32c_hash`).
+    pub const fn crc32c_hash(&self) -> u32 {
+        self.crc32c
     }
     /// Number of decoder entries that enter JIT-compiled code (0 without the
     /// JIT, or if nothing in the segment could be compiled).
@@ -231,8 +332,16 @@ impl DecodedSegment {
     }
 
     /// Port of `Memory::create_execute_segment` (minus the slot handling,
-    /// which lives in `Memory`) and `Memory::generate_decoder_cache`.
-    pub(crate) fn new(code: &[u8], vaddr: u64, execute_only: bool) -> Result<Self> {
+    /// which lives in `Memory`, and the sharing, see [`shared_segment`]) and
+    /// `Memory::generate_decoder_cache`. `crc32c` is [`crc32c`] of `code`,
+    /// and `shared` the cache entry the segment will be registered in.
+    pub(crate) fn new(
+        code: &[u8],
+        vaddr: u64,
+        execute_only: bool,
+        crc32c: u32,
+        shared: Option<Arc<SharedEntry>>,
+    ) -> Result<Self> {
         let exlen = code.len() as u64;
         if !exlen.is_multiple_of(if COMPRESSED { 2 } else { 4 }) {
             return Err(MachineError::invalid_program(
@@ -263,10 +372,16 @@ impl DecodedSegment {
             end,
             data: data.into_boxed_slice(),
             cache: vec![DecoderEntry::invalid(0); n_entries].into_boxed_slice(),
-            stale: AtomicBool::new(false),
+            stale: Arc::new(AtomicBool::new(false)),
             execute_only,
+            crc32c,
+            shared,
             #[cfg(feature = "jit")]
             jit: None,
+            #[cfg(feature = "jit")]
+            jit_started: AtomicBool::new(false),
+            #[cfg(feature = "jit")]
+            jit_done: OnceLock::new(),
         };
         let dst = seg.decode_execute_range(vaddr, end);
         // The entry after the last instruction is invalid (already is, from
@@ -515,5 +630,251 @@ fn is_regular_compressed(instr: u16) -> bool {
             !(rd != 0 && rs2 == 0)
         }
         _ => true,
+    }
+}
+
+/// What a shared execute segment is keyed on (C++ `SegmentKey`). C++ also
+/// keys on the arena boundaries, which its JIT bakes into the code; the
+/// Cranelift JIT reads them at run time, apart from the N-bit address mask,
+/// which is part of `jit`. Unlike C++, a lookup also compares the code
+/// itself, so a CRC collision never hands a machine someone else's code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SegmentKey {
+    pub vaddr: u64,
+    pub len: u64,
+    pub crc32c: u32,
+    pub execute_only: bool,
+    /// `None` without the JIT, else its guest address mask (0 for bounds
+    /// checks). Machines that don't JIT never get native code this way.
+    pub jit: Option<u64>,
+}
+
+/// One entry of the process-wide segment cache (C++
+/// `SharedExecuteSegments::Segment`). It refers to the segment weakly: the
+/// machines holding a segment keep it alive, the cache doesn't.
+#[derive(Debug, Default)]
+pub(crate) struct SharedEntry {
+    segment: Mutex<Weak<DecodedSegment>>,
+}
+
+/// C++ `SharedExecuteSegments`.
+struct SharedSegments {
+    entries: BTreeMap<SegmentKey, Arc<SharedEntry>>,
+    /// Drop unused entries when the map reaches this size.
+    prune_at: usize,
+}
+
+static SHARED_SEGMENTS: Mutex<SharedSegments> = Mutex::new(SharedSegments {
+    entries: BTreeMap::new(),
+    prune_at: 64,
+});
+
+/// Lock a mutex whose data stays consistent even if a holder panicked.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The sharing part of `Memory::create_execute_segment`
+/// (`use_shared_execute_segments`): the live segment for `key` if one
+/// exists with exactly this `code` and isn't stale, else a new one from
+/// `build`, which gets the cache entry to store in the segment. As in C++,
+/// the entry stays locked while building, so machines decoding the same
+/// code at the same time decode (and compile) it once.
+pub(crate) fn shared_segment(
+    key: SegmentKey,
+    code: &[u8],
+    build: impl FnOnce(Option<Arc<SharedEntry>>) -> Result<Arc<DecodedSegment>>,
+) -> Result<Arc<DecodedSegment>> {
+    let entry = {
+        let mut shared = lock(&SHARED_SEGMENTS);
+        if shared.entries.len() >= shared.prune_at {
+            // Every live segment holds its entry, so an entry only the map
+            // holds has none left.
+            shared.entries.retain(|_, e| Arc::strong_count(e) > 1);
+            shared.prune_at = (shared.entries.len() * 2).max(64);
+        }
+        Arc::clone(shared.entries.entry(key).or_default())
+    };
+    let mut registered = lock(&entry.segment);
+    if let Some(segment) = registered.upgrade()
+        && !segment.is_stale()
+    {
+        if segment.exec_bytes(segment.begin, segment.end) == Some(code) {
+            return Ok(segment);
+        }
+        // A collision: keep the registered segment, don't share this one.
+        drop(registered);
+        return build(None);
+    }
+    let segment = build(Some(Arc::clone(&entry)))?;
+    *registered = Arc::downgrade(&segment);
+    Ok(segment)
+}
+
+/// CRC32-C (Castagnoli) lookup tables for slicing by 8.
+#[allow(clippy::indexing_slicing)] // Evaluated at compile time; indices < 8 and < 256.
+const CRC32C_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            crc = (crc >> 1) ^ (0x82F6_3B78 & (crc & 1).wrapping_neg());
+            k += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+    let mut t = 1;
+    while t < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = tables[t - 1][i];
+            tables[t][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        t += 1;
+    }
+    tables
+};
+
+/// Port of `crc32c` (util/crc32.hpp): the CRC32-C of `data`. C++ uses the
+/// SSE4.2 instruction on amd64, which needs `unsafe` here; slicing by 8
+/// does ~2 GB/s.
+#[allow(clippy::indexing_slicing)] // Indices are bytes, the tables have 256 entries.
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
+    let t = &CRC32C_TABLES;
+    let mut crc = u32::MAX;
+    let (chunks, rest) = data.as_chunks::<8>();
+    for b in chunks {
+        let lo = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ crc;
+        let hi = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        crc = t[7][(lo & 0xFF) as usize]
+            ^ t[6][(lo >> 8 & 0xFF) as usize]
+            ^ t[5][(lo >> 16 & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][(hi >> 8 & 0xFF) as usize]
+            ^ t[1][(hi >> 16 & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &byte in rest {
+        crc = t[0][((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Port of `crc32c.cpp`.
+    #[test]
+    fn verify_crc32c() {
+        let s = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit.Sed do eiusmod \
+tempor incididunt ut labore et dolore magna aliqua.Ut enim ad minim veniam, quis nostrud \
+exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.";
+        assert_eq!(crc32c(s), 0x4291_922e);
+        assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+        assert_eq!(crc32c(b""), 0);
+        // Every split between the 8-byte and the byte-wise loop.
+        let bytewise = |d: &[u8]| {
+            !d.iter().fold(u32::MAX, |crc, &b| {
+                CRC32C_TABLES[0][((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8)
+            })
+        };
+        for n in 0..s.len() {
+            assert_eq!(crc32c(&s[..n]), bytewise(&s[..n]), "{n}");
+        }
+    }
+
+    /// Rewrite the last 4 bytes of `b` so that its CRC32-C equals `a`'s
+    /// (the CRC is affine in its input bits, so this is linear algebra).
+    fn forge_collision(a: &[u8], b: &mut [u8]) {
+        let tail = b.len() - 4;
+        b[tail..].fill(0);
+        let base = crc32c(b);
+        let flip = |b: &mut [u8], i: usize| b[tail + i / 8] ^= 1 << (i % 8);
+        // XOR basis by leading bit: (vector, which bits produce it).
+        let mut basis = [(0u32, 0u32); 32];
+        for i in 0..32 {
+            let mut t = b.to_vec();
+            flip(&mut t, i);
+            let (mut v, mut m) = (crc32c(&t) ^ base, 1u32 << i);
+            for bit in (0..32).rev() {
+                if v >> bit & 1 == 1 {
+                    if basis[bit].0 == 0 {
+                        basis[bit] = (v, m);
+                        break;
+                    }
+                    v ^= basis[bit].0;
+                    m ^= basis[bit].1;
+                }
+            }
+        }
+        let (mut v, mut m) = (crc32c(a) ^ base, 0u32);
+        for bit in (0..32).rev() {
+            if v >> bit & 1 == 1 {
+                v ^= basis[bit].0;
+                m ^= basis[bit].1;
+            }
+        }
+        assert_eq!(v, 0);
+        for i in 0..32 {
+            if m >> i & 1 == 1 {
+                flip(b, i);
+            }
+        }
+    }
+
+    fn machine(code: &[u8]) -> crate::Machine {
+        let mut m = crate::Machine::new(
+            &[],
+            crate::MachineOptions {
+                memory_max: 1 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.init_execute_area(code, 0x7_0000).unwrap();
+        m
+    }
+
+    fn segment(m: &crate::Machine) -> &DecodedSegment {
+        m.cpu.current_execute_segment()
+    }
+
+    /// Machines share identical live segments, never one that is stale or
+    /// merely has the same CRC (C++ trusts the CRC).
+    #[test]
+    fn shared_segments_compare_the_code() {
+        // addi a0, a0, 1 ... j .
+        let mut a: Vec<u8> = [0x0015_0513u32, 0x0015_0513, 0x0015_0513, 0x0000_006F]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        a.extend(0x5EED_u32.to_le_bytes());
+        let mut b = a.clone();
+        b[0] ^= 0x80; // rd = a1
+        forge_collision(&a, &mut b);
+        assert_ne!(a, b);
+        assert_eq!(crc32c(&a), crc32c(&b));
+
+        let m1 = machine(&a);
+        let m2 = machine(&a);
+        assert!(std::ptr::eq(segment(&m1), segment(&m2)));
+        assert_eq!(segment(&m1).crc32c_hash(), crc32c(&a));
+        let collider = machine(&b);
+        assert!(!std::ptr::eq(segment(&m1), segment(&collider)));
+        let (begin, end) = (segment(&collider).begin, segment(&collider).end);
+        assert_eq!(segment(&collider).exec_bytes(begin, end), Some(&b[..]));
+        // The collision didn't displace the registered segment.
+        assert!(std::ptr::eq(segment(&m1), segment(&machine(&a))));
+
+        segment(&m1).set_stale(true);
+        let m3 = machine(&a);
+        assert!(!std::ptr::eq(segment(&m1), segment(&m3)));
+        assert!(std::ptr::eq(segment(&m3), segment(&machine(&a))));
     }
 }

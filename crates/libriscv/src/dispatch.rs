@@ -642,7 +642,7 @@ impl Machine {
     pub(crate) fn dispatch_simulate(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
         let outer = self.dispatch.slice.take();
         #[cfg(feature = "jit")]
-        let result = if self.memory.jit_pending() {
+        let result = if self.jit_pending() {
             self.dispatch_sliced(pc, counter, max)
         } else {
             self.dispatch_run(pc, counter, max)
@@ -664,9 +664,9 @@ impl Machine {
         let (mut pc, mut counter) = (pc, counter);
         let slice = self.options().jit_background_slice.max(1);
         loop {
-            self.install_background_jit(false);
+            self.refresh_execute_segments(false);
             let end = counter.saturating_add(slice);
-            if !self.memory.jit_pending() || end >= max {
+            if !self.jit_pending() || end >= max {
                 return self.dispatch_run(pc, counter, max);
             }
             self.dispatch.slice = Some(Slice { end, max });

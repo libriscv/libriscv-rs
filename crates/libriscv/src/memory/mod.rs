@@ -28,7 +28,7 @@ pub use page::PageAttributes;
 
 use std::sync::Arc;
 
-use crate::decoder_cache::DecodedSegment;
+use crate::decoder_cache::{self, DecodedSegment};
 use crate::error::{ExceptionKind, MachineError, Result};
 use crate::options::MachineOptions;
 
@@ -85,6 +85,9 @@ pub struct Memory {
     /// Further execute segments. Slots can be empty after an eviction, and
     /// count towards `MAX_EXECUTE_SEGS`, as in C++.
     exec: Vec<Option<Arc<DecodedSegment>>>,
+    /// Share execute segments with other machines of the process
+    /// (`MachineOptions::use_shared_execute_segments`).
+    use_shared_segments: bool,
 
     /// Compile execute segments with the JIT (`MachineOptions::jit`).
     #[cfg(feature = "jit")]
@@ -96,9 +99,10 @@ pub struct Memory {
     /// (`MachineOptions::jit_automatic_nbit_address_space`).
     #[cfg(feature = "jit")]
     jit_arena_mask: u64,
-    /// Background compilations not installed yet.
-    #[cfg(feature = "jit")]
-    jit_pending: Vec<crate::jit::BackgroundJit>,
+    /// Keeps the dispatcher slicing, as if a compilation never finished
+    /// (see `hold_jit_pending`).
+    #[cfg(all(test, feature = "jit"))]
+    jit_hold: bool,
 
     /// The LR/SC reservation (C++ `Memory::m_atomics`).
     #[cfg(feature = "ext-a")]
@@ -225,14 +229,15 @@ impl Memory {
             forked: false,
             main_exec: None,
             exec: Vec::new(),
+            use_shared_segments: options.use_shared_execute_segments,
             #[cfg(feature = "jit")]
             jit: options.jit,
             #[cfg(feature = "jit")]
             jit_background: options.jit_background,
             #[cfg(feature = "jit")]
             jit_arena_mask: jit_arena_mask(options, arena_size),
-            #[cfg(feature = "jit")]
-            jit_pending: Vec::new(),
+            #[cfg(all(test, feature = "jit"))]
+            jit_hold: false,
             #[cfg(feature = "ext-a")]
             atomics: Default::default(),
         };
@@ -285,18 +290,20 @@ impl Memory {
             is_dynamic: self.is_dynamic,
             binary: Arc::clone(&self.binary),
             forked: true,
-            // The same execute segments. Segments still compiling in the
-            // background here stay interpreted in the fork.
+            // The same execute segments. A segment still compiling in the
+            // background gets its native code in the fork too, when the
+            // compilation publishes it in the segment.
             main_exec: self.main_exec.clone(),
             exec: self.exec.clone(),
+            use_shared_segments: options.use_shared_execute_segments,
             #[cfg(feature = "jit")]
             jit: options.jit,
             #[cfg(feature = "jit")]
             jit_background: options.jit_background,
             #[cfg(feature = "jit")]
             jit_arena_mask: 0,
-            #[cfg(feature = "jit")]
-            jit_pending: Vec::new(),
+            #[cfg(all(test, feature = "jit"))]
+            jit_hold: false,
             #[cfg(feature = "ext-a")]
             atomics: self.atomics,
         })
@@ -457,105 +464,118 @@ impl Memory {
     }
 
     /// Port of `Memory::create_execute_segment`: decode `code` as an execute
-    /// segment at `vaddr` and register it.
+    /// segment at `vaddr` and register it. With `use_shared_execute_segments`
+    /// an identical live segment of another machine is reused instead
+    /// (see [`decoder_cache::shared_segment`]).
     pub(crate) fn create_execute_segment(
         &mut self,
         code: &[u8],
         vaddr: u64,
         execute_only: bool,
     ) -> Result<Arc<DecodedSegment>> {
-        #[allow(unused_mut)]
-        let mut segment = DecodedSegment::new(code, vaddr, execute_only)?;
-        #[cfg(feature = "jit")]
-        if self.jit && !self.jit_background {
-            crate::jit::JitSegment::attach(&mut segment, self.jit_arena_mask);
-        }
-        let segment = Arc::new(segment);
-        // The first segment becomes the main one. (C++ takes the slot before
-        // decoding, and leaves a half-decoded segment registered if decoding
-        // throws. Here a segment is only registered once it's complete.)
-        if self.main_exec.is_none() {
-            self.main_exec = Some(Arc::clone(&segment));
-        } else if self.exec.len() < MAX_EXECUTE_SEGS {
-            self.exec.push(Some(Arc::clone(&segment)));
-        } else {
+        // Check the slot first: decoding (or compiling) for nothing is slow.
+        if self.main_exec.is_some() && self.exec.len() >= MAX_EXECUTE_SEGS {
             return Err(MachineError::invalid_program(
                 "Max execute segments reached",
                 0,
             ));
         }
+        let crc32c = decoder_cache::crc32c(code);
         #[cfg(feature = "jit")]
-        if self.jit && self.jit_background {
-            self.jit_pending.push(crate::jit::BackgroundJit::spawn(
-                &segment,
-                self.jit_arena_mask,
-            ));
+        let (jit, background, mask) = (self.jit, self.jit_background, self.jit_arena_mask);
+        let build = |shared| {
+            #[allow(unused_mut)]
+            let mut segment = DecodedSegment::new(code, vaddr, execute_only, crc32c, shared)?;
+            #[cfg(feature = "jit")]
+            if jit && !background {
+                crate::jit::JitSegment::attach(&mut segment, mask);
+            }
+            let segment = Arc::new(segment);
+            #[cfg(feature = "jit")]
+            if jit && background {
+                crate::jit::spawn_background(&segment, mask);
+            }
+            Ok(segment)
+        };
+        let segment = if self.use_shared_segments {
+            let key = decoder_cache::SegmentKey {
+                vaddr,
+                len: code.len() as u64,
+                crc32c,
+                execute_only,
+                #[cfg(feature = "jit")]
+                jit: jit.then_some(mask),
+                #[cfg(not(feature = "jit"))]
+                jit: None,
+            };
+            decoder_cache::shared_segment(key, code, build)?
+        } else {
+            build(None)?
+        };
+        // Compiling up front means native code from the start, also when
+        // another machine is still compiling the segment in the background.
+        #[cfg(feature = "jit")]
+        let segment = if jit && !background {
+            segment.wait_for_jit()
+        } else {
+            segment.latest()
+        };
+        // The first segment becomes the main one. (C++ takes the slot before
+        // decoding, and leaves a half-decoded segment registered if decoding
+        // throws. Here a segment is only registered once it's complete.)
+        if self.main_exec.is_none() {
+            self.main_exec = Some(Arc::clone(&segment));
+        } else {
+            self.exec.push(Some(Arc::clone(&segment)));
         }
         Ok(segment)
     }
 
-    /// Replace the pending compilations with one that never finishes, so
-    /// that the dispatcher keeps running in slices.
+    /// Keep the dispatcher running in slices without ever switching to
+    /// native code, as if a compilation never finished.
     #[cfg(all(test, feature = "jit"))]
-    pub(crate) fn hold_jit_pending(&mut self, segment: &Arc<DecodedSegment>) {
-        self.jit_pending = vec![crate::jit::BackgroundJit::never(segment)];
+    pub(crate) const fn hold_jit_pending(&mut self) {
+        self.jit_hold = true;
+    }
+    #[cfg(all(test, feature = "jit"))]
+    pub(crate) const fn jit_held(&self) -> bool {
+        self.jit_hold
     }
 
-    /// True while background compilations haven't been installed yet.
+    /// True while one of the execute segments is being compiled in the
+    /// background (by this or any other machine sharing it), or has native
+    /// code this memory hasn't switched to yet.
     #[cfg(feature = "jit")]
     pub(crate) fn jit_pending(&self) -> bool {
-        !self.jit_pending.is_empty()
+        #[cfg(test)]
+        if self.jit_hold {
+            return true;
+        }
+        self.main_exec
+            .iter()
+            .chain(self.exec.iter().flatten())
+            .any(|s| s.jit_outstanding())
     }
 
-    /// Install finished background compilations (with `wait`, all of them,
-    /// blocking until they finish): each compiled segment is replaced by a
-    /// patched copy. Returns `(old, new)` for every replaced segment.
-    /// Results for segments that went stale or were evicted meanwhile are
-    /// dropped.
+    /// Switch every execute segment to its JIT-compiled copy, where a
+    /// background compilation has published one (with `wait`, after
+    /// waiting for all running compilations). Segments that went stale
+    /// meanwhile stay interpreted.
     #[cfg(feature = "jit")]
-    pub(crate) fn install_background_jit(
-        &mut self,
-        wait: bool,
-    ) -> Vec<(Arc<DecodedSegment>, Arc<DecodedSegment>)> {
-        use crate::jit::{BackgroundResult, JitSegment};
-        let mut replaced = Vec::new();
-        let mut still_pending = Vec::new();
-        for mut job in std::mem::take(&mut self.jit_pending) {
-            let compiled = match job.poll(wait) {
-                BackgroundResult::Pending => {
-                    still_pending.push(job);
-                    continue;
-                }
-                BackgroundResult::Done(compiled) => compiled,
-            };
-            let old = job.segment;
-            let Some(compiled) = compiled else { continue };
-            if old.is_stale() {
-                continue;
+    pub(crate) fn refresh_execute_segments(&mut self, wait: bool) {
+        for segment in self
+            .main_exec
+            .iter_mut()
+            .chain(self.exec.iter_mut().flatten())
+        {
+            if segment.jit_outstanding() {
+                *segment = if wait {
+                    segment.wait_for_jit()
+                } else {
+                    segment.latest()
+                };
             }
-            let slot = if self
-                .main_exec
-                .as_ref()
-                .is_some_and(|m| Arc::ptr_eq(m, &old))
-            {
-                &mut self.main_exec
-            } else if let Some(slot) = self
-                .exec
-                .iter_mut()
-                .find(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(s, &old)))
-            {
-                slot
-            } else {
-                continue; // evicted
-            };
-            let mut patched = old.duplicate();
-            JitSegment::install(&mut patched, compiled);
-            let new = Arc::new(patched);
-            *slot = Some(Arc::clone(&new));
-            replaced.push((old, new));
         }
-        self.jit_pending = still_pending;
-        replaced
     }
 
     /// Port of `Memory::evict_execute_segment`.

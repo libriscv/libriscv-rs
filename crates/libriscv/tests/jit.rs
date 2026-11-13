@@ -49,6 +49,10 @@ fn background_machine(code: &[u8], slice: u64) -> Machine {
             jit: true,
             jit_background: true,
             jit_background_slice: slice,
+            // Every machine compiles its own copy, so the code arrives at
+            // a different point each time (a shared segment may already be
+            // compiled).
+            use_shared_execute_segments: false,
             ..Default::default()
         },
     )
@@ -1173,4 +1177,113 @@ fn fp_special_values_match_up_to_nan() {
             }
         }
     }
+}
+
+/// The loop of `background_compilation_switches_to_native_code`.
+fn sum_loop() -> Vec<u8> {
+    words(&[
+        itype(0x13, 0, 10, 0, 0),      // li a0, 0
+        itype(0x13, 0, 11, 0, 100),    // li a1, 100
+        rtype(0x33, 0, 0, 10, 10, 11), // add a0, a0, a1
+        itype(0x13, 0, 11, 11, -1),    // addi a1, a1, -1
+        btype(1, 11, 0, -8),           // bnez a1, -8
+        jtype(0, 0),                   // j .
+    ])
+}
+
+fn same_segment(a: &Machine, b: &Machine) -> bool {
+    std::ptr::eq(
+        a.cpu.current_execute_segment(),
+        b.cpu.current_execute_segment(),
+    )
+}
+
+/// A background compilation belongs to the segment, not to the machine
+/// that started it: forks made while it runs get the native code without
+/// the master waiting for it (C++ live-patches the shared segment).
+#[test]
+fn forks_receive_background_compilations() {
+    let mut code = sum_loop();
+    // Unique code, so that no other test's segment is shared.
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x5A1)]));
+    let options = MachineOptions {
+        jit: true,
+        jit_background: true,
+        jit_background_slice: 1,
+        use_memory_arena: false,
+        ..Default::default()
+    };
+    let master = machine_with(&code, options.clone());
+    assert_eq!(master.cpu.current_execute_segment().jit_entry_count(), 0);
+    let mut forks: Vec<Machine> = (0..3).map(|_| master.fork().unwrap()).collect();
+    for fork in &forks {
+        assert!(same_segment(fork, &master));
+    }
+    // A fork waits for the master's compilation...
+    forks[0].wait_for_jit();
+    assert!(!forks[0].jit_pending());
+    assert!(forks[0].cpu.current_execute_segment().jit_entry_count() > 0);
+    // ...and another switches to it by running.
+    let fork = &mut forks[1];
+    fork.cpu.jump(V).unwrap();
+    while fork.jit_pending() {
+        fork.cpu.jump(V).unwrap();
+        fork.try_simulate(1000, 0).unwrap();
+    }
+    assert_eq!(fork.cpu.reg(10), 5050);
+    assert!(same_segment(&forks[1], &forks[0]));
+    // Forks of forks, and forks made after the compilation, share it too.
+    let late = master.fork().unwrap();
+    assert!(late.jit_pending());
+    let mut nested = forks[2].fork().unwrap();
+    nested.wait_for_jit();
+    assert!(same_segment(&nested, &forks[0]));
+    // The master never waited, and gets the same code.
+    let mut master = master;
+    master.wait_for_jit();
+    assert!(same_segment(&master, &forks[0]));
+}
+
+/// Machines decoding the same code at the same address share the segment
+/// and its native code (`use_shared_execute_segments`), unless they differ
+/// in what the JIT compiles.
+#[test]
+fn machines_share_execute_segments() {
+    let mut code = sum_loop();
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x5A2)]));
+    let jit = MachineOptions {
+        jit: true,
+        ..Default::default()
+    };
+    let a = machine_with(&code, jit.clone());
+    let b = machine_with(&code, jit.clone());
+    assert!(same_segment(&a, &b));
+    assert!(a.cpu.current_execute_segment().jit_entry_count() > 0);
+    // Not with the option off, nor between JIT and interpreter.
+    let unshared = MachineOptions {
+        use_shared_execute_segments: false,
+        ..jit.clone()
+    };
+    assert!(!same_segment(&a, &machine_with(&code, unshared)));
+    let interp = machine(&code, false);
+    assert!(!same_segment(&a, &interp));
+    assert_eq!(interp.cpu.current_execute_segment().jit_entry_count(), 0);
+    assert!(same_segment(&interp, &machine(&code, false)));
+    // Background compilation reaches every machine sharing the segment,
+    // and a machine compiling up front waits for it rather than compiling
+    // the segment again.
+    let mut code = sum_loop();
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x5A3)]));
+    let background = MachineOptions {
+        jit_background: true,
+        ..jit.clone()
+    };
+    let mut c = machine_with(&code, background.clone());
+    let mut d = machine_with(&code, background);
+    assert!(same_segment(&c, &d));
+    let e = machine_with(&code, jit);
+    assert!(e.cpu.current_execute_segment().jit_entry_count() > 0);
+    c.wait_for_jit();
+    d.wait_for_jit();
+    assert!(same_segment(&c, &e) && same_segment(&d, &e));
 }

@@ -21,6 +21,13 @@ LIBRISCV_REQUIRE_TOOLCHAIN=1 cargo test      # same, but fail instead of skippin
 cargo test -- --ignored                      # include not-yet-enabled difftests
 cargo clippy --all-targets -- -D warnings    # must be clean (also with --features libriscv/jit,rvlinux/jit)
 cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, difftests also run --jit
+```
+
+Expected durations (with the JIT features): `difftest.rs` ~6 min, `vmcall.rs`
+~45 s, the rest seconds. That's normal: don't treat it as a regression, and
+never `git stash` work to time HEAD.
+
+```sh
 cargo fmt --all
 scripts/difftest.sh prog.elf [args...]       # diff one ELF against the C++ emulator
 scripts/build-cpp-reference.sh               # C++ threaded/tailcall/switch builds -> target/cpp-ref/

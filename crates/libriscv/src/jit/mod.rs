@@ -20,8 +20,7 @@ mod emit;
 mod region;
 
 use libriscv_jit_rt::{CodeMemory, JitState};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 pub(crate) use emit::Compiled;
 
@@ -56,86 +55,33 @@ pub(crate) struct JitSegment {
     original: Vec<(usize, Handler)>,
 }
 
-/// A segment being compiled on a background thread
-/// (`MachineOptions::jit_background`, C++ `asmjit_background_callback`).
-///
-/// The interpreter keeps running the original segment meanwhile. When the
-/// code is ready, a patched copy of the segment replaces the original
-/// between two dispatcher runs (C++ instead patches a copy of the decoder
-/// cache and live-patches the running one, which needs shared mutable
-/// decoder entries).
-#[derive(Debug)]
-pub(crate) struct BackgroundJit {
-    pub(crate) segment: Arc<DecodedSegment>,
-    /// In a mutex only to keep `Machine` `Sync`; it is never locked
-    /// (`poll` takes `&mut self`).
-    result: Mutex<Receiver<Option<Compiled>>>,
-    /// Keeps a test job's channel open forever.
-    #[cfg(test)]
-    _never: Option<mpsc::SyncSender<Option<Compiled>>>,
-}
-
-/// The state of a [`BackgroundJit`].
-pub(crate) enum BackgroundResult {
-    Pending,
-    /// Finished; `None` if nothing could be compiled (or the thread died).
-    Done(Option<Compiled>),
-}
-
-impl BackgroundJit {
-    /// Start compiling `segment` (with the guest address mask `mask`, see
-    /// [`JitSegment::compile`]) on a new thread. If no thread can be
-    /// started, compiles synchronously instead.
-    pub(crate) fn spawn(segment: &Arc<DecodedSegment>, mask: u64) -> Self {
-        let (tx, rx) = mpsc::sync_channel(1);
-        let shared = Arc::clone(segment);
-        let spawned = std::thread::Builder::new()
-            .name("libriscv-jit".into())
-            .spawn(move || {
-                // The machine may be gone by now: then nobody listens.
-                let _ = tx.send(JitSegment::compile(&shared, mask));
-            });
-        let result = match spawned {
-            Ok(_) => rx,
-            Err(_) => {
-                let (tx, rx) = mpsc::sync_channel(1);
-                let _ = tx.send(JitSegment::compile(segment, mask));
-                rx
-            }
-        };
-        Self {
-            segment: Arc::clone(segment),
-            result: Mutex::new(result),
-            #[cfg(test)]
-            _never: None,
+/// Compile `segment` (with the guest address mask `mask`, see
+/// [`JitSegment::compile`]) on a new thread (`MachineOptions::jit_background`,
+/// C++ `asmjit_background_callback`), which publishes the result in the
+/// segment ([`DecodedSegment::finish_background_jit`]). Every machine
+/// holding the segment (forks, and machines sharing it through the
+/// process-wide cache) keeps interpreting it meanwhile, and switches to the
+/// compiled copy at its next slice. If no thread can be started, compiles
+/// synchronously instead.
+pub(crate) fn spawn_background(segment: &Arc<DecodedSegment>, mask: u64) {
+    /// Publishes "nothing compiled" if the compilation panics, so that
+    /// nobody waits for it forever. (No effect after a real result.)
+    struct Finish(Arc<DecodedSegment>);
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            self.0.finish_background_jit(None);
         }
     }
-
-    /// A job that never finishes.
-    #[cfg(test)]
-    pub(crate) fn never(segment: &Arc<DecodedSegment>) -> Self {
-        let (tx, rx) = mpsc::sync_channel(1);
-        Self {
-            segment: Arc::clone(segment),
-            result: Mutex::new(rx),
-            _never: Some(tx),
-        }
-    }
-
-    /// Poll for the result, or with `wait`, block until it's there.
-    pub(crate) fn poll(&mut self, wait: bool) -> BackgroundResult {
-        let result = self
-            .result
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner);
-        if wait {
-            return BackgroundResult::Done(result.recv().ok().flatten());
-        }
-        match result.try_recv() {
-            Ok(compiled) => BackgroundResult::Done(compiled),
-            Err(TryRecvError::Empty) => BackgroundResult::Pending,
-            Err(TryRecvError::Disconnected) => BackgroundResult::Done(None),
-        }
+    segment.begin_background_jit();
+    let finish = Finish(Arc::clone(segment));
+    let spawned = std::thread::Builder::new()
+        .name("libriscv-jit".into())
+        .spawn(move || {
+            let compiled = JitSegment::compile(&finish.0, mask);
+            finish.0.finish_background_jit(compiled);
+        });
+    if spawned.is_err() {
+        segment.finish_background_jit(JitSegment::compile(segment, mask));
     }
 }
 
@@ -344,10 +290,9 @@ mod tests {
         m.install_syscall_handler(500, observe);
         m.install_syscall_handler(501, stop);
         m.install_syscall_handler(502, extend);
-        let seg = std::sync::Arc::new(crate::DecodedSegment::empty());
         m.init_execute_area(code, V).unwrap();
         if slice.is_some() {
-            m.memory.hold_jit_pending(&seg);
+            m.memory.hold_jit_pending();
             assert!(m.jit_pending());
         }
         m.cpu.jump(V).unwrap();
