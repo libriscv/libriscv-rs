@@ -477,13 +477,33 @@ impl DecodedSegment {
         }
         let begin = self.index(self.begin);
         let last = self.index(addr);
-        // 1. Look back to find the beginning of the block.
-        let block_bytes = |i: usize| self.cache.get(i).map_or(0, DecoderEntry::block_bytes);
+        // 1. Look back to find the beginning of the block: every instruction
+        // of the block ends it at the same address. C++ looks back while
+        // the distance to the end grows, which with the C extension stops
+        // at the second half of a 4-byte instruction (an empty, invalid
+        // entry: distance 0). The patched entry then stayed in the middle
+        // of its block, where the dispatcher's PC is the block's end, so a
+        // fast-path function or breakpoint after a 4-byte instruction in
+        // the same block was never recognised. Those entries are skipped
+        // here; anything else not ending the block at the same address
+        // belongs to an earlier block. (Without the C extension this is
+        // C++'s look-back.)
+        let block_end = |i: usize| {
+            self.cache
+                .get(i)
+                .map(|e| self.address_of(i).wrapping_add(e.block_bytes()))
+        };
+        let end = block_end(last);
         let mut current = last;
-        let mut last_block_bytes = block_bytes(current);
-        while current > begin && block_bytes(current - 1) > last_block_bytes {
-            current -= 1;
-            last_block_bytes = block_bytes(current);
+        let mut j = last;
+        while j > begin && last - j < 256 {
+            j -= 1;
+            if block_end(j) == end {
+                current = j;
+            } else if !(COMPRESSED && self.cache.get(j).is_some_and(|e| e.invalid && e.instr == 0))
+            {
+                break;
+            }
         }
         // 2. Find the start address of the block.
         let block_begin_addr = addr.wrapping_sub(DIVISOR * (last - current) as u64);

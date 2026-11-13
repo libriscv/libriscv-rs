@@ -265,3 +265,43 @@ fn instructions_before_a_breakpoint_are_counted() {
     // as without the C extension.
     assert_eq!(a0, 2 * 1000);
 }
+
+/// A breakpoint (or libc fast-path function) after a 4-byte instruction
+/// in the same block ends the block too. With the C extension the look-back
+/// for the block's start stopped at the empty second half of the 4-byte
+/// instruction, as in C++, leaving the breakpoint in the middle of its
+/// block: its handler saw the block's last PC, so a fast-path function
+/// there wasn't recognised. Found while investigating a `libcfuzzer`
+/// finding.
+#[test]
+#[cfg(feature = "ext-c")]
+fn a_breakpoint_after_a_4_byte_instruction_ends_its_block() {
+    // V: addi a0, a0, 1; V+4: c.addi a0, 1; V+6: breakpoint (c.nop);
+    // V+8: c.j back.
+    let mut code = 0x0015_0513u32.to_le_bytes().to_vec();
+    for half in [0x0505u16, 0x0001, 0xbfe5] {
+        code.extend(half.to_le_bytes());
+    }
+    let options = MachineOptions {
+        memory_max: 1 << 20,
+        ebreak_locations: vec![libriscv::EbreakLocation::Address(V + 6)],
+        ..Default::default()
+    };
+    let mut m = Machine::new(&[], options).unwrap();
+    m.init_execute_area(&code, V).unwrap();
+    m.set_userdata(std::sync::atomic::AtomicU64::new(0));
+    m.install_syscall_handler(SYSCALL_EBREAK_NR, |m| {
+        let pc = m.cpu.pc();
+        if let Some(seen) = m.userdata::<std::sync::atomic::AtomicU64>() {
+            seen.store(pc, std::sync::atomic::Ordering::Relaxed);
+        }
+        m.cpu.jump(V)
+    });
+    m.cpu.jump(V).unwrap();
+    let err = m.simulate(3000).unwrap_err();
+    assert_eq!(err.kind, ExceptionKind::MaxInstructionsReached);
+    let seen = m.userdata::<std::sync::atomic::AtomicU64>().unwrap();
+    assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), V + 6);
+    // Three instructions per round, the breakpoint included.
+    assert_eq!(m.cpu.reg(REG_ARG0), 2 * 1000);
+}
