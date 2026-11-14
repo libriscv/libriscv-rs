@@ -1228,6 +1228,10 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   the libc fast path returns the difference of the first differing
   (unsigned) bytes, what C++'s slow path returns; its fast paths return
   the host `std::memcmp`'s value, whose magnitude depends on the host libc.
+  Outside the arena it compares a page-bounded stretch at a time, not a
+  byte at a time with two page lookups per byte as C++ does (same result
+  and faults): one native memcmp of up to 512 MiB runs before its penalty
+  is charged, so the instruction limit can't bound it.
 - Not reproduced (C++ bugs): `ppoll` with a NULL timeout faults in C++;
   killing a suspended thread (`tgkill`) leaves a dangling pointer in C++'s
   scheduler lists, here the thread is removed from them; a signal number

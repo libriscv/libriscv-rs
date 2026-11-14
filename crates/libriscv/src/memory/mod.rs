@@ -1111,4 +1111,71 @@ mod tests {
         mem.memdiscard(0, u64::MAX, true).unwrap();
         assert_eq!(mem.read_u64(0x8000).unwrap(), 0);
     }
+
+    /// The guest-to-guest `memcmp` outside the arena gives what C++'s byte
+    /// loop gives: the first difference, or the fault of the first
+    /// unreadable byte (p1's before p2's) when no difference comes first.
+    #[test]
+    fn memcmp_outside_the_arena_matches_a_byte_loop() {
+        fn byte_loop(mem: &Memory, p1: u64, p2: u64, len: u64) -> Result<i32> {
+            for i in 0..len {
+                let a = mem.read_u8(p1 + i)?;
+                let b = mem.read_u8(p2 + i)?;
+                if a != b {
+                    return Ok(i32::from(a) - i32::from(b));
+                }
+            }
+            Ok(0)
+        }
+        let a = 0x10_0000_0000; // outside the arena
+        let b = a + 0x10_0000;
+        let mut mem = empty_memory(MIB);
+        let data: Vec<u8> = (0..4 * PAGE_SIZE).map(|i| (i * 7 % 251) as u8).collect();
+        mem.memcpy(a, &data).unwrap();
+        mem.memcpy(b, &data).unwrap();
+        mem.write_u8(b + 2 * PAGE_SIZE + 5, 0xFF).unwrap();
+        mem.write_u8(a + 3 * PAGE_SIZE + 9, 0xFF).unwrap();
+        // Unreadable pages after both copies.
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        mem.set_page_attr(a + 4 * PAGE_SIZE, PAGE_SIZE, none)
+            .unwrap();
+        mem.set_page_attr(b + 3 * PAGE_SIZE, 2 * PAGE_SIZE, none)
+            .unwrap();
+        let outcome = |r: Result<i32>| r.map_err(|e| (e.kind, e.data));
+        for (o1, o2) in [(0, 0), (1, 0), (0, 3), (PAGE_SIZE - 1, 1), (100, 4000)] {
+            for len in [
+                1,
+                7,
+                PAGE_SIZE,
+                2 * PAGE_SIZE + 6,
+                3 * PAGE_SIZE,
+                5 * PAGE_SIZE,
+            ] {
+                let (p1, p2) = (a + o1, b + o2);
+                assert_eq!(
+                    outcome(mem.memcmp_guest_diff(p1, p2, len)),
+                    outcome(byte_loop(&mem, p1, p2, len)),
+                    "{o1:#x} {o2:#x} {len:#x}"
+                );
+            }
+        }
+    }
+
+    /// One memcmp system call of half a gigabyte (the most it allows) of
+    /// zero pages: the penalty only comes after it, so it has to be fast
+    /// itself (a `forkfuzzer` input took 27 s comparing a byte at a time).
+    #[test]
+    fn a_long_memcmp_outside_the_arena_is_fast() {
+        let mem = empty_memory(MIB);
+        let start = std::time::Instant::now();
+        let len = 512 << 20;
+        let a = 0x10_0000_0000;
+        assert_eq!(mem.memcmp_guest_diff(a, a + len + 1, len).unwrap(), 0);
+        assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
+    }
 }
