@@ -90,6 +90,66 @@ jobs:
       - name: Test the JIT without the C extension
         run: cargo test -p libriscv --no-default-features --features jit
 
+  # Run the dynamically linked STREAM benchmark through ld.so and the
+  # riscv64 glibc, and check that it completes with validated results:
+  # interpreted, with the JIT (cold cache), and with the JIT again, which
+  # must use the cached code of ld.so and libc.
+  stream:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install riscv64 glibc (ld.so and shared libraries)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-riscv64-cross
+
+      - run: cargo build --release -p rvlinux --features jit
+
+      - name: Run STREAM
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The guest's ld.so opens the program itself, so the path must be absolute.
+          prog="$PWD/binaries/STREAM/stream.dyn"
+          cache="$RUNNER_TEMP/rvlinux-jit-cache"
+          rm -rf "$cache"
+
+          # run NAME [rvlinux args...]: run STREAM, check it, set $ms.
+          run() {
+            local name=$1; shift
+            echo "::group::$name"
+            local start=$(date +%s%N)
+            ./target/release/rvlinux "$@" "$prog" > "$name.out" 2> "$name.err"
+            ms=$(( ($(date +%s%N) - start) / 1000000 ))
+            cat "$name.out" "$name.err"
+            echo "::endgroup::"
+            echo "$name: ${ms} ms"
+            grep -q '^Triad:' "$name.out"
+            grep -q '^Solution Validates' "$name.out"
+            grep -q '^>>> Program exited, exit code = 0 ' "$name.out"
+          }
+
+          run interpreter
+
+          run jit-cold -j --jit-cache-dir "$cache"
+          cold_ms=$ms
+          if [ -z "$(ls -A "$cache")" ]; then
+            echo "::error::The JIT cache is empty after the first --jit run"; exit 1
+          fi
+
+          run jit-cached -j --jit-cache-dir "$cache"
+          if grep -q 'Saving JIT code' jit-cached.err; then
+            echo "::error::The second --jit run compiled system code again"; exit 1
+          fi
+          # Cold, the run waits for ld.so and libc to compile and be saved.
+          if [ $(( ms * 2 )) -ge "$cold_ms" ]; then
+            echo "::error::Cached --jit run (${ms} ms) is not faster than the cold one (${cold_ms} ms)"; exit 1
+          fi
+
   features:
     runs-on: ubuntu-24.04
     steps:
