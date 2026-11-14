@@ -1256,7 +1256,11 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   (a C++ TODO). Guest-to-guest copies use `Memory::memcpy_within`
   (C++ `memcpy(dst, machine, src, len)` with the same machine), which
   copies overlapping arena ranges like `memmove` (C++'s `std::memcpy`
-  leaves that undefined).
+  leaves that undefined). Outside the arena it copies a page-bounded
+  chunk at a time where C++ loads and stores a byte or word at a time,
+  with the same memory, faults and created pages (overlap and C++'s
+  arena shortcut included; tested against the loop): one native memcpy of
+  up to 512 MiB runs before its penalty is charged.
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).
