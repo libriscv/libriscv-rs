@@ -454,16 +454,28 @@ impl Memory {
             let s2 = page2.get(o2..o2 + n).unwrap_or_default();
             return Ok(diff(s1, s2));
         }
+        // C++ compares a byte at a time here, looking both pages up for
+        // every byte. Compare the stretches where neither address crosses
+        // a page instead: the same pages are read in the same order (p1's,
+        // then p2's), so the result and any fault are the same, without
+        // a lookup per byte (up to MEMCPY_MAX of them per call, before the
+        // instruction limit can stop anything).
         let (mut p1, mut p2, mut len) = (p1, p2, len);
         while len > 0 {
-            let v1 = self.byte_at(p1)?;
-            let v2 = self.byte_at(p2)?;
-            if v1 != v2 {
-                return Ok(i32::from(v1) - i32::from(v2));
+            let o1 = p1 & PAGE_MASK;
+            let o2 = p2 & PAGE_MASK;
+            let chunk = len.min(PAGE_SIZE - o1).min(PAGE_SIZE - o2);
+            let page1 = self.get_readable_pageno(p1 / PAGE_SIZE)?;
+            let page2 = self.get_readable_pageno(p2 / PAGE_SIZE)?;
+            let (o1, o2, n) = (o1 as usize, o2 as usize, chunk as usize);
+            let s1 = page1.get(o1..o1 + n).unwrap_or_default();
+            let s2 = page2.get(o2..o2 + n).unwrap_or_default();
+            if s1 != s2 {
+                return Ok(diff(s1, s2));
             }
-            p1 = p1.wrapping_add(1);
-            p2 = p2.wrapping_add(1);
-            len -= 1;
+            p1 = p1.wrapping_add(chunk);
+            p2 = p2.wrapping_add(chunk);
+            len -= chunk;
         }
         Ok(0)
     }
