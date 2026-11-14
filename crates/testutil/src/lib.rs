@@ -613,6 +613,11 @@ fn run_emulator(emu: &Path, flags: &[&str], elf: &Path, args: &[&str]) -> io::Re
         .arg(elf)
         .args(args)
         .stdin(Stdio::null())
+        // Never the user's cache (`rvlinux --jit` caches system libraries).
+        .env(
+            "XDG_CACHE_HOME",
+            workspace_root().join("target").join("test-cache"),
+        )
         .output()?;
     Ok(parse_run_output(
         &String::from_utf8_lossy(&out.stdout),

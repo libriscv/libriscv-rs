@@ -59,7 +59,9 @@ fn run_in_mode(mode: Mode, scenario: impl FnOnce()) {
 fn mode_flags(elf: &Path) -> Option<&'static [&'static str]> {
     match MODE.get() {
         Mode::Interp => Some(&[]),
-        Mode::Jit => Some(&["--jit"]),
+        // Without the cache directory: every run compiles, and none waits
+        // at exit to save libc.so (`tests/jit_cache.rs` tests the cache).
+        Mode::Jit => Some(&["--jit", "--no-jit-cache"]),
         Mode::JitUpfront => {
             let dynamic = std::fs::read(elf)
                 .ok()

@@ -13,7 +13,8 @@
 //!
 //! Code linked into the program is found automatically, and shared objects
 //! are added with [`load_shared_object`], both into one process-wide
-//! registry. When a machine creates an execute segment, it first looks for
+//! registry. A [`CacheDir`] automates this for chosen segments, one shared
+//! object per segment. When a machine creates an execute segment, it first looks for
 //! code for it there (`MachineOptions::jit_cache`); only otherwise does the
 //! JIT compile it. Code is keyed on the segment (address, length, contents,
 //! execute-only, libc fast path), the memory layout baked into the code
@@ -32,11 +33,12 @@
 //! [`Image::entries`]), then the patch count and the patched decoder
 //! indices (`u32`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use cranelift_codegen::ir::LibCall;
 use libriscv_jit_rt::{
@@ -256,6 +258,159 @@ pub fn load_shared_object(path: impl AsRef<Path>) -> io::Result<usize> {
 /// embedded in the program plus those from loaded shared objects.
 pub fn registered_segments() -> usize {
     registry().as_ref().map_or(0, |r| r.units.len())
+}
+
+/// A directory of cached JIT code that machines use and fill by
+/// themselves (`MachineOptions::jit_cache_dir`): the counterpart of C++'s
+/// translation cache (`translation_cache`, one `dlopen`ed `.so` per
+/// segment hash). Only the segments it [covers](Self::covers) take part.
+/// For each, a machine with `jit` loads the segment's shared object from
+/// the directory if there is one, and otherwise compiles the segment and
+/// writes it there (linking with `$CC` or `cc`), so later runs find it.
+///
+/// Meant for code that stays the same from run to run, like a system's
+/// dynamic linker and libraries mapped at fixed addresses (code is keyed
+/// by address): a cached program that is rebuilt often leaves a stale
+/// file for every build. Files are kept per build of the JIT (a
+/// subdirectory named after its fingerprint); nothing is ever removed.
+///
+/// Loading a shared object runs native code from it: only use a directory
+/// that nobody else can write to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDir {
+    pub path: PathBuf,
+    /// Cache the machine's initial execute segment (the one created from
+    /// the ELF program the machine was created with).
+    pub initial_segment: bool,
+    /// Cache the segments lying entirely inside one of these address
+    /// ranges.
+    pub ranges: Vec<Range<u64>>,
+}
+
+impl CacheDir {
+    /// True if the segment of `len` bytes at `vaddr` is cached here.
+    pub(crate) fn covers(&self, vaddr: u64, len: u64, initial: bool) -> bool {
+        (initial && self.initial_segment)
+            || vaddr
+                .checked_add(len)
+                .is_some_and(|end| self.ranges.iter().any(|r| r.start <= vaddr && end <= r.end))
+    }
+
+    /// The file holding the code for `key`.
+    pub(crate) fn file(&self, key: &CacheKey) -> PathBuf {
+        let words: Vec<u8> = key.words().iter().flat_map(|w| w.to_le_bytes()).collect();
+        self.path.join(format!("{:016x}", key.build)).join(format!(
+            "{:x}-{:016x}.so",
+            key.vaddr,
+            crate::codegen::hash64(&words)
+        ))
+    }
+}
+
+/// The cache files this process has tried loading (once each).
+static LOADED_FILES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Load the cache file `file` into the registry, if it exists and this
+/// process hasn't tried before.
+pub(crate) fn load_file(file: &Path, verbose: bool) {
+    if !file.exists() {
+        return;
+    }
+    {
+        let mut loaded = LOADED_FILES.lock().unwrap_or_else(PoisonError::into_inner);
+        if !loaded
+            .get_or_insert_with(HashSet::new)
+            .insert(file.to_owned())
+        {
+            return;
+        }
+    }
+    match load_shared_object(file) {
+        Ok(n) if verbose => eprintln!(
+            "libriscv: Loaded cached JIT code for {n} segments from {}",
+            file.display()
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            if verbose {
+                eprintln!("libriscv: Could not load {}: {e}", file.display());
+            }
+        }
+    }
+}
+
+/// Write `image`, compiled for `key`, to the cache file `file`. Written
+/// to a temporary name first and renamed, so other processes never see a
+/// partial file.
+pub(crate) fn save_file(key: CacheKey, image: &Image, file: &Path, verbose: bool) {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let output = JitCacheOutput::new();
+    output.record(key, image);
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp);
+    let saved = file
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| output.write_shared_object(&tmp))
+        .and_then(|()| std::fs::rename(&tmp, file));
+    match saved {
+        Ok(()) if verbose => eprintln!(
+            "libriscv: Saved JIT code for the segment at 0x{:X} to {}",
+            key.vaddr,
+            file.display()
+        ),
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if verbose {
+                eprintln!("libriscv: Could not save {}: {e}", file.display());
+            }
+        }
+    }
+}
+
+/// Cache files being written by background compilations.
+static PENDING_SAVES: Mutex<usize> = Mutex::new(0);
+static SAVES_DONE: Condvar = Condvar::new();
+
+/// Counts a background compilation that will write a cache file, until
+/// dropped.
+pub(crate) struct PendingSave(());
+
+impl PendingSave {
+    pub(crate) fn new() -> Self {
+        *PENDING_SAVES.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        Self(())
+    }
+}
+
+impl Drop for PendingSave {
+    fn drop(&mut self) {
+        let mut n = PENDING_SAVES.lock().unwrap_or_else(PoisonError::into_inner);
+        *n = n.saturating_sub(1);
+        SAVES_DONE.notify_all();
+    }
+}
+
+/// The number of background compilations that are going to write a file
+/// to a [`CacheDir`].
+pub fn pending_saves() -> usize {
+    *PENDING_SAVES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Wait until every background compilation that writes to a [`CacheDir`]
+/// has written its file. Background compilations don't keep the process
+/// alive: call this before exiting so that their code is saved.
+pub fn wait_for_saves() {
+    let mut n = PENDING_SAVES.lock().unwrap_or_else(PoisonError::into_inner);
+    while *n > 0 {
+        n = SAVES_DONE.wait(n).unwrap_or_else(PoisonError::into_inner);
+    }
 }
 
 /// Collects the code the JIT compiles, to save it with

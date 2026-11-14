@@ -55,6 +55,11 @@ pub(crate) fn spawn_background(
         }
     }
     segment.begin_background_jit();
+    // Writing a cache file: `cache::wait_for_saves` waits for it.
+    let pending = save
+        .as_ref()
+        .filter(|s| s.file.is_some())
+        .map(|_| cache::PendingSave::new());
     let finish = Finish(Arc::clone(segment));
     let fallback = save.clone();
     let spawned = std::thread::Builder::new()
@@ -62,6 +67,7 @@ pub(crate) fn spawn_background(
         .spawn(move || {
             let compiled = compile_and_load(&finish.0, layout, save.as_ref());
             finish.0.finish_background_jit(compiled);
+            drop(pending);
         });
     if spawned.is_err() {
         let compiled = compile_and_load(segment, layout, fallback.as_ref());
@@ -69,11 +75,15 @@ pub(crate) fn spawn_background(
     }
 }
 
-/// Where to save the code compiled for a segment (`MachineOptions::jit_cache_output`).
+/// Where to save the code compiled for a segment: to
+/// `MachineOptions::jit_cache_output` and/or to a file of
+/// `MachineOptions::jit_cache_dir`.
 #[derive(Debug, Clone)]
 pub(crate) struct Save {
     pub key: cache::CacheKey,
-    pub output: cache::JitCacheOutput,
+    pub output: Option<cache::JitCacheOutput>,
+    pub file: Option<std::path::PathBuf>,
+    pub verbose: bool,
 }
 
 /// Compile `exec` and patch its decoder entries to enter the native code
@@ -98,7 +108,12 @@ fn compile_and_load(
 ) -> Option<Compiled> {
     let image = compile(exec, layout)?;
     if let Some(save) = save {
-        save.output.record(save.key, &image);
+        if let Some(output) = &save.output {
+            output.record(save.key, &image);
+        }
+        if let Some(file) = &save.file {
+            cache::save_file(save.key, &image, file, save.verbose);
+        }
     }
     image.load()
 }

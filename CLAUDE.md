@@ -24,11 +24,13 @@ cargo test --workspace --features libriscv/jit,rvlinux/jit   # + Cranelift JIT, 
 cargo test --workspace --features libriscv/jit,rvlinux/jit,libriscv/aot-dylib,rvlinux/aot-dylib  # + AOT (needs rustc)
 rvlinux --jit-save-shared x.so prog.elf; rvlinux --jit-load x.so prog.elf   # JIT code cache (also --jit-save-object, RVLINUX_JIT_EMBED)
 rvlinux --aot-save-shared x.so prog.elf; rvlinux --aot-load x.so prog.elf   # AOT: translate to safe Rust (also --aot-save x.rs, RVLINUX_AOT_EMBED)
+rvlinux -j dynamic.elf                       # caches ld.so + system libraries in ~/.cache/rvlinux/jit by itself (--jit-cache-dir, --no-jit-cache)
 ```
 
-Expected durations (warm build, 32 cores): the whole suite ~25 s with the JIT
-features (`difftest.rs` ~14 s, bounded by one up-front JIT compile of static
-libstdc++), ~7 s without. Cranelift is always built optimized
+Expected durations (warm build, 32 cores): the whole suite ~42 s with the JIT
+features (test binaries run one after another: `difftest.rs` ~18 s, bounded
+by one up-front JIT compile of static libstdc++; `libriscv`'s tests ~21 s,
+`shared_rodata.rs`'s `jit_runs_on_shared_rodata` alone ~7 s), ~9 s without. Cranelift is always built optimized
 (`[profile.dev.package."*"]`); our crates stay at opt-level 0. A test that
 loops over many runs should be split into separate tests (see `difftests!`)
 so the harness runs them concurrently. Never `git stash` work to time HEAD.

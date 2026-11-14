@@ -31,6 +31,7 @@ struct CliArgs {
     jit_save_shared: Option<PathBuf>,
     jit_load: Vec<PathBuf>,
     no_jit_cache: bool,
+    jit_cache_dir: Option<PathBuf>,
     aot_save: Option<PathBuf>,
     aot_save_shared: Option<PathBuf>,
     aot_load: Vec<PathBuf>,
@@ -106,7 +107,13 @@ fn usage(name: &str) {
         );
         println!("      --jit-load file    Load saved code from a shared object (repeatable)");
         println!(
-            "      --no-jit-cache     Ignore saved code (loaded, or linked into this program)"
+            "      --no-jit-cache     Ignore saved code (loaded, linked into this program, or cached)"
+        );
+        println!(
+            "      --jit-cache-dir dir  Where --jit caches the code of the dynamic linker and system"
+        );
+        println!(
+            "                         libraries (default: $XDG_CACHE_HOME/rvlinux/jit or ~/.cache/rvlinux/jit)"
         );
     }
 }
@@ -168,6 +175,9 @@ fn parse_args() -> Result<CliArgs, String> {
                 args.jit_load.push(path(&mut it, "--jit-load")?);
             }
             "--no-jit-cache" if cfg!(feature = "jit") => args.no_jit_cache = true,
+            "--jit-cache-dir" if cfg!(feature = "jit") => {
+                args.jit_cache_dir = Some(path(&mut it, "--jit-cache-dir")?);
+            }
             "-Q" | "--quit" => args.quit = true,
             "--libc-fastpath" => args.libc_fastpath = true,
             "-f" | "--fuel" => args.fuel = Some(num(&mut it, "--fuel")?),
@@ -301,6 +311,8 @@ fn main() -> ExitCode {
         jit_cache: !args.no_jit_cache,
         #[cfg(feature = "jit")]
         jit_cache_output: jit_cache_output.clone(),
+        #[cfg(feature = "jit")]
+        jit_cache_dir: jit_cache_dir(&args, is_dynamic),
         aot: !args.no_aot,
         #[cfg(feature = "aot")]
         aot_output: aot_output.clone(),
@@ -322,6 +334,8 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let save = || {
+        #[cfg(feature = "jit")]
+        wait_for_jit_cache(&args);
         #[cfg(feature = "jit")]
         let status = save_jit_code(&args, jit_cache_output.as_ref());
         #[cfg(not(feature = "jit"))]
@@ -415,6 +429,45 @@ fn main() -> ExitCode {
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
     save()
+}
+
+/// The JIT cache directory for a dynamic executable: the code of the
+/// dynamic linker (the initial segment) and of the pinned libraries is
+/// the same in every program, so `--jit` saves it the first time and uses
+/// it from then on. The program's own code is never cached.
+#[cfg(feature = "jit")]
+fn jit_cache_dir(args: &CliArgs, is_dynamic: bool) -> Option<libriscv::jit_cache::CacheDir> {
+    if !is_dynamic || !args.jit || args.no_jit_cache {
+        return None;
+    }
+    let path = args.jit_cache_dir.clone().or_else(|| {
+        let cache = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+        Some(cache.join("rvlinux").join("jit"))
+    })?;
+    let pinned_end = LIBRARY_PIN_BASE + GUEST_LIBS.len() as u64 * LIBRARY_PIN_SLOT;
+    Some(libriscv::jit_cache::CacheDir {
+        path,
+        initial_segment: true,
+        ranges: std::iter::once(LIBRARY_PIN_BASE..pinned_end).collect(),
+    })
+}
+
+/// Background compilations still saving to the JIT cache directory would
+/// be lost when the process exits: wait for them.
+#[cfg(feature = "jit")]
+fn wait_for_jit_cache(args: &CliArgs) {
+    let n = libriscv::jit_cache::pending_saves();
+    if n == 0 {
+        return;
+    }
+    if !args.silent {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        eprintln!("rvlinux: Saving JIT code of {n} system segments for later runs...");
+    }
+    libriscv::jit_cache::wait_for_saves();
 }
 
 /// Write the code the JIT compiled to the `--jit-save-*` files.

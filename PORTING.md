@@ -671,6 +671,31 @@ compiles `libc.so`) and the embedded object (builds `rvlinux` again in
 `target/jit-embed`)). Not yet: saving code that came from the cache
 (a machine saving code compiles everything instead), AArch64.
 
+**Cache directory** (2026-11-14; C++'s `translation_cache`, which
+`dlopen`s `/tmp/rvbintr-<hash>.so` per segment, or compiles and writes
+it): `MachineOptions::jit_cache_dir` (a `jit_cache::CacheDir`: a path,
+whether it covers the initial segment, and address ranges). With `jit`,
+each segment it covers is looked up in
+`<dir>/<build fingerprint>/<vaddr>-<key hash>.so` (`dlopen`ed once per
+process), and if the JIT compiles it, written there (`write_shared_object`
+to a temporary name, then renamed, so concurrent processes are fine).
+The write is part of the compilation, also in the background; such
+compilations are counted, and `jit_cache::wait_for_saves` waits for them,
+since background threads don't keep a process alive. Unlike saving to a
+`JitCacheOutput`, it doesn't stop a machine from sharing segments.
+Nothing is ever deleted (a new build gets a new subdirectory).
+`rvlinux --jit` uses it for dynamic executables: the dynamic linker (the
+initial segment) and the pinned library slots (see "Execute segments
+from pages" under memory), never the program, in
+`--jit-cache-dir`, else `$XDG_CACHE_HOME/rvlinux/jit` or
+`~/.cache/rvlinux/jit`. `--no-jit-cache` turns it off. The first run
+waits at exit for the libraries still compiling (stderr says so);
+`libc.so`'s code is 36 MB. `stream.dyn` with `-j`: 3.5 s and 7.5 s of CPU
+compiling `libc.so` in the background every run before; 0.88 s with the
+cache (and the region and slicing fixes). Tests: `cache_directory` and
+the ignored `cache_directory_dynamic_executable` in `rvlinux`'s
+`tests/jit_cache.rs`.
+
 **N-bit address space** (C++ `translate_automatic_nbit_address_space`,
 `MachineOptions::jit_automatic_nbit_address_space`, `rvlinux
 --nbit-address-space`): with a power-of-two arena, native loads and stores

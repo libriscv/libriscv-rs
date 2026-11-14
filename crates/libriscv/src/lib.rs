@@ -83,10 +83,14 @@ mod jit;
 /// cache of compiled code, not a separate compiler. Code saved as an
 /// object file and linked into the program is found automatically; shared
 /// objects are loaded with [`load_shared_object`](jit_cache::load_shared_object).
-/// See [`MachineOptions::jit_cache`] and [`MachineOptions::jit_cache_output`].
+/// See [`MachineOptions::jit_cache`], [`MachineOptions::jit_cache_output`]
+/// and [`MachineOptions::jit_cache_dir`].
 #[cfg(feature = "jit")]
 pub mod jit_cache {
-    pub use crate::jit::cache::{JitCacheOutput, load_shared_object, registered_segments};
+    pub use crate::jit::cache::{
+        CacheDir, JitCacheOutput, load_shared_object, pending_saves, registered_segments,
+        wait_for_saves,
+    };
 }
 mod linux;
 mod machine;

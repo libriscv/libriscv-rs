@@ -86,6 +86,16 @@ pub struct MachineOptions {
     /// [`JitCacheOutput`]: crate::jit_cache::JitCacheOutput
     #[cfg(feature = "jit")]
     pub jit_cache_output: Option<crate::jit_cache::JitCacheOutput>,
+    /// With `jit` and `jit_cache`, a directory where the segments it
+    /// covers find their code from earlier runs, and where the JIT saves
+    /// their code when it compiles them (see [`CacheDir`]). Saving is part
+    /// of the compilation: with `jit_background`, call
+    /// [`jit_cache::wait_for_saves`] before exiting.
+    ///
+    /// [`CacheDir`]: crate::jit_cache::CacheDir
+    /// [`jit_cache::wait_for_saves`]: crate::jit_cache::wait_for_saves
+    #[cfg(feature = "jit")]
+    pub jit_cache_dir: Option<crate::jit_cache::CacheDir>,
     /// Run execute segments with code translated to Rust ahead of time
     /// (default on), where a translation for them is registered: compiled
     /// into the program ([`aot::register`]) or loaded from a shared object
@@ -170,6 +180,8 @@ impl Default for MachineOptions {
             jit_cache: true,
             #[cfg(feature = "jit")]
             jit_cache_output: None,
+            #[cfg(feature = "jit")]
+            jit_cache_dir: None,
             aot: true,
             #[cfg(feature = "aot")]
             aot_output: None,

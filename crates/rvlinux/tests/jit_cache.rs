@@ -1,5 +1,6 @@
 //! The JIT code cache: `--jit-save-object`, `--jit-save-shared`,
-//! `--jit-load` and code linked into `rvlinux` (`RVLINUX_JIT_EMBED`).
+//! `--jit-load`, code linked into `rvlinux` (`RVLINUX_JIT_EMBED`) and the
+//! cache directory `--jit` keeps for dynamic executables (`--jit-cache-dir`).
 //! Saved code must behave exactly like the JIT (and so the interpreter):
 //! the same output, exit code and instruction count, and it must only be
 //! used for the segments and memory layout it was compiled for.
@@ -164,6 +165,121 @@ fn quit_after_loading_saves_code() {
     assert_eq!(run(&elf, &["--jit-load", so_s]), run(&elf, &[]));
     let messages = cache_messages(&elf, &["--jit-load", so_s]);
     assert!(messages.contains("Found cached JIT code"), "{messages}");
+}
+
+/// An empty cache directory for `test`, in the target directory.
+fn cache_dir(test: &str) -> PathBuf {
+    let dir = scratch(test, "cache");
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// The files in the cache directory `dir` (one subdirectory per build).
+fn cached_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(builds) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = builds
+        .flat_map(|b| std::fs::read_dir(b.unwrap().path()).unwrap())
+        .map(|f| f.unwrap().path())
+        .collect();
+    files.sort();
+    files
+}
+
+/// `rvlinux` with `flags` and `elf`, which it quits after loading (`-Q`).
+/// Returns stderr.
+fn quit_after_loading(elf: &Path, flags: &[&str]) -> String {
+    let out = Command::new(rvlinux())
+        .arg("-Q")
+        .args(flags)
+        .arg(elf)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// With `--jit`, a dynamic executable's dynamic linker is saved to the
+/// cache directory by itself, and found there by the next run. (Only the
+/// dynamic linker: `-Q` quits before it maps anything.)
+#[test]
+fn cache_directory() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build("-O2");
+    let dir = cache_dir("dir");
+    let dir_s = dir.to_str().unwrap();
+    let flags = ["--jit", "--jit-cache-dir", dir_s];
+    // Not without --jit, nor with --no-jit-cache.
+    quit_after_loading(&elf, &["--jit-cache-dir", dir_s]);
+    quit_after_loading(&elf, &["--jit", "--jit-cache-dir", dir_s, "--no-jit-cache"]);
+    assert!(cached_files(&dir).is_empty());
+
+    let stderr = quit_after_loading(&elf, &flags);
+    let files = cached_files(&dir);
+    assert_eq!(files.len(), 1, "{files:?} {stderr}");
+    assert!(files[0].to_str().unwrap().ends_with(".so"), "{files:?}");
+
+    let mut verbose = vec!["-v"];
+    verbose.extend(flags);
+    let stderr = quit_after_loading(&elf, &verbose);
+    assert!(
+        stderr.contains("Found cached JIT code for the segment at 0x"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Saved"), "{stderr}");
+    assert_eq!(cached_files(&dir), files);
+
+    // A static executable is all program: nothing is cached.
+    let dir = cache_dir("dir-static");
+    quit_after_loading(
+        &build("-O2 -static"),
+        &["--jit", "--jit-cache-dir", dir.to_str().unwrap()],
+    );
+    assert!(cached_files(&dir).is_empty());
+}
+
+/// A dynamic executable runs from the cache directory the second time:
+/// `ld.so` and `libc.so` come from the cache, the program doesn't (and is
+/// compiled in the background, switching to native code while running),
+/// with the same results. Slow (~20 s): the first run compiles `libc.so`.
+#[test]
+#[ignore = "compiles all of libc.so (~20 s)"]
+fn cache_directory_dynamic_executable() {
+    if !have_tools() {
+        return;
+    }
+    let elf = build("-O2");
+    let dir = cache_dir("dir-dynamic");
+    let flags = ["--jit", "--jit-cache-dir", dir.to_str().unwrap()];
+    let expected = run(&elf, &[]);
+    // The first run waits for the compilation of libc.so to save it.
+    let first = run(&elf, &flags);
+    assert!(first.stderr.contains("Saving JIT code"), "{first:?}");
+    assert_eq!(
+        RunOutput {
+            stderr: String::new(),
+            ..first
+        },
+        expected
+    );
+    // ld.so and libc.so.
+    assert_eq!(cached_files(&dir).len(), 2, "{:?}", cached_files(&dir));
+    assert_eq!(run(&elf, &flags), expected);
+    let messages = cache_messages(&elf, &flags);
+    assert_eq!(
+        messages.matches("Found cached JIT code").count(),
+        2,
+        "{messages}"
+    );
+    assert_eq!(
+        messages.matches("No cached JIT code").count(),
+        1,
+        "{messages}"
+    );
+    assert_eq!(cached_files(&dir).len(), 2);
 }
 
 /// A missing or foreign file is an error, not a crash.

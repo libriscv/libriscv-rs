@@ -119,6 +119,9 @@ pub struct Memory {
     /// Save the code the JIT compiles (`MachineOptions::jit_cache_output`).
     #[cfg(feature = "jit")]
     jit_cache_output: Option<crate::jit::cache::JitCacheOutput>,
+    /// Use and fill a directory of cached code (`MachineOptions::jit_cache_dir`).
+    #[cfg(feature = "jit")]
+    jit_cache_dir: Option<crate::jit::cache::CacheDir>,
     /// `MachineOptions::verbose_loader`, for the JIT cache and translations.
     #[cfg(any(feature = "jit", feature = "aot"))]
     jit_verbose: bool,
@@ -285,6 +288,8 @@ impl Memory {
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
             jit_cache_output: options.jit_cache_output.clone(),
+            #[cfg(feature = "jit")]
+            jit_cache_dir: options.jit_cache_dir.clone(),
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
             #[cfg(feature = "aot")]
@@ -366,6 +371,8 @@ impl Memory {
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
             jit_cache_output: options.jit_cache_output.clone(),
+            #[cfg(feature = "jit")]
+            jit_cache_dir: options.jit_cache_dir.clone(),
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_verbose: options.verbose_loader,
             #[cfg(feature = "aot")]
@@ -591,12 +598,18 @@ impl Memory {
         };
         #[cfg(all(feature = "jit", not(feature = "aot")))]
         let (aot_saving, aot_lookup) = (false, false);
+        // A segment of the cache directory is looked up there, and saved
+        // there if the JIT compiles it.
         #[cfg(feature = "jit")]
-        let (jit_saving, jit_lookup) = {
+        let (jit_saving, jit_lookup, cache_dir) = {
             let saving = jit && self.jit_cache_output.is_some();
+            let dir = self.jit_cache_dir.as_ref().filter(|d| {
+                jit && self.jit_cache && !saving && d.covers(vaddr, code.len() as u64, initial)
+            });
             (
                 saving,
-                self.jit_cache && !saving && crate::jit::cache::any(),
+                self.jit_cache && !saving && (dir.is_some() || crate::jit::cache::any()),
+                dir,
             )
         };
         #[cfg(all(feature = "aot", not(feature = "jit")))]
@@ -633,10 +646,19 @@ impl Memory {
             let key = native_key
                 .filter(|_| jit_saving || jit_lookup)
                 .and_then(crate::jit::cache::cache_key);
+            let file = cache_dir.zip(key).map(|(d, k)| d.file(&k));
             let save = match (&self.jit_cache_output, key) {
                 (Some(output), Some(key)) if jit_saving => Some(crate::jit::Save {
                     key,
-                    output: output.clone(),
+                    output: Some(output.clone()),
+                    file: None,
+                    verbose,
+                }),
+                (_, Some(key)) if file.is_some() => Some(crate::jit::Save {
+                    key,
+                    output: None,
+                    file,
+                    verbose,
                 }),
                 _ => None,
             };
@@ -670,6 +692,9 @@ impl Memory {
             #[cfg(feature = "jit")]
             let cached = match cache_key.filter(|_| !translated) {
                 Some(key) => {
+                    if let Some(file) = save.as_ref().and_then(|s| s.file.as_deref()) {
+                        crate::jit::cache::load_file(file, verbose);
+                    }
                     let compiled = crate::jit::cache::lookup(&key, segment.cache.len());
                     if verbose {
                         let found = if compiled.is_some() { "Found" } else { "No" };
@@ -703,8 +728,10 @@ impl Memory {
         // shared. (C++ shares them anyway.)
         // A machine saving code compiles (or translates) its own segments:
         // a shared one may have been compiled before saving started.
+        // (Saving to the cache directory doesn't count: a shared segment is
+        // as good as one built here.)
         #[cfg(feature = "jit")]
-        let share = save.is_none();
+        let share = save.as_ref().is_none_or(|s| s.output.is_none());
         #[cfg(not(feature = "jit"))]
         let share = true;
         #[cfg(feature = "aot")]
