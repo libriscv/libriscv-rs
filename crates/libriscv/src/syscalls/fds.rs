@@ -57,6 +57,14 @@ pub struct FileDescriptors {
     pub filter_readlink: Option<PathFilter>,
     pub filter_stat: Option<StatFilter>,
     pub filter_ioctl: Option<IoctlFilter>,
+    /// Files whose `mmap` without an address (`ld.so` mapping a shared
+    /// library) goes to a fixed guest address: (filtered path, address).
+    /// The address is used when it is page aligned, the whole mapping fits
+    /// in the arena and that range of the mmap area is free; otherwise the
+    /// mapping goes where it would have gone. Not in C++: it keeps libraries
+    /// at the same address in every program, so code saved for them (the
+    /// JIT cache, AOT translations, both keyed by address) is found again.
+    pub pinned_mappings: Vec<(String, u64)>,
 }
 
 impl core::fmt::Debug for FileDescriptors {
@@ -84,6 +92,7 @@ impl Default for FileDescriptors {
             filter_readlink: None,
             filter_stat: None,
             filter_ioctl: None,
+            pinned_mappings: Vec::new(),
         }
     }
 }

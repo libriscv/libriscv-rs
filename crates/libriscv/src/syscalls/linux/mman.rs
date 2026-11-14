@@ -66,6 +66,57 @@ fn map_file(m: &mut Machine, vfd: i32, offset: u64, dst: u64, length: u64) -> Re
     Ok(true)
 }
 
+/// Take `[addr, addr + length)` from the mmap area if all of it is free
+/// (`MAP_FIXED_NOREPLACE`): above the cursor, which then moves past it
+/// (the skipped gap goes to the free list), or carved out of the free list.
+/// Changes nothing and returns false otherwise.
+fn claim_free_range(m: &mut Machine, addr: u64, length: u64, nextfree: &mut u64) -> bool {
+    let Some(end) = addr.checked_add(length) else {
+        return false;
+    };
+    if addr < m.memory.mmap_start() {
+        return false;
+    }
+    if addr >= *nextfree {
+        // Untouched territory: move the cursor above it, and donate the
+        // skipped gap to the free list.
+        if addr > *nextfree {
+            m.memory
+                .mmap_cache_mut()
+                .insert(*nextfree, addr - *nextfree);
+        }
+        *nextfree = end;
+        true
+    } else {
+        // Below the cursor: only if not occupied
+        m.memory.mmap_cache_mut().carve(addr, length)
+    }
+}
+
+/// Where a file mapping without an address goes when its file is pinned
+/// ([`FileDescriptors::pinned_mappings`](crate::FileDescriptors)): the pinned
+/// address, claimed from the mmap area, if the whole mapping fits in the
+/// arena there and nothing else is mapped there. Not a Linux feature: it
+/// keeps shared libraries at the same address in every program, so code
+/// saved for them (the JIT cache, AOT translations) is found again.
+fn pinned_address(m: &mut Machine, vfd: i32, length: u64) -> Option<u64> {
+    let fds = m.fds.as_deref_mut()?;
+    let path = fds.get(vfd)?.path.clone();
+    let addr = fds
+        .pinned_mappings
+        .iter()
+        .find_map(|(p, a)| (*p == path).then_some(*a))?;
+    let end = addr.checked_add(length)?;
+    if !addr.is_multiple_of(PAGE_SIZE) || end > m.memory.memory_arena_size() {
+        return None;
+    }
+    let mut nextfree = m.memory.mmap_address();
+    claim_free_range(m, addr, length, &mut nextfree).then(|| {
+        m.memory.set_mmap_address(nextfree);
+        addr
+    })
+}
+
 pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
     let addr_g = m.sysarg(0);
     let length = m.sysarg(1);
@@ -98,7 +149,14 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
             // File descriptors are disabled: fail like the kernel would.
             return failed(m);
         }
-        let dst = if addr_g == 0 {
+        let pinned = if addr_g == 0 && voff == 0 {
+            pinned_address(m, vfd, length)
+        } else {
+            None
+        };
+        let dst = if let Some(pin) = pinned {
+            pin
+        } else if addr_g == 0 {
             let Some(end) = nextfree.checked_add(length) else {
                 return failed(m);
             };
@@ -126,23 +184,7 @@ pub(super) fn syscall_mmap(m: &mut Machine) -> Result<()> {
     if addr_g != 0 && flags & MAP_FIXED_NOREPLACE != 0 {
         // MAP_FIXED_NOREPLACE maps at exactly the given address or fails
         // with EEXIST, and is never relocated.
-        let Some(end) = addr_g.checked_add(length) else {
-            return taken(m);
-        };
-        if addr_g < m.memory.mmap_start() {
-            return taken(m);
-        }
-        if addr_g >= nextfree {
-            // Untouched territory: move the cursor above it, and donate
-            // the skipped gap to the free list.
-            if addr_g > nextfree {
-                m.memory
-                    .mmap_cache_mut()
-                    .insert(nextfree, addr_g - nextfree);
-            }
-            nextfree = end;
-        } else if !m.memory.mmap_cache_mut().carve(addr_g, length) {
-            // Below the cursor and not entirely free: occupied
+        if !claim_free_range(m, addr_g, length, &mut nextfree) {
             return taken(m);
         }
         result = addr_g;

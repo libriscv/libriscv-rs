@@ -504,6 +504,27 @@ const GUEST_LIBS: [&str; 9] = [
     "libnss_dns.so.2",
     "libnss_files.so.2",
 ];
+/// Where `ld.so` maps the libraries in `GUEST_LIBS`: each in its own
+/// slot, in the order of the list, from `LIBRARY_PIN_BASE` up. A library
+/// stays at the same address in every program, so its saved JIT code or
+/// translation is found again (both are keyed by address). With an arena
+/// too small for a slot, or a library larger than one, the library is
+/// mapped where `mmap` would have put it.
+const LIBRARY_PIN_BASE: u64 = 1 << 30;
+const LIBRARY_PIN_SLOT: u64 = 16 << 20;
+
+fn pinned_libraries() -> Vec<(String, u64)> {
+    (0u64..)
+        .zip(GUEST_LIBS)
+        .map(|(i, lib)| {
+            (
+                format!("{REAL_LIBDIR}{lib}"),
+                LIBRARY_PIN_BASE + i * LIBRARY_PIN_SLOT,
+            )
+        })
+        .collect()
+}
+
 const SANDBOX_LIBDIR: &str = "/lib/riscv64-linux-gnu/";
 const REAL_LIBDIR: &str = "/usr/riscv64-linux-gnu/lib/";
 
@@ -528,6 +549,9 @@ fn setup_linux(
     if let Some(fds) = machine.fds_mut() {
         fds.permit_filesystem = !args.sandbox;
         fds.permit_sockets = !args.sandbox;
+        if is_dynamic {
+            fds.pinned_mappings = pinned_libraries();
+        }
         if args.proxy {
             if args.sandbox {
                 eprintln!("Warning: Proxy mode is enabled, but sandbox is also enabled");

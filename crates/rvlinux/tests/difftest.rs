@@ -1661,6 +1661,41 @@ fn dynamic_glibc_threads() {
     assert_eq!(out.exit_code, Some(123_666_123), "{}", out.stdout);
 }
 
+/// Libraries are pinned (`rvlinux`'s `LIBRARY_PIN_BASE`): `libc.so` and
+/// `libm.so` are at the same address for a small program and for one with
+/// a large data section mapped before them, as in C++.
+fn dynamic_pinned_libraries() {
+    if !have_tools() {
+        return;
+    }
+    let program = |padding: usize| {
+        format!(
+            r#"
+            #include <math.h>
+            #include <stdio.h>
+            static char padding[{padding}] = {{1}};
+            int main(int argc, char** argv) {{
+                printf("puts=%p cos=%p\n", (void*)&puts, (void*)&cos);
+                return padding[argc];
+            }}"#
+        )
+    };
+    let small = diff(&build_dynamic(&program(16), testutil::Lang::C, "-lm"));
+    let large = diff(&build_dynamic(&program(3 << 20), testutil::Lang::C, "-lm"));
+    assert_eq!(small.stdout, large.stdout);
+    // libc.so.6 is the fourth library, libm.so.6 the second: 16 MiB slots from 1 GiB
+    let addr = |name: &str| {
+        let hex = small.stdout.split(&format!("{name}=0x")).nth(1).unwrap();
+        u64::from_str_radix(
+            hex.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap(),
+            16,
+        )
+        .unwrap()
+    };
+    assert_eq!(addr("puts") >> 24, 0x43, "{}", small.stdout);
+    assert_eq!(addr("cos") >> 24, 0x41, "{}", small.stdout);
+}
+
 /// Code generated at runtime: written to an anonymous mapping, made
 /// executable with mprotect, rewritten (FENCE.I rebuilds the stale
 /// segment), and mapped far outside the arena. With `ARGC > 1` it jumps to a
@@ -1926,6 +1961,7 @@ difftests!(
     dynamic_glibc_program,
     dynamic_glibc_cxx,
     dynamic_glibc_threads,
+    dynamic_pinned_libraries,
     runtime_code,
     page_accounting,
     vmcall_after_exit,

@@ -981,6 +981,17 @@ guest open the program and the allow-listed libraries in
 `rvlinux` does. `ld.so` maps the program and libraries with
 `mmap`/`mprotect`, and their code becomes execute segments when first
 jumped to. Instruction counts match the oracle exactly, also for `dlopen`.
+The allow-listed libraries are pinned (`FileDescriptors::pinned_mappings`,
+also in C++ libriscv): `ld.so`'s first `mmap` of one (no address, offset 0)
+goes to its own 16 MiB slot from 1 GiB up, in list order (`libc.so.6` at
+`0x43000000`), if the range is inside the arena and free, and where `mmap`
+would have put it otherwise. Without pinning, a library's address depended
+on the size of the program `ld.so` mapped first, and the JIT cache and AOT
+translations, keyed by address, missed for every other program. With it,
+code saved for `libc.so`/`libstdc++.so` from one program is found for any
+other (a dynamic C++ program: 27 s compiling up front, 0.07 s from the
+cache). Tests: `pinned_file_mappings` (`libriscv`'s `tests/linux.rs`) and
+the `dynamic_pinned_libraries` difftest.
 
 Not ported yet: custom page fault/read/write handlers and execute fault
 handlers (embedding API, Phase 3), memory traps (`RISCV_MEMORY_TRAPS`,

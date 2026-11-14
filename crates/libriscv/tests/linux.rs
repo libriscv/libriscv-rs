@@ -346,6 +346,74 @@ fn file_system_sandbox() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// `FileDescriptors::pinned_mappings`: a pinned file mapped without an
+/// address (as `ld.so` maps a library) lands at its pinned address while
+/// that range is free and inside the arena, and where `mmap` would have
+/// put it otherwise.
+#[test]
+fn pinned_file_mappings() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    const PIN: u64 = 40 << 20;
+    let dir = std::env::temp_dir().join(format!("libriscv-pin-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("lib.so");
+    std::fs::write(&file, vec![0x5Au8; 8192]).unwrap();
+    let path = file.to_str().unwrap().to_owned();
+    let code = format!(
+        r#"
+        #include <fcntl.h>
+        #include <sys/mman.h>
+        #define PIN ((char*){PIN}ul)
+        static char* map(int fd, long off) {{
+            return mmap(0, 8192, PROT_READ, MAP_PRIVATE, fd, off);
+        }}
+        int main() {{
+            int fd = open("{path}", O_RDONLY);
+            if (fd < 0) return 1;
+            char* a = map(fd, 0);
+            if (a == MAP_FAILED || a[8191] != 0x5A) return 2;
+            if (a != PIN) return 100;
+            /* Taken: the next one goes elsewhere */
+            char* b = map(fd, 0);
+            if (b == MAP_FAILED || b == PIN || b[0] != 0x5A) return 3;
+            /* Only whole-file mappings (offset 0) are pinned */
+            munmap(a, 8192);
+            char* c = map(fd, 4096);
+            if (c == MAP_FAILED || c == PIN) return 4;
+            /* Free again (now on the free list): pinned again */
+            char* d = map(fd, 0);
+            if (d != PIN) return 5;
+            return 666;
+        }}"#
+    );
+    let binary = build(&code);
+    let run_pinned = |memory_max: u64, pin: Option<u64>| {
+        let options = MachineOptions {
+            memory_max,
+            ..Default::default()
+        };
+        let mut machine = Machine::new(&binary, options).unwrap();
+        machine.setup_linux_syscalls(true, false);
+        machine.setup_linux(&["linux_test"], &ENV).unwrap();
+        let fds = machine.fds_mut().unwrap();
+        fds.permit_filesystem = true;
+        if let Some(pin) = pin {
+            fds.pinned_mappings = vec![(path.clone(), pin)];
+        }
+        machine.simulate(MAX_INSTRUCTIONS).unwrap();
+        machine.return_value() as i32
+    };
+    assert_eq!(run_pinned(64 << 20, Some(PIN)), 666);
+    // Unpinned, or with the range outside the arena, or unaligned: where
+    // mmap puts it.
+    assert_eq!(run_pinned(64 << 20, None), 100);
+    assert_eq!(run_pinned(PIN + 4096, Some(PIN)), 100);
+    assert_eq!(run_pinned(64 << 20, Some(PIN + 1)), 100);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn signals_and_sigreturn() {
     if !testutil::need_compiler() {
