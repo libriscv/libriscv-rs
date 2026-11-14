@@ -1386,6 +1386,105 @@ mod tests {
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
     }
 
+    /// `set_page_attr` changes runs of existing pages through the index;
+    /// it must leave every page, the page count and any failure as C++'s
+    /// page-at-a-time loop does: gaps, arena pages, copy-on-write pages,
+    /// and running out of pages part of the way.
+    #[test]
+    fn set_page_attr_in_runs_matches_the_page_loop() {
+        const P: u64 = PAGE_SIZE;
+        let far = 0x10_0000_0000;
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        let exec = PageAttributes {
+            exec: true,
+            ..PageAttributes::default()
+        };
+        let setup = |max: u64| {
+            let mut mem = empty_memory(max);
+            // Owned pages with gaps, a zero page, arena pages.
+            for page in [0, 1, 2, 5, 6, 9] {
+                mem.write_u8(far + page * P, 1).unwrap();
+            }
+            mem.set_page_attr(far + 12 * P, P, read_only).unwrap();
+            mem.write_u8(0x3000, 1).unwrap();
+            mem.set_page_attr(0x5000, 2 * P, read_only).unwrap();
+            mem
+        };
+        let cases = [
+            (MIB, far / P, far / P + 16),
+            (MIB, far / P + 1, far / P + 7),
+            (MIB, far / P + 3, far / P + 5),
+            (MIB, 0, 2 * MIB / P),
+            (MIB, 2, 8),
+            // More missing pages than may be created.
+            (MIB, far / P - 300, far / P + 16),
+            (MIB, far / P + 4, far / P + 4000),
+        ];
+        let state = |mem: &Memory, first: u64, end: u64| {
+            let attrs: Vec<_> = (first..end.min(first + 5000))
+                .map(|p| mem.page_attributes(p * P).map_err(|e| e.data))
+                .collect();
+            (attrs, mem.pages_active())
+        };
+        for (i, &(max, first, end)) in cases.iter().enumerate() {
+            for attr in [read_only, none, exec] {
+                let (mut runs, mut reference) = (setup(max), setup(max));
+                let got = runs
+                    .set_page_attr(first * P, (end - first) * P, attr)
+                    .map_err(|e| (e.kind, e.data));
+                let expected = reference
+                    .set_page_attr_pagewise(first, end, attr)
+                    .map_err(|e| (e.kind, e.data));
+                assert_eq!(got, expected, "case {i} {attr:?}");
+                assert_eq!(
+                    state(&runs, first, end),
+                    state(&reference, first, end),
+                    "case {i} {attr:?}"
+                );
+                // Writing through the pages behaves the same afterwards.
+                for page in [0, 1, 2, 5, 12] {
+                    let addr = far + page * P;
+                    assert_eq!(
+                        runs.write_u8(addr, 7).map_err(|e| e.kind),
+                        reference.write_u8(addr, 7).map_err(|e| e.kind),
+                        "case {i} {attr:?} {addr:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// mprotect of every page of a 700 MiB arena is one guest instruction;
+    /// a `linuxfuzzer` input repeating it took 25 s looking each page up.
+    #[test]
+    fn set_page_attr_of_many_existing_pages_is_fast() {
+        let mut mem = empty_memory(512 * MIB);
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        mem.set_page_attr(0, 512 * MIB, read_only).unwrap();
+        let exec = PageAttributes {
+            exec: true,
+            ..read_only
+        };
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            mem.set_page_attr(0, 512 * MIB, exec).unwrap();
+            mem.set_page_attr(0, 512 * MIB, read_only).unwrap();
+        }
+        assert!(start.elapsed().as_secs() < 4, "{:?}", start.elapsed());
+    }
+
     /// The native memcpy outside the arena copies a page-bounded chunk at
     /// a time; it must leave memory, faults and created pages exactly as
     /// C++'s loop of loads and stores (`memcpy_within_elementwise`) does.

@@ -277,6 +277,32 @@ impl PageTable {
         self.slots.get_mut(slot).map(|s| &mut s.page)
     }
 
+    /// Set `attr` on the entries in `[first, end)`.
+    fn set_attr_in(&mut self, first: u64, end: u64, attr: PageAttributes) {
+        for (_, &slot) in self.index.range(first..end) {
+            if let Some(entry) = self.slots.get_mut(slot) {
+                entry.page.set_attr(attr);
+            }
+        }
+    }
+
+    /// Set `attr` on the entries from `first` on while they are
+    /// consecutive; returns the first page number in `[first, end)` without
+    /// an entry, if any.
+    fn set_attr_run(&mut self, first: u64, end: u64, attr: PageAttributes) -> Option<u64> {
+        let mut next = first;
+        for (&pageno, &slot) in self.index.range(first..end) {
+            if pageno != next {
+                break;
+            }
+            if let Some(entry) = self.slots.get_mut(slot) {
+                entry.page.set_attr(attr);
+            }
+            next += 1;
+        }
+        (next < end).then_some(next)
+    }
+
     /// The page numbers of the entries in `[first, end)`.
     fn pagenos_in(&self, first: u64, end: u64) -> Vec<u64> {
         self.index.range(first..end).map(|(&p, _)| p).collect()
@@ -1101,16 +1127,7 @@ impl Memory {
     /// Port of `Memory::set_pageno_attr`.
     fn set_pageno_attr(&mut self, pageno: u64, attr: PageAttributes) -> Result<()> {
         if let Some(page) = self.paging.get_mut(pageno) {
-            // Keep the copy-on-write state.
-            let is_cow = page.attr.is_cow;
-            page.attr = attr;
-            // A writable page showing the zero page is copy-on-write, and
-            // so is a fork's loaned page (C++ would write to the master's
-            // data).
-            if is_cow || (attr.write && (page.is_zero_page() || page.is_loaned())) {
-                page.attr.is_cow = true;
-                page.attr.write = false;
-            }
+            page.set_attr(attr);
             return Ok(());
         }
         // An arena page (C++ creates it through the page fault handler).
@@ -1178,10 +1195,7 @@ impl Memory {
             // Only existing pages change, besides the arena pages, which C++
             // creates. (C++ takes this path for ranges larger than the page
             // table, with the same result.)
-            let existing: Vec<u64> = self.paging.pagenos_in(first, end);
-            for pageno in existing {
-                self.set_pageno_attr(pageno, attr)?;
-            }
+            self.paging.set_attr_in(first, end, attr);
             let arena_end = end.min(self.arena_pages);
             if first < arena_end {
                 if self.paging.arena.any_missing(first, arena_end) {
@@ -1191,6 +1205,28 @@ impl Memory {
             }
             return Ok(());
         }
+        // Page by page in order, as C++ does, so a failure (out of memory)
+        // leaves the pages before it changed and those after it not. The
+        // existing pages are changed a run at a time, walking the index
+        // instead of looking each page up: an mprotect of every page of a
+        // large program is one guest instruction, and took ~9 ms.
+        let mut pageno = first;
+        while let Some(missing) = self.paging.set_attr_run(pageno, end, attr) {
+            self.set_pageno_attr(missing, attr)?;
+            pageno = missing + 1;
+        }
+        Ok(())
+    }
+
+    /// C++'s loop for a non-default [`set_page_attr`](Self::set_page_attr),
+    /// a page at a time: the reference its runs are tested against.
+    #[cfg(test)]
+    pub(super) fn set_page_attr_pagewise(
+        &mut self,
+        first: u64,
+        end: u64,
+        attr: PageAttributes,
+    ) -> Result<()> {
         for pageno in first..end {
             self.set_pageno_attr(pageno, attr)?;
         }
