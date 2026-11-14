@@ -9,7 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   # C++ libriscv commit used as the differential-testing oracle.
   # Keep in sync with PORTING.md.
-  LIBRISCV_CPP_REF: e806d46046fb4059ab6e605255852b9335386de2
+  LIBRISCV_CPP_REF: 9adb3f6618308111a3b1c5e3c407fdc246ce1916
   # eembc/coremark commit for the CoreMark difftest and benchmark.
   COREMARK_REF: eefc986ebd3452d6adde22eafaff3e5c859f29e4
 

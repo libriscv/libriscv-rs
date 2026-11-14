@@ -4,7 +4,7 @@ This is the plan and progress tracker for the port. Update the status column
 in the same commit that changes it.
 
 **Reference:** C++ libriscv at `../libriscv` (override with `$LIBRISCV_CPP`),
-tracking upstream commit `e806d46046fb4059ab6e605255852b9335386de2` (v1.11+).
+tracking upstream commit `9adb3f6618308111a3b1c5e3c407fdc246ce1916` (v1.11+).
 When the C++ side moves, bump this hash and the ones in
 `.github/workflows/ci.yml` and `fuzzing.yml` together.
 
