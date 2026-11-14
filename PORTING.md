@@ -416,6 +416,14 @@ system linker's GOT, pointing at `libm`.
   direct branches (loops stay inside) and over calls to their return
   address, stopping at called functions' entries, indirect jumps,
   uncompiled instructions and other regions, at most 512 instructions.
+  A region at the limit still takes in the rest of a loop of at most
+  1 KiB whose head it holds (up to 1024 instructions in all): a loop cut
+  in two makes every iteration a native call into the other region,
+  which reloads every register. STREAM built `-O0` (`stream.dyn`, whose
+  `main` is ~900 instructions with the kernels' loops across the limit)
+  ran its Copy kernel at 2.1 GB/s that way, 17.9 GB/s with the loops
+  whole. (C++ asmjit caps regions at 1024 instructions,
+  `asmjit_region_instr_max`, without regard for loops.)
   One Cranelift function per region, `tail` calling convention, signature
   `(state, pc, counter, depth) -> (target, counter)`.
 - Region-to-region transfers are native tail calls (`return_call`; indirect

@@ -27,6 +27,12 @@ pub(crate) use crate::native_code::block_icount;
 /// register allocator slows down on the calls in them (2048 compiled
 /// static glibc 15% slower than 512 and ran no faster).
 const MAX_REGION_INSNS: usize = 512;
+/// A region at its size limit still takes in the rest of a loop it holds
+/// the head of, if the loop is at most this long (bytes, from the head to
+/// the backward branch): cutting a loop in two would make every iteration
+/// a native call into the other region. Up to this size in all.
+const MAX_LOOP_BYTES: u64 = 1024;
+const MAX_REGION_INSNS_WITH_LOOPS: usize = 2 * MAX_REGION_INSNS;
 
 /// A compilable instruction.
 #[derive(Debug, Clone, Copy)]
@@ -200,6 +206,28 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
     a
 }
 
+/// True if `insns[i]` lies in one of the short `loops` whose head region
+/// `id` holds.
+fn in_held_loop(
+    exec: &DecodedSegment,
+    a: &Analysis,
+    loops: &[(u64, u64)],
+    id: RegionId,
+    i: usize,
+) -> bool {
+    let Some(pc) = a.insns.get(i).map(|ins| ins.pc) else {
+        return false;
+    };
+    // Heads within MAX_LOOP_BYTES before `pc`.
+    let from = loops.partition_point(|&(h, _)| h < pc.saturating_sub(MAX_LOOP_BYTES));
+    let to = loops.partition_point(|&(h, _)| h <= pc);
+    loops
+        .get(from..to)
+        .unwrap_or_default()
+        .iter()
+        .any(|&(head, back)| pc <= back && a.region_at(exec, head) == Some(id))
+}
+
 /// The direct successors of `ins` that stay in its region: fall-through,
 /// branch targets, `JAL x0` targets and a call's return address. Calls
 /// and indirect jumps leave.
@@ -241,6 +269,20 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         }
     }
     let fallback: Vec<u64> = a.insns.iter().map(|i| i.pc).collect();
+    // Short loops, `(head, backward branch)`, by head.
+    let mut loops: Vec<(u64, u64)> = a
+        .insns
+        .iter()
+        .filter_map(|ins| match ins.op {
+            JOp::Branch { target, .. } | JOp::Jal { rd: 0, target }
+                if target <= ins.pc && ins.pc - target <= MAX_LOOP_BYTES =>
+            {
+                Some((target, ins.pc))
+            }
+            _ => None,
+        })
+        .collect();
+    loops.sort_unstable();
 
     let mut work = Vec::new();
     for seed in seeds.into_iter().chain(fallback) {
@@ -256,8 +298,12 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         work.clear();
         work.push(start);
         while let Some(i) = work.pop() {
-            if region.insns.len() >= MAX_REGION_INSNS {
-                break;
+            if region.insns.len() >= MAX_REGION_INSNS
+                && (region.insns.len() >= MAX_REGION_INSNS_WITH_LOOPS
+                    || !in_held_loop(exec, a, &loops, id, i))
+            {
+                // Left for another region.
+                continue;
             }
             match a.region_of.get_mut(i) {
                 Some(r) if *r == usize::MAX => *r = id,
@@ -314,5 +360,90 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         if let Some(region) = a.regions.get_mut(r) {
             region.entries.insert(pc);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Machine, MachineOptions};
+
+    const V: u64 = 0x10000;
+    const ADDI: u32 = (1 << 20) | (10 << 15) | (10 << 7) | 0x13; // addi a0, a0, 1
+    const DEC: u32 = (0xFFF << 20) | (11 << 15) | (11 << 7) | 0x13; // addi a1, a1, -1
+    const JSELF: u32 = 0x6F; // j .
+
+    /// `bnez a1, offset`
+    const fn bnez(offset: i32) -> u32 {
+        let o = offset as u32;
+        ((o >> 12 & 1) << 31)
+            | ((o >> 5 & 0x3F) << 25)
+            | (11 << 15)
+            | (1 << 12)
+            | ((o >> 1 & 0xF) << 8)
+            | ((o >> 11 & 1) << 7)
+            | 0x63
+    }
+
+    fn analysed(words: &[u32]) -> (Machine, Analysis) {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut m = Machine::new(
+            &[],
+            MachineOptions {
+                memory_max: 1 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        m.init_execute_area(&code, V).unwrap();
+        let a = analyse(m.cpu.current_execute_segment());
+        (m, a)
+    }
+
+    /// A loop that the size limit would cut in two stays in one region:
+    /// otherwise every iteration is a native call into the other one.
+    #[test]
+    fn the_size_limit_keeps_short_loops_whole() {
+        let before = MAX_REGION_INSNS - 4;
+        let mut words = vec![ADDI; before];
+        // The loop: 8 instructions from its head to the branch back.
+        words.extend([ADDI; 6]);
+        words.push(DEC);
+        words.push(bnez(-7 * 4));
+        // After the loop: more than the limit allows.
+        words.extend(vec![ADDI; MAX_REGION_INSNS]);
+        words.push(JSELF);
+        let (m, a) = analysed(&words);
+        let exec = m.cpu.current_execute_segment();
+        let region = |i: usize| a.region_at(exec, V + 4 * i as u64);
+        let first = region(0);
+        assert!(first.is_some());
+        for i in before..before + 8 {
+            assert_eq!(region(i), first, "loop instruction {i}");
+        }
+        // The code after the loop isn't: a region doesn't grow any further.
+        assert_ne!(region(before + 8), first);
+        assert!(
+            a.regions
+                .iter()
+                .all(|r| r.insns.len() <= MAX_REGION_INSNS_WITH_LOOPS)
+        );
+    }
+
+    /// Long loops are still cut at the limit.
+    #[test]
+    fn the_size_limit_cuts_long_loops() {
+        let before = MAX_REGION_INSNS - 4;
+        let len = (MAX_LOOP_BYTES / 4) as usize + 8;
+        let mut words = vec![ADDI; before];
+        words.extend(vec![ADDI; len - 2]);
+        words.push(DEC);
+        words.push(bnez(-((len as i32 - 1) * 4)));
+        words.push(JSELF);
+        let (m, a) = analysed(&words);
+        let exec = m.cpu.current_execute_segment();
+        let region = |i: usize| a.region_at(exec, V + 4 * i as u64);
+        assert_eq!(region(MAX_REGION_INSNS - 1), region(0));
+        assert_ne!(region(MAX_REGION_INSNS), region(0));
     }
 }
