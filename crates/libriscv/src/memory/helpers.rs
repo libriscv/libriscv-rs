@@ -504,24 +504,23 @@ impl Memory {
             let s2 = page.get(off..off + data.len()).unwrap_or_default();
             return Ok(data.cmp(s2));
         }
-        let mut p2 = addr;
-        for &v1 in data {
-            let v2 = self.byte_at(p2)?;
-            if v1 != v2 {
-                return Ok(v1.cmp(&v2));
+        // C++ compares a byte at a time here, looking the page up for every
+        // byte. Compare a page's stretch at a time instead: the pages are
+        // read in the same order, so the result and any fault are the same.
+        let (mut data, mut p2) = (data, addr);
+        while !data.is_empty() {
+            let off = (p2 & PAGE_MASK) as usize;
+            let n = data.len().min(PAGE - off);
+            let page = self.get_readable_pageno(p2 / PAGE_SIZE)?;
+            let (s1, rest) = data.split_at(n);
+            let s2 = page.get(off..off + n).unwrap_or_default();
+            if s1 != s2 {
+                return Ok(s1.cmp(s2));
             }
-            p2 = p2.wrapping_add(1);
+            data = rest;
+            p2 = p2.wrapping_add(n as u64);
         }
         Ok(Ordering::Equal)
-    }
-
-    /// One readable byte, through the page table (the `memcmp` slow paths).
-    fn byte_at(&self, addr: u64) -> Result<u8> {
-        let page = self.get_readable_pageno(addr / PAGE_SIZE)?;
-        Ok(page
-            .get((addr & PAGE_MASK) as usize)
-            .copied()
-            .unwrap_or_default())
     }
 
     /// Port of `Memory::memcpy(address_t, Machine&, address_t, address_t)`:

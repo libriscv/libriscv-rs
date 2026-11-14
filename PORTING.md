@@ -1224,6 +1224,8 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   address_t, size_t)` compares the host byte as a signed `char`, flipping
   the result for bytes above 0x7F; here every path compares unsigned bytes
   (and returns an `Ordering`, since only `memcmp`'s sign is meaningful).
+  Across pages it compares a page's stretch at a time where C++ looks the
+  page up for every byte (same result and faults).
   The guest-to-guest `memcmp` behind the native memcmp system call and
   the libc fast path returns the difference of the first differing
   (unsigned) bytes, what C++'s slow path returns; its fast paths return
