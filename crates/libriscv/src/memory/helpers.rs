@@ -504,24 +504,23 @@ impl Memory {
             let s2 = page.get(off..off + data.len()).unwrap_or_default();
             return Ok(data.cmp(s2));
         }
-        let mut p2 = addr;
-        for &v1 in data {
-            let v2 = self.byte_at(p2)?;
-            if v1 != v2 {
-                return Ok(v1.cmp(&v2));
+        // C++ compares a byte at a time here, looking the page up for every
+        // byte. Compare a page's stretch at a time instead: the pages are
+        // read in the same order, so the result and any fault are the same.
+        let (mut data, mut p2) = (data, addr);
+        while !data.is_empty() {
+            let off = (p2 & PAGE_MASK) as usize;
+            let n = data.len().min(PAGE - off);
+            let page = self.get_readable_pageno(p2 / PAGE_SIZE)?;
+            let (s1, rest) = data.split_at(n);
+            let s2 = page.get(off..off + n).unwrap_or_default();
+            if s1 != s2 {
+                return Ok(s1.cmp(s2));
             }
-            p2 = p2.wrapping_add(1);
+            data = rest;
+            p2 = p2.wrapping_add(n as u64);
         }
         Ok(Ordering::Equal)
-    }
-
-    /// One readable byte, through the page table (the `memcmp` slow paths).
-    fn byte_at(&self, addr: u64) -> Result<u8> {
-        let page = self.get_readable_pageno(addr / PAGE_SIZE)?;
-        Ok(page
-            .get((addr & PAGE_MASK) as usize)
-            .copied()
-            .unwrap_or_default())
     }
 
     /// Port of `Memory::memcpy(address_t, Machine&, address_t, address_t)`:
@@ -727,12 +726,7 @@ impl Memory {
     /// the caller takes whole steps, keeping the check at the same places.
     /// Otherwise `src` never comes back to the arena after a chunk.
     fn paged_copy_chunk(&self, dst: u64, src: u64, len: u64) -> u64 {
-        let outside = |addr: u64| {
-            let pageno = addr / PAGE_SIZE;
-            pageno >= self.arena_pages
-                && pageno.saturating_mul(PAGE_SIZE) >= self.arena.len() as u64
-        };
-        if !outside(src) || !outside(dst) {
+        if !self.outside_arena(src) || !self.outside_arena(dst) {
             return 0;
         }
         let mut n = len
@@ -741,6 +735,96 @@ impl Memory {
         let ahead = dst.wrapping_sub(src);
         if ahead != 0 {
             n = n.min(ahead);
+        }
+        n
+    }
+
+    /// True if `addr`'s page is neither an arena page nor backed by the
+    /// arena: loads and stores there go through the page table, a page at
+    /// a time alike.
+    fn outside_arena(&self, addr: u64) -> bool {
+        let pageno = addr / PAGE_SIZE;
+        pageno >= self.arena_pages && pageno.saturating_mul(PAGE_SIZE) >= self.arena.len() as u64
+    }
+
+    /// Port of the backward half of C++'s native `memmove` (used when
+    /// `dst >= src`): loads and stores from the end, of words when `dst`,
+    /// `src` and `len` are all word-aligned, else of bytes. On a fault, the
+    /// bytes after it have been copied.
+    ///
+    /// Outside the arena it copies the longest chunk ending at the current
+    /// position that stays in one source and one destination page, and
+    /// that its own stores can't reach before it reads them: the result,
+    /// faults and created pages are the loop's, without a page lookup per
+    /// element (up to `MEMCPY_MAX` bytes per call, before the instruction
+    /// limit can stop anything).
+    pub(crate) fn memmove_backward(&mut self, dst: u64, src: u64, len: u64) -> Result<()> {
+        let words = dst.is_multiple_of(8) && src.is_multiple_of(8) && len.is_multiple_of(8);
+        let mut i = len;
+        while i != 0 {
+            let n = self.paged_copy_chunk_back(dst, src, i);
+            if n > 0 {
+                i -= n;
+                self.copy_paged_chunk(dst.wrapping_add(i), src.wrapping_add(i), n)?;
+            } else if words {
+                let v = self.read_u64(src.wrapping_add(i - 8))?;
+                self.write_u64(dst.wrapping_add(i - 8), v)?;
+                i -= 8;
+            } else {
+                let v = self.read_u8(src.wrapping_add(i - 1))?;
+                self.write_u8(dst.wrapping_add(i - 1), v)?;
+                i -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// C++'s loop for [`memmove_backward`](Self::memmove_backward),
+    /// element by element: the reference its chunks are tested against.
+    #[cfg(test)]
+    pub(super) fn memmove_backward_elementwise(
+        &mut self,
+        dst: u64,
+        src: u64,
+        len: u64,
+    ) -> Result<()> {
+        let mut i = len;
+        if dst.is_multiple_of(8) && src.is_multiple_of(8) && len.is_multiple_of(8) {
+            while i != 0 {
+                let v = self.read_u64(src.wrapping_add(i - 8))?;
+                self.write_u64(dst.wrapping_add(i - 8), v)?;
+                i -= 8;
+            }
+        } else {
+            while i != 0 {
+                let v = self.read_u8(src.wrapping_add(i - 1))?;
+                self.write_u8(dst.wrapping_add(i - 1), v)?;
+                i -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// How many bytes [`memmove_backward`](Self::memmove_backward) can copy
+    /// as one chunk ending at `dst + i` / `src + i`, or 0 to take one
+    /// element. Both ends must be outside the arena, and the chunk stays in
+    /// one page of each (keeping the loop's page-at-a-time faults: a
+    /// source page is read, then the destination page made writable, as
+    /// the chunk's first element does). Going backwards, a store can only
+    /// reach a later load when `dst` is behind `src` modulo 2^64 (the copy
+    /// wraps the address space), so then the chunk is no longer than that
+    /// distance. The bounds are multiples of 8 when the addresses are.
+    fn paged_copy_chunk_back(&self, dst: u64, src: u64, i: u64) -> u64 {
+        let (s_last, d_last) = (src.wrapping_add(i - 1), dst.wrapping_add(i - 1));
+        if !self.outside_arena(s_last) || !self.outside_arena(d_last) {
+            return 0;
+        }
+        let mut n = i
+            .min((s_last & PAGE_MASK) + 1)
+            .min((d_last & PAGE_MASK) + 1);
+        let behind = src.wrapping_sub(dst);
+        if behind != 0 {
+            n = n.min(behind);
         }
         n
     }

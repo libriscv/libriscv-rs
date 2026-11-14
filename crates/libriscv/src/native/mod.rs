@@ -53,22 +53,10 @@ pub(crate) fn native_memmove(m: &mut Machine, dst: u64, src: u64, len: u64) -> R
         let buffers = m.memory.gather_buffers(src, len, MEMCPY_BUFFERS)?;
         let data = buffers.concat();
         m.memory.memcpy(dst, &data)?;
-    } else if dst.is_multiple_of(8) && src.is_multiple_of(8) && len.is_multiple_of(8) {
-        // Copy whole registers backwards.
-        let mut i = len;
-        while i != 0 {
-            let v = m.memory.read_u64(src.wrapping_add(i - 8))?;
-            m.memory.write_u64(dst.wrapping_add(i - 8), v)?;
-            i -= 8;
-        }
     } else {
-        // Copy byte by byte backwards.
-        let mut i = len;
-        while i != 0 {
-            let v = m.memory.read_u8(src.wrapping_add(i - 1))?;
-            m.memory.write_u8(dst.wrapping_add(i - 1), v)?;
-            i -= 1;
-        }
+        // Copy backwards: whole registers when everything is aligned, else
+        // bytes.
+        m.memory.memmove_backward(dst, src, len)?;
     }
     m.penalize(2 * len);
     Ok(())

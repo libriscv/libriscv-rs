@@ -1290,6 +1290,8 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   address_t, size_t)` compares the host byte as a signed `char`, flipping
   the result for bytes above 0x7F; here every path compares unsigned bytes
   (and returns an `Ordering`, since only `memcmp`'s sign is meaningful).
+  Across pages it compares a page's stretch at a time where C++ looks the
+  page up for every byte (same result and faults).
   The guest-to-guest `memcmp` behind the native memcmp system call and
   the libc fast path returns the difference of the first differing
   (unsigned) bytes, what C++'s slow path returns; its fast paths return
@@ -1326,7 +1328,11 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   chunk at a time where C++ loads and stores a byte or word at a time,
   with the same memory, faults and created pages (overlap and C++'s
   arena shortcut included; tested against the loop): one native memcpy of
-  up to 512 MiB runs before its penalty is charged.
+  up to 512 MiB runs before its penalty is charged. The native memmove's
+  backward copy (`Memory::memmove_backward`, when `dst >= src`) does the
+  same: page-bounded chunks from the end, no longer than the distance by
+  which `dst` is behind `src` modulo 2^64, matching C++'s loop of word or
+  byte loads and stores from the end (tested against it).
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).
