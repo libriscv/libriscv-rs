@@ -103,6 +103,10 @@ pub struct Memory {
     /// (`MachineOptions::jit_automatic_nbit_address_space`).
     #[cfg(any(feature = "jit", feature = "aot"))]
     jit_arena_mask: u64,
+    /// Native code ignores the instruction limit
+    /// (`MachineOptions::jit_ignore_instruction_limit`).
+    #[cfg(any(feature = "jit", feature = "aot"))]
+    jit_unlimited: bool,
     /// Use cached JIT code (`MachineOptions::jit_cache`).
     #[cfg(feature = "jit")]
     jit_cache: bool,
@@ -256,6 +260,8 @@ impl Memory {
             jit_background: options.jit_background,
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_arena_mask: jit_arena_mask(options, arena_size),
+            #[cfg(any(feature = "jit", feature = "aot"))]
+            jit_unlimited: options.jit_ignore_instruction_limit,
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
@@ -333,6 +339,8 @@ impl Memory {
             jit_background: options.jit_background,
             #[cfg(any(feature = "jit", feature = "aot"))]
             jit_arena_mask: 0,
+            #[cfg(any(feature = "jit", feature = "aot"))]
+            jit_unlimited: options.jit_ignore_instruction_limit,
             #[cfg(feature = "jit")]
             jit_cache: options.jit_cache,
             #[cfg(feature = "jit")]
@@ -468,7 +476,8 @@ impl Memory {
     }
     /// The guest memory layout native code is built for and run with: the
     /// N-bit address mask, or (mask 0) the arena windows loads and stores
-    /// check against, as `read_*`/`write_*` do. The windows are final once
+    /// check against, as `read_*`/`write_*` do; and whether it ignores the
+    /// instruction limit. The windows are final once
     /// the program is loaded, before any execute segment is created.
     #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) const fn native_layout(&self) -> crate::native_code::MemoryLayout {
@@ -476,6 +485,7 @@ impl Memory {
             mask: self.jit_arena_mask,
             read: (RWREAD_BEGIN, self.read_boundary),
             write: (self.initial_rodata_end, self.write_boundary),
+            unlimited: self.jit_unlimited,
         }
     }
     /// The whole arena including the padding page, for native code.

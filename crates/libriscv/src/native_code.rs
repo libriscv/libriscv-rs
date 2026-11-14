@@ -45,20 +45,23 @@ pub(crate) const EXIT_DYNCALL: u64 = 5;
 /// The guest memory layout native code is built for: a non-zero `mask`
 /// (masked accesses, no windows: the N-bit address space), or the
 /// `(base, len)` windows of the arena that loads and stores check their
-/// address against, as `Memory::read_*`/`write_*` do.
+/// address against, as `Memory::read_*`/`write_*` do; and whether it
+/// ignores the instruction limit (`unlimited`).
 #[cfg(feature = "jit")]
 pub(crate) use libriscv_jit_rt::MemoryLayout;
 
 /// The guest memory layout native code is built for: a non-zero `mask`
 /// (masked accesses, no windows: the N-bit address space), or the
 /// `(base, len)` windows of the arena that loads and stores check their
-/// address against, as `Memory::read_*`/`write_*` do.
+/// address against, as `Memory::read_*`/`write_*` do; and whether it
+/// ignores the instruction limit (`unlimited`).
 #[cfg(all(feature = "aot", not(feature = "jit")))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MemoryLayout {
     pub mask: u64,
     pub read: (u64, u64),
     pub write: (u64, u64),
+    pub unlimited: bool,
 }
 
 /// What a call into native code ended with.
@@ -139,6 +142,17 @@ impl NativeCode {
             Self::Aot(ref code) => code.has_entry(i),
         }
     }
+
+    /// The code neither counts instructions nor checks the limit
+    /// (`MachineOptions::jit_ignore_instruction_limit`).
+    fn unlimited(&self) -> bool {
+        match *self {
+            #[cfg(feature = "jit")]
+            Self::Jit(ref code) => code.layout().unlimited,
+            #[cfg(feature = "aot")]
+            Self::Aot(ref code) => code.unlimited(),
+        }
+    }
 }
 
 /// The native code of one execute segment, and the decoder entries patched
@@ -177,6 +191,12 @@ impl NativeSegment {
     /// True if native code can be entered at decoder entry `i`.
     pub(crate) fn has_entry(&self, i: usize) -> bool {
         self.code.has_entry(i)
+    }
+
+    /// True if the code ignores the instruction limit: it leaves the
+    /// counter as it was entered with, and never halts for the limit.
+    pub(crate) fn unlimited(&self) -> bool {
+        self.code.unlimited()
     }
 
     /// True if the code was compiled by an earlier run of the JIT (see

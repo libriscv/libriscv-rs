@@ -1083,3 +1083,43 @@ fn machines_share_execute_segments() {
     d.wait_for_jit();
     assert!(same_segment(&c, &e) && same_segment(&d, &e));
 }
+
+/// A loop of 2^20 iterations, then system calls the interpreter runs
+/// until the limit stops it (each leaves native code).
+fn long_loop_then_syscalls() -> Vec<u8> {
+    words(&[
+        itype(0x13, 0, 10, 0, 0),      // li a0, 0
+        itype(0x13, 0, 11, 0, 1),      // li a1, 1
+        itype(0x13, 1, 11, 11, 20),    // slli a1, a1, 20
+        rtype(0x33, 0, 0, 10, 10, 11), // add a0, a0, a1
+        itype(0x13, 0, 11, 11, -1),    // addi a1, a1, -1
+        btype(1, 11, 0, -8),           // bnez a1, -8
+        itype(0x13, 0, 17, 0, 300),    // li a7, 300 (unhandled syscall)
+        ECALL,
+        jtype(0, -4), // j -4 (to the ecall)
+    ])
+}
+
+/// `jit_ignore_instruction_limit` (C++ `translate_ignore_instruction_limit`):
+/// native code runs the whole loop however low the limit, counting
+/// nothing; the interpreter still counts its blocks and stops at the limit.
+#[test]
+fn unlimited_native_code_neither_counts_nor_stops() {
+    let code = long_loop_then_syscalls();
+    let n: u64 = 1 << 20;
+    let sum = n * (n + 1) / 2;
+    let unlimited = MachineOptions {
+        jit: true,
+        jit_ignore_instruction_limit: true,
+        ..Default::default()
+    };
+    let mut m = machine_with(&code, unlimited);
+    let out = run(&mut m, &[0; 64], 1000);
+    assert_eq!(out.result, Ok(false), "stopped by the limit");
+    assert_eq!(out.regs[10], sum, "the loop ran to the end");
+    assert!(out.counter >= 1000 && out.counter < 1100, "{}", out.counter);
+    // Counting code stops in the loop, as the interpreter does.
+    let limited = run(&mut machine(&code, true), &[0; 64], 1000);
+    assert_eq!(limited, run(&mut machine(&code, false), &[0; 64], 1000));
+    assert_ne!(limited.regs[10], sum);
+}

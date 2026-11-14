@@ -635,6 +635,7 @@ mod tests {
                 mask: 0,
                 read: (0x1000, 0x2000),
                 write: (0x3000, 0x400),
+                unlimited: false,
             },
         };
         let image = Image {

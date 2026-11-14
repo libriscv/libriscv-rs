@@ -650,6 +650,32 @@ the arena (which has a padding page for exactly that). Tests:
 `tests/nbit_arena.rs` (port of `nbit_arena.cpp`) and the `nbit_*` cases
 in `tests/jit.rs`.
 
+**No instruction limit** (C++ `translate_ignore_instruction_limit`,
+`MachineOptions::jit_ignore_instruction_limit`, set by `rvlinux` unless
+`--accurate`, as in C++; 2026-11-14): JIT code and translations neither
+count instructions nor check the limit, so a loop in native code runs until
+it leaves native code (a system call, a fault, code it can't run). It is
+`MemoryLayout::unlimited`, so it is part of every key (shared segments,
+the JIT cache, translations) and `CodeMemory` knows it. `native_enter`
+enters such code with the counter as it is (entry block counted) instead
+of pre-subtracting the entry block, and doesn't pre-subtract after a
+dyncall either, so the counter only grows: it counts what the interpreter
+runs, and the dispatcher still stops at the limit. `rdinstret` sees that
+undercount: freestanding CoreMark, whose clock it is, then fails its
+10-second rule (its CRCs are right). Removing the checks and the counter
+register took freestanding CoreMark (30000 iterations, N-bit) from 1.21 to
+1.10 s (AOT) and 1.48 to 1.30 s (JIT). Tests: `unlimited_*` in
+`tests/jit.rs` and `tests/aot.rs`.
+
+**Speculation.** Only N-bit code is safe against speculative out-of-bounds
+loads (Spectre v1): its index is `addr & mask` into an arena of at least
+`mask + 8` bytes, on every path. Checked code (JIT and AOT, and the
+interpreter's `Memory` fast paths) compares and branches, then loads at
+`arena + addr`: a mispredicted check reads anywhere within 2^64 of the
+arena. C++ wraps the address in `RISCV_SPECSAFE`
+(`__builtin_speculation_safe_value`, GCC only) in its translator's checked
+accesses; nothing here does yet.
+
 **Performance** (2026-11-12, freestanding CoreMark built from
 `../coremark/barebones`, 4000 iterations, `--accurate`, best of 3):
 

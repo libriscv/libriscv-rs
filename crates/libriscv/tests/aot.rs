@@ -730,6 +730,55 @@ fn translations_are_keyed_on_the_memory_layout() {
     );
 }
 
+/// `jit_ignore_instruction_limit`: translated without counting, the loop
+/// runs to the end however low the limit, and the interpreter stops at it
+/// afterwards. Such translations are only used by machines with the same
+/// setting.
+#[test]
+fn unlimited_translations_neither_count_nor_stop() {
+    if !have_rustc() {
+        return;
+    }
+    let mut code = words(&[
+        itype(0x13, 0, 10, 0, 0),      // li a0, 0
+        itype(0x13, 0, 11, 0, 1),      // li a1, 1
+        itype(0x13, 1, 11, 11, 20),    // slli a1, a1, 20
+        rtype(0x33, 0, 0, 10, 10, 11), // add a0, a0, a1
+        itype(0x13, 0, 11, 11, -1),    // addi a1, a1, -1
+        btype(1, 11, 0, -8),           // bnez a1, -8
+        itype(0x13, 0, 17, 0, 300),    // li a7, 300 (unhandled syscall)
+        ECALL,
+        jtype(0, -4), // j -4 (to the ecall)
+    ]);
+    // Unique code: the registry is process-wide.
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x7A2)]));
+    let unlimited = MachineOptions {
+        jit_ignore_instruction_limit: true,
+        ..Default::default()
+    };
+    let out = AotOutput::new();
+    machine_sized(
+        &code,
+        1 << 20,
+        MachineOptions {
+            aot_output: Some(out.clone()),
+            ..unlimited.clone()
+        },
+    );
+    compile_and_load(&out, "unlimited");
+    let n: u64 = 1 << 20;
+    let sum = n * (n + 1) / 2;
+    let mut m = machine_sized(&code, 1 << 20, unlimited);
+    assert!(m.cpu.current_execute_segment().is_aot());
+    let got = run(&mut m, &[0; 64], 1000);
+    assert_eq!(got.result, Ok(false), "stopped by the limit");
+    assert_eq!(got.regs[10], sum, "the loop ran to the end");
+    assert!(got.counter >= 1000 && got.counter < 1100, "{}", got.counter);
+    // Not for machines that count.
+    let m = machine(&code, true);
+    assert!(!m.cpu.current_execute_segment().is_aot());
+}
+
 /// A missing file, or a shared object that isn't a translation, is an
 /// error.
 #[test]
