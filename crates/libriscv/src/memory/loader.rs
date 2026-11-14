@@ -4,8 +4,8 @@
 //! copied in through the page table (so they can be anywhere) and get the
 //! page attributes of their program header.
 //!
-//! Not ported: shared read-only images (`prepare_shared_rodata`,
-//! `publish_shared_rodata`) and `default_exit_function`.
+//! Shared read-only images (`prepare_shared_rodata`,
+//! `publish_shared_rodata`) are in `shared.rs`.
 
 use std::sync::Arc;
 
@@ -97,6 +97,9 @@ impl Memory {
 
         self.start_address = self.elf_base_address(hdr.e_entry)?;
         self.heap_address = 0;
+
+        // Before loading, so that the loader can skip the shared segments.
+        self.prepare_shared_rodata(options, &phdrs)?;
 
         let mut execute_segments = Vec::new();
         for (k, ph) in phdrs.iter().enumerate() {
@@ -195,6 +198,9 @@ impl Memory {
             }
         }
 
+        // Offer the region to later machines, unless already sharing one.
+        self.publish_shared_rodata(options);
+
         if options.verbose_loader {
             println!("* Entry is at {:#x}", self.start_address);
         }
@@ -260,7 +266,22 @@ impl Memory {
             .ok()
             .and_then(|o| binary.get(o..o.checked_add(usize::try_from(len).ok()?)?))
             .ok_or(invalid("Not enough room for ELF program segment"))?;
-        self.memcpy(vaddr, src)?;
+        // A shared image already holds the bytes below its end: create the
+        // pages as the copy would, without writing to them.
+        let shared_end = self.shared_rodata_end();
+        let skip = if vaddr < shared_end {
+            len.min(shared_end - vaddr)
+        } else {
+            0
+        };
+        if skip > 0 {
+            self.touch_writable(vaddr, skip)?;
+        }
+        let rest = usize::try_from(skip)
+            .ok()
+            .and_then(|skip| src.get(skip..))
+            .unwrap_or_default();
+        self.memcpy(vaddr + skip, rest)?;
 
         // Track the read-only boundary (after the copy, so that the arena
         // writes succeed).

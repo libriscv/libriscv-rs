@@ -122,6 +122,17 @@ pub struct MachineOptions {
     /// address (C++ `use_shared_execute_segments`, default on). Forks share
     /// their master's segments either way.
     pub use_shared_execute_segments: bool,
+    /// Share the program's text and rodata (the arena below the first
+    /// writable segment, in whole pages) in host memory with every other
+    /// machine of the process loaded from the same program into an arena
+    /// of the same size (C++ `use_shared_rodata`, default on). Needs the
+    /// `jit` feature (its runtime crate owns the mapping) and Linux,
+    /// otherwise it does nothing; the machine doesn't have to use the JIT.
+    /// Unlike C++, the image is mapped copy-on-write, so it also works with
+    /// paging and with N-bit address masking: a store that reaches one of
+    /// its pages (the guest made it writable, a masked store) gets a
+    /// private copy of that page, invisible to other machines.
+    pub use_shared_rodata: bool,
     /// Breakpoints: EBREAKs installed in the decoder cache of every
     /// execute segment containing them (guest memory is unchanged), which
     /// run the EBREAK system call handler (C++ `ebreak_locations`).
@@ -164,6 +175,7 @@ impl Default for MachineOptions {
             aot_output: None,
             default_exit_function: None,
             use_shared_execute_segments: true,
+            use_shared_rodata: true,
             ebreak_locations: Vec::new(),
             libc_fastpath: false,
         }

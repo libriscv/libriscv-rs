@@ -22,6 +22,7 @@ mod loader;
 mod mmap;
 mod page;
 mod paging;
+mod shared;
 
 pub use helpers::{Buffer, GuestPod, GuestSlice, GuestSliceMut, MEMVIEW_MAX};
 pub(crate) use mmap::page_round_up;
@@ -56,7 +57,9 @@ pub(crate) const fn protection_fault(addr: u64) -> MachineError {
 #[derive(Debug)]
 pub struct Memory {
     /// `arena_size` bytes of guest memory plus one page of overrun padding.
-    arena: Vec<u8>,
+    /// A `Vec<u8>`, or with the `jit` feature a mapping whose
+    /// low pages can be a shared image of the program (see `shared.rs`).
+    arena: shared::Arena,
     arena_size: u64,
     /// `arena_size / PAGE_SIZE` (C++ `m_arena.pages`).
     arena_pages: u64,
@@ -67,6 +70,8 @@ pub struct Memory {
     read_boundary: u64,
     write_boundary: u64,
     initial_rodata_end: u64,
+    /// The shared image of the program's read-only memory, if any.
+    shared_rodata: shared::SharedRodata,
 
     start_address: u64,
     stack_address: u64,
@@ -206,9 +211,20 @@ impl Memory {
             .checked_add(PAGE_SIZE)
             .filter(|&n| n <= isize::MAX as u64)
             .and_then(|n| usize::try_from(n).ok());
-        let (arena_pages, arena_len) = match arena_len {
-            Some(len) if options.use_memory_arena && pages_max > 0 => (pages_max, len),
-            _ => (0, PAGE_SIZE as usize),
+        let arena = match arena_len {
+            Some(len) if options.use_memory_arena && pages_max > 0 => {
+                shared::new_arena(len).ok().map(|arena| (pages_max, arena))
+            }
+            _ => None,
+        };
+        let (arena_pages, arena) = match arena {
+            Some(arena) => arena,
+            None => (
+                0,
+                shared::new_arena(PAGE_SIZE as usize).map_err(|_| {
+                    MachineError::new(ExceptionKind::OutOfMemory, "Out of memory", 0)
+                })?,
+            ),
         };
         let arena_size = arena_pages * PAGE_SIZE;
         // Bound the page table, including attribute-only pages created
@@ -228,7 +244,7 @@ impl Memory {
         let mut memory = Self {
             // Zeroed allocation: the OS hands out pages lazily, like C++'s
             // MAP_NORESERVE mapping.
-            arena: vec![0u8; arena_len],
+            arena,
             arena_size,
             arena_pages,
             paging: paging::PageTable::new(arena_pages, table_max, fault_limit, fault_oom_data),
@@ -239,6 +255,7 @@ impl Memory {
             read_boundary: arena_size.wrapping_sub(RWREAD_BEGIN).min(arena_size),
             write_boundary: arena_size,
             initial_rodata_end: 0,
+            shared_rodata: shared::SharedRodata::NONE,
             start_address: 0,
             stack_address: 0,
             exit_address: 0,
@@ -307,7 +324,7 @@ impl Memory {
         }
         Ok(Self {
             // No arena: the windows below are empty, so it is never read.
-            arena: Vec::new(),
+            arena: shared::empty_arena(),
             arena_size: 0,
             arena_pages: 0,
             paging: self.fork_page_table(options.minimal_fork),
@@ -315,6 +332,7 @@ impl Memory {
             read_boundary: 0,
             write_boundary: 0,
             initial_rodata_end: 0,
+            shared_rodata: shared::SharedRodata::NONE,
             start_address: self.start_address,
             stack_address: self.stack_address,
             exit_address: self.exit_address,
@@ -456,6 +474,13 @@ impl Memory {
     }
     pub const fn memory_arena_size(&self) -> u64 {
         self.arena_size
+    }
+    /// The flat arena: guest memory `[0, memory_arena_size())` (C++
+    /// `memory_arena_ptr`, read-only here). Its low pages can be a shared
+    /// image of the program, see [`Memory::shared_rodata_end`].
+    pub fn memory_arena(&self) -> &[u8] {
+        let len = usize::try_from(self.arena_size).unwrap_or(usize::MAX);
+        self.arena.get(..len).unwrap_or_default()
     }
     /// True when there is a flat arena (C++ `uses_flat_memory_arena`).
     pub const fn uses_flat_memory_arena(&self) -> bool {

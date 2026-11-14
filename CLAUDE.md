@@ -52,7 +52,8 @@ Guests compile with `riscv64-linux-gnu-gcc-14` (`$RCC`); outputs are cached in
 - **No `unsafe`.** Enforced by `forbid(unsafe_code)`; never work around it
   (no `allow`, no unsafe-using helper crates added to dodge it). The one
   exception is `crates/libriscv-jit-rt`, the executable-memory runtime of the
-  optional `jit` feature (it also loads AOT shared objects for `aot-dylib`):
+  optional `jit` feature (it also loads AOT shared objects for `aot-dylib`,
+  and owns the guest arena mapping for shared rodata):
   keep its unsafe surface minimal and documented, and keep everything else
   (including `libriscv/src/jit/` and `aot/`) unsafe-free. Code the AOT
   translator generates is safe Rust too.

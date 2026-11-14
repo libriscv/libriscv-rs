@@ -55,6 +55,14 @@
 //! The [`aot`] module loads `libriscv`'s ahead-of-time translations (safe
 //! Rust, compiled into a shared object) for the `aot-dylib` feature: the
 //! `dlopen` and the call across the C boundary.
+//!
+//! # Guest arenas
+//!
+//! [`GuestArena`] is `libriscv`'s flat guest memory when built with `jit`:
+//! an anonymous mapping that derefs to `[u8]`, over whose low pages a
+//! sealed [`RodataImage`] of the program can be mapped copy-on-write, so
+//! that machines loaded from the same program share its text and rodata
+//! (see the `arena` module).
 
 use std::io;
 use std::marker::PhantomData;
@@ -64,7 +72,9 @@ use std::sync::Arc;
 use memmap2::Mmap;
 
 pub mod aot;
+mod arena;
 mod linked;
+pub use arena::{GuestArena, RodataImage, host_page_size, shared_rodata_supported};
 pub use linked::{
     CachedUnit, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, SharedObject, TABLE_MAGIC,
     TABLE_SYMBOL, TABLE_WORDS, embedded_units, load_shared_object,

@@ -13,7 +13,9 @@ When the C++ side moves, bump this hash and the ones in
 1. **Safe:** `#![forbid(unsafe_code)]` in every crate, with one exception:
    `libriscv-jit-rt`, the executable-memory runtime of the optional JIT (see
    "JIT"), which also loads AOT translations from shared objects (see
-   "AOT"; embedded translations need no unsafe code at all). `libriscv` itself forbids unsafe code with or without the JIT.
+   "AOT"; embedded translations need no unsafe code at all) and owns the
+   guest arena mapping for shared read-only data (see "Shared read-only
+   data"). `libriscv` itself forbids unsafe code with or without the JIT.
    Prefer zero runtime dependencies for `libriscv` (the `jit` feature adds
    Cranelift). Nightly *language features* are fine (see Toolchain); unsafe
    is not.
@@ -1218,6 +1220,56 @@ again (64 pages: 36 µs), unless its dynamic trim threshold was raised
 earlier by freeing a large `mmap`ed block, as the C++ harness happens to
 do. The bench does that first (`FORK_BENCH_NO_WARMUP=1` skips it).
 
+### Shared read-only data
+
+Port of C++ `shared_rodata.cpp` and `Memory::prepare_shared_rodata`/
+`publish_shared_rodata` (`memory/shared.rs`), on by default
+(`MachineOptions::use_shared_rodata`) with the `jit` feature, on Linux.
+Machines loaded from the same program into arenas of the same size map
+one sealed memfd (`libriscv-rodata`) over guest memory `[0, end)`, where
+`end` is the page-aligned end of the read-only segments (at most the start
+of the first writable one): the program's text and rodata are in host
+memory once, and a pooled VM costs its writable data, stack and heap. The
+first machine publishes the image once it has loaded the program
+(relocations included). Later machines with the same layout attach it
+before loading, after comparing every byte with their own segments (the
+layout only selects candidates), and skip copying what it covers; the
+loader still creates those pages in the page table, without writing them
+(`touch_writable`). The cache holds images weakly: the last machine to
+drop one frees it. Together with shared execute segments this is the
+model of embedders that pool independently created VMs rather than fork
+them (carapace: one `Arc<[u8]>` ELF, `Machine::new` per VM).
+
+The arena is the one thing that needs `unsafe`: with the feature it is a
+`libriscv_jit_rt::GuestArena` (an anonymous `MAP_NORESERVE` mapping that
+derefs to `[u8]`) instead of a `Vec<u8>`, and `RodataImage` is the memfd.
+That's why it lives under `jit`. Nothing else changes: the arena is still
+one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
+the JIT's base-pointer addressing and AOT code are untouched, and the cost
+is all at machine creation.
+
+Differences from C++:
+
+- **The image is mapped copy-on-write** (`PROT_READ | PROT_WRITE`,
+  `MAP_PRIVATE`), not `PROT_READ | MAP_SHARED`. Its pages are the memfd's
+  page-cache pages, shared by every machine, until a store reaches one,
+  which gets a private copy of that page only. C++ relies on the write
+  boundary and turns sharing off where stores can get past it: with
+  virtual paging (which this port always has: a guest can `mprotect` its
+  rodata writable, and the page table then writes the arena) and with an
+  encompassing N-bit arena (masked stores aren't checked). Here both work,
+  and behave exactly as without sharing (`tests/shared_rodata.rs`), so
+  N-bit address masking keeps its speed with shared rodata. The seals
+  (write, grow, shrink, seal) keep the file's bytes from changing or
+  disappearing (no `SIGBUS`).
+- Images are whole *host* pages (C++: guest pages, which breaks with
+  larger host pages).
+- A discard (`memdiscard`) of rodata zeroes it, as C++ does with paging
+  (C++'s "never touches read-only data" test is about its arena without
+  paging); with sharing, the zeroed pages are private to that machine.
+- Candidates are compared through a read-only view each image keeps
+  mapped, instead of mapping and unmapping one per comparison.
+
 ### Linux system calls
 
 `syscalls/linux/` follows `linux/system_calls.cpp`, with the host reached
@@ -1479,7 +1531,7 @@ no references into guest memory, so:
 - [x] `extern "rust-preserve-none"` handlers
 - [x] Instruction fusion (`rvi_fuse.cpp`): nothing to port, C++ never calls `try_fuse`
 - [x] Shared execute segments across machines and forks, background JIT results reaching every holder (`decoder_cache.cpp` `SharedExecuteSegments`, `util/crc32.hpp`); see "Shared execute segments"
-- [ ] Shared read-only data (`shared_rodata.cpp`)
+- [x] Shared read-only data (`shared_rodata.cpp`), copy-on-write, with the `jit` feature; see "Shared read-only data"
 - [ ] Bounds-check elimination audit (`cargo asm`)
 - [x] Cranelift JIT (`jit` feature) replacing asmjit; see "JIT". RV64IMFDC, Zcb, B (no CLMUL), Zicond; A, CSRs, Zfa and Zfhmin stay interpreted
 - [x] JIT: background compilation (`jit_background`, `rvlinux -B`/`--no-background`)
@@ -1539,7 +1591,7 @@ phase starts; names below are the intended targets.
 | `decode_bytecodes.cpp`, `threaded_rewriter.cpp` | `decode.rs` (`fast_handler`, `cpp_entry_bits`) | 1–4 | ✅ RV64IMAFDC + Zcb + B |
 | `bytecode_impl.cpp`, `threaded_bytecodes.hpp` | `bytecode.rs` (slow-path and system bytecodes: `dispatch.rs`) | 4 | ✅ |
 | `bytecode_dispatch.cpp`, `threaded_bytecode_array.hpp` | — | — | superseded by tail-call dispatch |
-| `shared_rodata.*` | `memory/shared.rs` | 4 | |
+| `shared_rodata.*` | `memory/shared.rs`, `libriscv-jit-rt/src/arena.rs` | 4 | ✅ copy-on-write image, also with paging and N-bit arenas |
 | `machine_defaults.cpp`, `posix/minimal.cpp` | `machine.rs`, `syscalls/minimal.rs` | 1–2 | ✅ |
 | `linux/system_calls.cpp`, `linux/syscalls_*.cpp` | `syscalls/linux/` | 2, 5 | ✅ incl. mman, poll, select (epoll, eventfd: Phase 5) |
 | `posix/filedesc.hpp` | `syscalls/fds.rs` | 2 | ✅ (`std::fs::File`s, no raw fds) |

@@ -863,6 +863,16 @@ impl Memory {
         Ok(())
     }
 
+    /// The page-table side of `memcpy(dst, ..len)` without the copy: make
+    /// the pages writable (creating them), but leave their bytes alone.
+    /// For loading segments a shared image already holds.
+    pub(super) fn touch_writable(&mut self, dst: u64, len: u64) -> Result<()> {
+        for (pageno, _, _) in page_chunks(dst, len) {
+            self.create_writable_pageno(pageno)?;
+        }
+        Ok(())
+    }
+
     /// Port of `Memory::memset` with paging.
     pub fn memset(&mut self, dst: u64, value: u8, len: u64) -> Result<()> {
         for (pageno, off, size) in page_chunks(dst, len) {
