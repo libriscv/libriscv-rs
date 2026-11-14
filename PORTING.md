@@ -1262,7 +1262,11 @@ Bugs or oddities in C++ that the port reproduces on purpose:
   chunk at a time where C++ loads and stores a byte or word at a time,
   with the same memory, faults and created pages (overlap and C++'s
   arena shortcut included; tested against the loop): one native memcpy of
-  up to 512 MiB runs before its penalty is charged.
+  up to 512 MiB runs before its penalty is charged. The native memmove's
+  backward copy (`Memory::memmove_backward`, when `dst >= src`) does the
+  same: page-bounded chunks from the end, no longer than the distance by
+  which `dst` is behind `src` modulo 2^64, matching C++'s loop of word or
+  byte loads and stores from the end (tested against it).
 - `native/backtrace.rs`: `Memory::lookup`/`print_backtrace` as
   `Machine::lookup`/`print_backtrace`, without demangling (C++ demangles
   with `__cxa_demangle` when built with `DEMANGLE_ENABLED`).

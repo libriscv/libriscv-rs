@@ -1253,6 +1253,139 @@ mod tests {
         assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
     }
 
+    /// The native memmove's backward copy outside the arena copies a
+    /// page-bounded chunk at a time; it must leave memory, faults and
+    /// created pages exactly as C++'s loop of loads and stores
+    /// (`memmove_backward_elementwise`) does.
+    #[test]
+    fn memmove_backward_in_chunks_matches_the_element_loop() {
+        const P: u64 = PAGE_SIZE;
+        let far = 0x10_0000_0000;
+        let top = 0u64.wrapping_sub(2 * P);
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        // (memory_max, dst, src, len, unreadable source page, read-only
+        // destination page)
+        type Case = (u64, u64, u64, u64, Option<u64>, Option<u64>);
+        let cases: Vec<Case> = vec![
+            // Apart: words, and bytes.
+            (MIB, far + 0x10_0000 + 8, far + 8, 5 * P + 16, None, None),
+            (MIB, far + 0x10_0000 + 3, far + 8, 5 * P + 13, None, None),
+            (MIB, far + 0x10_0000, far + 0x7F9, 3 * P, None, None),
+            // Overlapping, dst ahead (what memmove copies backwards for).
+            (MIB, far + 1, far, 3 * P, None, None),
+            (MIB, far + 8, far, 3 * P, None, None),
+            (MIB, far + 40, far + 8, 3 * P, None, None),
+            (MIB, far + P + 24, far + 24, 3 * P, None, None),
+            (MIB, far + 16, far + 16, 3 * P, None, None),
+            // A fault part of the way: the source, then the destination.
+            (
+                MIB,
+                far + 0x10_0000 + 8,
+                far + 8,
+                5 * P,
+                Some(far + 2 * P),
+                None,
+            ),
+            (
+                MIB,
+                far + 0x10_0000 + 5,
+                far + 9,
+                5 * P,
+                Some(far + 3 * P),
+                None,
+            ),
+            (
+                MIB,
+                far + 0x10_0000 + 8,
+                far + 8,
+                5 * P,
+                None,
+                Some(far + 0x10_0000 + 2 * P),
+            ),
+            // Out of memory part of the way (zero pages to new pages).
+            (MIB, far + 0x200_0000, far + 0x100_0000, 400 * P, None, None),
+            (MIB, far + 0x200_0003, far + 0x100_0000, 400 * P, None, None),
+            // Between the arena and the pages outside it.
+            (MIB, far + 8, 0x3008, 3 * P, None, None),
+            (MIB, far + 5, 0x3008, 3 * P, None, None),
+            // Wrapping the address space: src ending in the arena, dst
+            // wrapping, and dst just behind src modulo 2^64 (its stores
+            // reach the loads still to come).
+            (MIB, far + 0x10_0000, top, 2 * P + 0x3000, None, None),
+            (MIB, far + 0x10_0003, top + 5, 2 * P + 0x3000, None, None),
+            (MIB, top + 8, far + 8, 3 * P, None, None),
+            (
+                MIB,
+                top + 8,
+                top + 0x40,
+                0u64.wrapping_sub(0x38),
+                None,
+                None,
+            ),
+            (MIB, far, far + 8, 0u64.wrapping_sub(8), None, None),
+            (MIB, far, far + 3, 0u64.wrapping_sub(3), None, None),
+        ];
+        for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
+            // The huge lengths fault (or run out of memory) on the way;
+            // bound the work by memory, not by the length.
+            let setup = || {
+                let mut mem = empty_memory(max);
+                let data: Vec<u8> = (0..4 * P).map(|i| (i * 13 % 251) as u8 + 1).collect();
+                for base in [far, far + 0x10_0000, 0x3000, top] {
+                    let _ = mem.memcpy(base, &data);
+                }
+                if let Some(page) = unreadable {
+                    mem.set_page_attr(page, P, none).unwrap();
+                }
+                if let Some(page) = read_only_page {
+                    mem.set_page_attr(page, P, read_only).unwrap();
+                }
+                mem
+            };
+            let (mut chunked, mut reference) = (setup(), setup());
+            let got = chunked
+                .memmove_backward(dst, src, len)
+                .map_err(|e| (e.kind, e.data));
+            let expected = reference
+                .memmove_backward_elementwise(dst, src, len)
+                .map_err(|e| (e.kind, e.data));
+            assert_eq!(got, expected, "case {i}");
+            assert_eq!(chunked.pages_active(), reference.pages_active(), "case {i}");
+            for base in [dst, src, far, top] {
+                for off in (0..len.min(8 * P) + 64).step_by(7) {
+                    for addr in [base.wrapping_add(off), base.wrapping_sub(off)] {
+                        assert_eq!(
+                            chunked.read_u8(addr).map_err(|e| e.data),
+                            reference.read_u8(addr).map_err(|e| e.data),
+                            "case {i} at {addr:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A native memmove's backward copy of 16 MiB between pages outside
+    /// the arena, not aligned (a byte at a time in C++'s loop):
+    /// `nativefuzzer` inputs took 5 s copying a byte at a time.
+    #[test]
+    fn a_long_memmove_backward_outside_the_arena_is_fast() {
+        let mut mem = empty_memory(64 * MIB);
+        let start = std::time::Instant::now();
+        let a = 0x10_0000_0000;
+        mem.memmove_backward(a + 0x1000_0003, a, 16 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
+
     /// The native memcpy outside the arena copies a page-bounded chunk at
     /// a time; it must leave memory, faults and created pages exactly as
     /// C++'s loop of loads and stores (`memcpy_within_elementwise`) does.
