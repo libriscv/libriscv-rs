@@ -126,8 +126,8 @@ pub struct MachineOptions {
     /// writable segment, in whole pages) in host memory with every other
     /// machine of the process loaded from the same program into an arena
     /// of the same size (C++ `use_shared_rodata`, default on). Needs the
-    /// `jit` feature (its runtime crate owns the mapping) and Linux,
-    /// otherwise it does nothing; the machine doesn't have to use the JIT.
+    /// `jit` feature (its runtime crate owns the mapping) and Linux
+    /// (x86_64, aarch64, riscv64), otherwise it does nothing; the machine doesn't have to use the JIT.
     /// Unlike C++, the image is mapped copy-on-write, so it also works with
     /// paging and with N-bit address masking: a store that reaches one of
     /// its pages (the guest made it writable, a masked store) gets a

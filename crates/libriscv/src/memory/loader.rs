@@ -99,7 +99,7 @@ impl Memory {
         self.heap_address = 0;
 
         // Before loading, so that the loader can skip the shared segments.
-        self.prepare_shared_rodata(options, &phdrs)?;
+        self.prepare_shared_rodata(options, &phdrs);
 
         let mut execute_segments = Vec::new();
         for (k, ph) in phdrs.iter().enumerate() {

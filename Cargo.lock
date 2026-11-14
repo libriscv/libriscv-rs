@@ -249,7 +249,6 @@ dependencies = [
 name = "libriscv-jit-rt"
 version = "0.1.0"
 dependencies = [
- "libc",
  "memmap2",
 ]
 

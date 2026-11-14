@@ -7,12 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# 0.9.8+ for `no_reserve_swap` (guest arenas).
 memmap2 = "0.9.11"
-
-# mmap/memfd for guest arenas with shared read-only images (`arena`).
-# Already in the build through memmap2.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2.191"
 
 # Not `workspace = true`: this crate is the one exception to the workspace's
 # `forbid(unsafe_code)`. It denies unsafe code instead, so each unsafe block

@@ -305,6 +305,9 @@ fn main() -> ExitCode {
         #[cfg(feature = "aot")]
         aot_output: aot_output.clone(),
         libc_fastpath: args.libc_fastpath,
+        // One machine per process: nothing to share the program's
+        // read-only memory with, so don't pay for creating an image of it.
+        use_shared_rodata: false,
         ..Default::default()
     };
     let mut machine = match libriscv::Machine::new(&binary, options) {

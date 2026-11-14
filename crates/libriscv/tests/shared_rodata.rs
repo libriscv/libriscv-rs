@@ -18,8 +18,17 @@ const MAX_MEMORY: u64 = 64 << 20;
 const MAX_INSTRUCTIONS: u64 = 10_000_000;
 const ENV: [&str; 3] = ["LC_TYPE=C", "LC_ALL=C", "USER=root"];
 
-/// Sharing needs the `jit` feature and Linux.
-const SHARING: bool = cfg!(all(feature = "jit", target_os = "linux"));
+/// Sharing needs the `jit` feature and Linux (on the architectures whose
+/// `mmap` flags `libriscv-jit-rt` declares).
+const SHARING: bool = cfg!(all(
+    feature = "jit",
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+));
 
 /// The C++ test program, with a page-aligned table that keeps several whole
 /// pages of rodata inside the shared image. `fill` is its contents, so that
@@ -347,4 +356,41 @@ fn jit_runs_on_shared_rodata() {
         assert_eq!(first.return_value() as i32, 666);
         assert_eq!(second.return_value() as i32, 666);
     }
+}
+
+/// Machines created on many threads at once (comparisons and image
+/// creation run outside the cache's lock) all end up on one image.
+#[test]
+fn concurrently_created_machines_share_one_image() {
+    if !testutil::need_compiler() || !SHARING {
+        return;
+    }
+    const THREADS: usize = 8;
+    // Its own contents, so that no other test's image is a candidate.
+    let binary = rodata_program('T');
+    let barrier = std::sync::Barrier::new(THREADS);
+    let images: Vec<(u64, u64)> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let machine = machine(&binary);
+                    let end = machine.memory.shared_rodata_end();
+                    let ino = inode(&smaps_entry(machine.memory.memory_arena().as_ptr()));
+                    // Keep every machine (so every image) alive until all
+                    // are created.
+                    barrier.wait();
+                    (end, ino)
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    let (end, ino) = images[0];
+    assert_ne!(end, 0);
+    assert_ne!(ino, 0);
+    assert!(
+        images.iter().all(|&image| image == (end, ino)),
+        "{images:?}"
+    );
 }

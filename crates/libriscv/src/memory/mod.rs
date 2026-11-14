@@ -71,6 +71,7 @@ pub struct Memory {
     write_boundary: u64,
     initial_rodata_end: u64,
     /// The shared image of the program's read-only memory, if any.
+    #[cfg(feature = "jit")]
     shared_rodata: shared::SharedRodata,
 
     start_address: u64,
@@ -255,6 +256,7 @@ impl Memory {
             read_boundary: arena_size.wrapping_sub(RWREAD_BEGIN).min(arena_size),
             write_boundary: arena_size,
             initial_rodata_end: 0,
+            #[cfg(feature = "jit")]
             shared_rodata: shared::SharedRodata::NONE,
             start_address: 0,
             stack_address: 0,
@@ -332,6 +334,7 @@ impl Memory {
             read_boundary: 0,
             write_boundary: 0,
             initial_rodata_end: 0,
+            #[cfg(feature = "jit")]
             shared_rodata: shared::SharedRodata::NONE,
             start_address: self.start_address,
             stack_address: self.stack_address,

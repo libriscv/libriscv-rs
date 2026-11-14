@@ -1224,8 +1224,9 @@ do. The bench does that first (`FORK_BENCH_NO_WARMUP=1` skips it).
 
 Port of C++ `shared_rodata.cpp` and `Memory::prepare_shared_rodata`/
 `publish_shared_rodata` (`memory/shared.rs`), on by default
-(`MachineOptions::use_shared_rodata`) with the `jit` feature, on Linux.
-Machines loaded from the same program into arenas of the same size map
+(`MachineOptions::use_shared_rodata`) with the `jit` feature, on Linux
+(x86_64, aarch64, riscv64). `rvlinux` turns it off: it runs one machine,
+so an image would only cost a copy. Machines loaded from the same program into arenas of the same size map
 one sealed memfd (`libriscv-rodata`) over guest memory `[0, end)`, where
 `end` is the page-aligned end of the read-only segments (at most the start
 of the first writable one): the program's text and rodata are in host
@@ -1236,14 +1237,20 @@ before loading, after comparing every byte with their own segments (the
 layout only selects candidates), and skip copying what it covers; the
 loader still creates those pages in the page table, without writing them
 (`touch_writable`). The cache holds images weakly: the last machine to
-drop one frees it. Together with shared execute segments this is the
+drop one frees it. Its lock is only held to look up and insert:
+comparisons and image creation happen outside it, so machines can be
+created on many threads at once (an image created concurrently with an
+identical one is dropped in favour of it). Together with shared execute segments this is the
 model of embedders that pool independently created VMs rather than fork
 them (carapace: one `Arc<[u8]>` ELF, `Machine::new` per VM).
 
 The arena is the one thing that needs `unsafe`: with the feature it is a
-`libriscv_jit_rt::GuestArena` (an anonymous `MAP_NORESERVE` mapping that
-derefs to `[u8]`) instead of a `Vec<u8>`, and `RodataImage` is the memfd.
-That's why it lives under `jit`. Nothing else changes: the arena is still
+`libriscv_jit_rt::GuestArena` (an anonymous `MAP_NORESERVE` `memmap2`
+mapping that derefs to `[u8]`, on every platform) instead of a
+`Vec<u8>`, and `RodataImage` is the memfd. That's why it lives under
+`jit`. `memfd_create`, `fcntl(F_ADD_SEALS)` and the fixed-address `mmap`
+are declared by hand (like `dlopen`), not through the `libc` crate, for
+the architectures whose flag values they spell out. Nothing else changes: the arena is still
 one contiguous `[u8]`, so the interpreter's `arena_read`/`arena_write`,
 the JIT's base-pointer addressing and AOT code are untouched, and the cost
 is all at machine creation.
@@ -1267,8 +1274,10 @@ Differences from C++:
 - A discard (`memdiscard`) of rodata zeroes it, as C++ does with paging
   (C++'s "never touches read-only data" test is about its arena without
   paging); with sharing, the zeroed pages are private to that machine.
-- Candidates are compared through a read-only view each image keeps
-  mapped, instead of mapping and unmapping one per comparison.
+- If mapping the image over a loaded arena fails, the range is mapped
+  again privately and refilled from a view of the image taken before
+  the arena was touched (C++ leaves whatever the failed `mmap` left).
+  The image is also mapped `MAP_NORESERVE`, like the arena it replaces.
 
 ### Linux system calls
 
