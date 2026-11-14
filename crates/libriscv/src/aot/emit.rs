@@ -7,7 +7,7 @@
 //! Each segment becomes a module, each region a function
 //!
 //! ```text
-//! extern "rust-preserve-none" fn r<N>(s: &mut S<'_>, pc: u64, c: u64)
+//! extern "rust-preserve-none" fn r<N>(s: &mut S<'_>, pc: u64, c: u64, d: u32) -> (u64, u64)
 //! ```
 //!
 //! that keeps the guest registers it uses in locals (C++ `use_register_caching`),
@@ -35,7 +35,7 @@
 
 use std::fmt::Write as _;
 
-use super::structure::{dispatch, structure};
+use super::structure::{MAX_GROWTH, dispatch, structure};
 use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
 use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
@@ -45,6 +45,13 @@ use crate::native_code::{
 
 /// The widest guest memory access, in bytes (FLD/FSD/LD/SD).
 const MAX_ACCESS: u64 = 8;
+
+/// Region functions per module (see `translate`).
+const CHUNK: usize = 40;
+
+/// How much a region's structured code may grow with all its entries as
+/// roots, before its weak entries are dropped (see `RegionWriter::write`).
+const ALL_ENTRIES_GROWTH: usize = 2;
 
 /// One translated segment: its module's source, and what the host needs to
 /// enter it.
@@ -66,12 +73,23 @@ pub(crate) struct Translation {
 /// the JIT's) results for every input.
 pub(crate) const RUNTIME: &str = r#"
     /// How a region function leaves: an exit to the host (kind, PC), a
-    /// direct tail call (region, PC) or an indirect jump (target).
+    /// direct tail call (region, PC), an indirect jump (target), a guest
+    /// return (target) to the native caller, or on after a callee left
+    /// for the host (its exit is in `S::out`).
     pub(super) enum A {
         X(u64, u64),
         G(u32, u64),
         I(u64),
+        R(u64),
+        D,
     }
+    /// What a region function returns instead of a guest return target:
+    /// it left for the host, with the exit in `S::out`. (Odd, so never a
+    /// `jalr` target.)
+    pub(super) const DONE: u64 = 1;
+    /// The most nested native calls; deeper calls are tail calls (which
+    /// don't grow the stack) and return through the entry table.
+    pub(super) const DEPTH: u32 = 32;
     #[inline(always)]
     pub(super) fn sx(v: u32) -> u64 {
         v as i32 as i64 as u64
@@ -248,15 +266,31 @@ pub(crate) fn translate(
         return None;
     }
     let cache_len = exec.cache.len();
+    // The regions first: each decides which of its entries it keeps.
+    let summaries = summaries(exec, a)?;
+    let mut regions = String::new();
     let mut entries: Vec<(u32, RegionId)> = Vec::new();
-    for (r, region) in a.regions.iter().enumerate() {
-        for &pc in &region.entries {
+    for r in 0..a.regions.len() {
+        // In modules of `CHUNK` regions: `rustc` splits its work into
+        // codegen units (compiled in parallel) by module.
+        if r % CHUNK == 0 {
+            if r != 0 {
+                regions.push_str("        }\n");
+            }
+            let k = r / CHUNK;
+            let _ = writeln!(
+                regions,
+                "        use c{k}::*;\n        mod c{k} {{ use super::*;"
+            );
+        }
+        for pc in RegionWriter::write(exec, a, r, layout, &summaries, &mut regions)? {
             let i = exec.index(pc);
             if i < cache_len {
                 entries.push((u32::try_from(i).ok()?, r));
             }
         }
     }
+    regions.push_str("        }\n");
     entries.sort_unstable();
     entries.dedup_by_key(|e| e.0);
     let is_entry = |i: usize| {
@@ -364,7 +398,10 @@ pub(crate) fn translate(
             t: &'static [Option<F>],
             out: [u64; 3],
         }}
-        type F = for<'a, 'b> extern "rust-preserve-none" fn(&'a mut S<'b>, u64, u64);
+        /// A region function: `(state, pc, counter, depth)` to `(target,
+        /// counter)`, where `target` is where a guest return went, or
+        /// `DONE`, and `depth` the native calls in progress (see `DEPTH`).
+        type F = for<'a, 'b> extern "rust-preserve-none" fn(&'a mut S<'b>, u64, u64, u32) -> (u64, u64);
         static TABLE: std::sync::OnceLock<Box<[Option<F>]>> = std::sync::OnceLock::new();
         /// The entry table, by decoder index, for indirect jumps.
         fn table() -> Box<[Option<F>]> {{
@@ -383,7 +420,23 @@ pub(crate) fn translate(
             let Some(&Some(func)) = t.get(index) else {{ return false }};
             let [pc, counter, max, frm] = *io;
             let mut s = S {{ x, f, m, max, frm, t, out: [u64::MAX, pc, counter] }};
-            func(&mut s, pc, counter);
+            let (mut func, mut pc, mut c) = (func, pc, counter);
+            // A guest return that no native caller took: continue at its
+            // target through the entry table, as an indirect jump would.
+            loop {{
+                let (target, counter) = func(&mut s, pc, c, 0);
+                if target == DONE {{
+                    break;
+                }}
+                let i = ((target >> {SHIFT}).wrapping_sub(BEGIN >> {SHIFT})) as usize;
+                match t.get(i).copied().flatten() {{
+                    Some(next) => (func, pc, c) = (next, target, counter),
+                    None => {{
+                        s.out = [{EXIT_INDIRECT}, target, counter];
+                        break;
+                    }}
+                }}
+            }}
             let [kind, pc, counter] = s.out;
             *io = [kind, pc, counter, 0];
             true
@@ -394,9 +447,7 @@ pub(crate) fn translate(
         let _ = writeln!(o, "            ({i}, r{r} as F),");
     }
     let _ = writeln!(o, "        ];");
-    for r in 0..a.regions.len() {
-        RegionWriter::write(exec, a, r, layout, o)?;
-    }
+    o.push_str(&regions);
     Some(Translation {
         source: out,
         cache_len,
@@ -451,6 +502,142 @@ struct RegionWriter<'a> {
     region_checked: [[Option<Check>; 32]; 2],
     /// The entry code of the region checks.
     region_lines: Vec<String>,
+    /// Every region's [`Summary`].
+    summaries: &'a [Summary],
+    /// The registers this region uses and writes (see [`Summary`]).
+    used: u64,
+    written: u64,
+    /// Index in `a.insns` of the instruction being written.
+    index: usize,
+}
+
+/// Registers as a bit set: `x<n>` is bit `n`, `f<n>` bit `32 + n`.
+type RegSet = u64;
+
+/// What a region may read and write before it returns (a guest return,
+/// or leaving for the host): its own registers and those of every region
+/// it may transfer to, transitively; all of them if it may jump
+/// indirectly. A native call to it stores the caller's registers it may
+/// read, and reloads those it may write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Summary {
+    reads: RegSet,
+    writes: RegSet,
+}
+
+/// The registers region `r` uses and writes (`x0` excluded). A
+/// single-precision FP write keeps the upper half, so it reads it too.
+fn region_regs(a: &Analysis, r: RegionId) -> Option<(RegSet, RegSet)> {
+    let (mut used, mut written) = (0u64, 0u64);
+    for &i in &a.regions.get(r)?.insns {
+        let u = operands(a.insns.get(i)?.op);
+        for s in u.x.into_iter().flatten().filter(|&s| s & 31 != 0) {
+            used |= 1 << (s & 31);
+        }
+        if let Some(d) = u.xw.filter(|&d| d & 31 != 0) {
+            used |= 1 << (d & 31);
+            written |= 1 << (d & 31);
+        }
+        for s in u.f.into_iter().flatten() {
+            used |= 1 << (32 + (s & 31));
+        }
+        if let Some(d) = u.fw {
+            used |= 1 << (32 + (d & 31));
+            written |= 1 << (32 + (d & 31));
+        }
+    }
+    Some((used, written))
+}
+
+/// A guest return: `jalr x0, imm(ra)` or `jalr x0, imm(t0)`. It goes back
+/// to the native caller (or `enter`) instead of through the entry table.
+fn is_return(op: JOp) -> bool {
+    matches!(op, JOp::Jalr { rd, rs1, .. } if rd & 31 == 0 && matches!(rs1 & 31, 1 | 5))
+}
+
+/// The constant target of the `jalr` at `a.insns[i]` that the code jumps
+/// to directly, if any: one in a region (or else it goes through the
+/// entry table), and aligned.
+fn direct_jalr_target(exec: &DecodedSegment, a: &Analysis, i: usize) -> Option<u64> {
+    a.jalr_target(i)
+        .filter(|&t| COMPRESSED || t & 3 == 0)
+        .filter(|&t| a.region_at(exec, t).is_some())
+}
+
+/// Every region's [`Summary`]: its own registers, then those of the
+/// regions it may transfer to, to a fixed point.
+fn summaries(exec: &DecodedSegment, a: &Analysis) -> Option<Vec<Summary>> {
+    let n = a.regions.len();
+    let mut out = Vec::with_capacity(n);
+    let mut succ: Vec<Vec<RegionId>> = Vec::with_capacity(n);
+    for (r, region) in a.regions.iter().enumerate() {
+        let (used, written) = region_regs(a, r)?;
+        let mut targets = std::collections::BTreeSet::new();
+        let mut indirect = false;
+        for &i in &region.insns {
+            let ins = a.insns.get(i)?;
+            let next = ins.pc.wrapping_add(ins.len);
+            let mut to = |pc: u64| {
+                if let Some(t) = a.region_at(exec, pc).filter(|&t| t != r) {
+                    targets.insert(t);
+                }
+            };
+            match ins.op {
+                JOp::Branch { target, .. } => {
+                    to(target);
+                    to(next);
+                }
+                JOp::Jal { rd, target } => {
+                    to(target);
+                    if rd & 31 != 0 {
+                        to(next);
+                    }
+                }
+                JOp::Jalr { rd, .. } => {
+                    match direct_jalr_target(exec, a, i) {
+                        Some(t) => to(t),
+                        None if is_return(ins.op) => {}
+                        None => indirect = true,
+                    }
+                    if rd & 31 != 0 {
+                        to(next);
+                    }
+                }
+                _ => to(next),
+            }
+        }
+        out.push(if indirect {
+            Summary {
+                reads: !0,
+                writes: !0,
+            }
+        } else {
+            Summary {
+                reads: used,
+                writes: written,
+            }
+        });
+        succ.push(targets.into_iter().collect());
+    }
+    loop {
+        let mut changed = false;
+        for (r, targets) in succ.iter().enumerate() {
+            let mut s = *out.get(r)?;
+            for &t in targets {
+                let o = *out.get(t)?;
+                s.reads |= o.reads;
+                s.writes |= o.writes;
+            }
+            let slot = out.get_mut(r)?;
+            if *slot != s {
+                *slot = s;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(out);
+        }
+    }
 }
 
 /// Offsets `lo..=hi` of guest memory accesses through one base register.
@@ -492,29 +679,16 @@ impl<'a> RegionWriter<'a> {
         a: &'a Analysis,
         region: RegionId,
         layout: MemoryLayout,
+        summaries: &'a [Summary],
         o: &mut String,
-    ) -> Option<()> {
+    ) -> Option<Vec<u64>> {
         let r = a.regions.get(region)?;
-        let (mut used, mut written) = ([false; 32], [false; 32]);
-        let (mut fused, mut fwritten) = ([false; 32], [false; 32]);
-        for &i in &r.insns {
-            let u = operands(a.insns.get(i)?.op);
-            for s in u.x.into_iter().flatten().filter(|&s| s != 0) {
-                *used.get_mut(s as usize)? = true;
-            }
-            if let Some(d) = u.xw.filter(|&d| d != 0) {
-                *used.get_mut(d as usize)? = true;
-                *written.get_mut(d as usize)? = true;
-            }
-            for s in u.f.into_iter().flatten() {
-                *fused.get_mut(s as usize)? = true;
-            }
-            if let Some(d) = u.fw {
-                // A single-precision write keeps the upper half: read it too.
-                *fused.get_mut(d as usize)? = true;
-                *fwritten.get_mut(d as usize)? = true;
-            }
-        }
+        let (used_set, written_set) = region_regs(a, region)?;
+        let bit = |set: RegSet, n: usize| set >> n & 1 != 0;
+        let used: [bool; 32] = std::array::from_fn(|n| n != 0 && bit(used_set, n));
+        let written: [bool; 32] = std::array::from_fn(|n| n != 0 && bit(written_set, n));
+        let fused: [bool; 32] = std::array::from_fn(|n| bit(used_set, 32 + n));
+        let fwritten: [bool; 32] = std::array::from_fn(|n| bit(written_set, 32 + n));
         let mut w = RegionWriter {
             exec,
             a,
@@ -529,30 +703,55 @@ impl<'a> RegionWriter<'a> {
             checks: 0,
             region_checked: [[None; 32]; 2],
             region_lines: Vec::new(),
+            summaries,
+            used: used_set,
+            written: written_set,
+            index: 0,
         };
-        w.region_checks(&r.insns, &written)?;
+        // Region checks need base registers that keep their entry value:
+        // not written here, nor by a native call's callee.
+        let mut clobbered = written;
+        for &i in &r.insns {
+            let writes = match (w.native_call(i), a.insns.get(i)?.op) {
+                (Some((_, callee)), _) => summaries.get(callee)?.writes,
+                // An indirect call may write anything.
+                (None, JOp::Jalr { rd, .. }) if rd & 31 != 0 => !0,
+                _ => 0,
+            };
+            for (n, c) in clobbered.iter_mut().enumerate() {
+                *c |= bit(writes, n);
+            }
+        }
+        w.region_checks(&r.insns, &clobbered)?;
         w.body(&r.insns)?;
         // Without the limit nothing is counted (`MemoryLayout::unlimited`).
-        let entry_counts: Vec<(u64, u64)> = r
-            .entries
-            .iter()
-            .map(|&pc| {
-                (
-                    pc,
-                    if layout.unlimited {
-                        0
-                    } else {
-                        block_icount(exec, pc)
-                    },
-                )
-            })
-            .collect();
-        let control =
-            structure(&w.arms, &entry_counts).unwrap_or_else(|| dispatch(&w.arms, &entry_counts));
+        let count = |&pc: &u64| {
+            let k = if layout.unlimited {
+                0
+            } else {
+                block_icount(exec, pc)
+            };
+            (pc, k)
+        };
+        let all: Vec<(u64, u64)> = r.entries.iter().map(count).collect();
+        // Every label an entry, if that doesn't grow the code much: an
+        // entry inside a loop needs a copy of the loop (see `structure`),
+        // and the return address of every call in a loop is one.
+        // Otherwise no entries inside loops (but at their headers): what
+        // arrives there from the host or the entry table (a return whose
+        // caller isn't waiting natively) goes on in the interpreter, which
+        // enters native code again at the next entry. The dispatcher is
+        // the last resort.
+        let (control, kept) = structure(&w.arms, &all, ALL_ENTRIES_GROWTH, true)
+            .or_else(|| structure(&w.arms, &all, MAX_GROWTH, false))
+            .unwrap_or_else(|| {
+                let pcs = all.iter().map(|&(pc, _)| pc).collect();
+                (dispatch(&w.arms, &all), pcs)
+            });
 
         let _ = writeln!(
             o,
-            "        extern \"rust-preserve-none\" fn r{region}(s: &mut S<'_>, pc: u64, c: u64) {{"
+            "        pub(super) extern \"rust-preserve-none\" fn r{region}(s: &mut S<'_>, pc: u64, c: u64, d: u32) -> (u64, u64) {{"
         );
         for n in 1..32 {
             if used.get(n).copied().unwrap_or(false) {
@@ -568,7 +767,8 @@ impl<'a> RegionWriter<'a> {
         // through `s`, they would be reloaded after every guest store
         // (`s` escapes into the tail calls, so LLVM can't tell that the
         // arena doesn't overlap it).
-        let _ = writeln!(o, "            let m = &mut *s.m;");
+        // (Taken again after native calls, which need all of `s`.)
+        let _ = writeln!(o, "            let mut m = &mut *s.m;");
         let _ = writeln!(o, "            let (max, frm) = (s.max, s.frm);");
         for line in &w.region_lines {
             let _ = writeln!(o, "            {line}");
@@ -578,40 +778,52 @@ impl<'a> RegionWriter<'a> {
         let _ = writeln!(o, "                let mut pc = pc;");
         o.push_str(&control);
         let _ = writeln!(o, "            }};");
+        // Through one borrow of each file (see `native_call_body`).
+        let _ = writeln!(o, "            {{ let xs = &mut *s.x; let fs = &mut *s.f;");
         for n in 1..32 {
             if written.get(n).copied().unwrap_or(false) {
-                let _ = writeln!(o, "            s.x[{n}] = x{n};");
+                let _ = writeln!(o, "            xs[{n}] = x{n};");
             }
         }
         for n in 0..32 {
             if fwritten.get(n).copied().unwrap_or(false) {
-                let _ = writeln!(o, "            s.f[{n}] = f{n};");
+                let _ = writeln!(o, "            fs[{n}] = f{n};");
             }
         }
+        let _ = writeln!(o, "            }}");
         let _ = writeln!(o, "            match a {{");
-        let _ = writeln!(o, "                A::X(k, p) => s.out = [k, p, c],");
+        let _ = writeln!(
+            o,
+            "                A::X(k, p) => {{ s.out = [k, p, c]; (DONE, c) }}"
+        );
         let _ = writeln!(o, "                A::G(r, p) => match r {{");
         for &callee in &w.calls {
             let _ = writeln!(
                 o,
-                "                    {callee} => become r{callee}(s, p, c),"
+                "                    {callee} => become r{callee}(s, p, c, d),"
             );
         }
-        let _ = writeln!(o, "                    _ => s.out = [{EXIT_JUMP}, p, c],");
+        let _ = writeln!(
+            o,
+            "                    _ => {{ s.out = [{EXIT_JUMP}, p, c]; (DONE, c) }}"
+        );
         let _ = writeln!(o, "                }},");
         let _ = writeln!(
             o,
             "                A::I(t) => {{
                     let i = ((t >> {SHIFT}).wrapping_sub(BEGIN >> {SHIFT})) as usize;
                     if let Some(f) = s.t.get(i).copied().flatten() {{
-                        become f(s, t, c)
+                        become f(s, t, c, d)
                     }}
                     s.out = [{EXIT_INDIRECT}, t, c];
-                }}"
+                    (DONE, c)
+                }}
+                A::R(t) => (t, c),
+                A::D => (DONE, c),"
         );
         let _ = writeln!(o, "            }}");
         let _ = writeln!(o, "        }}");
-        Some(())
+        Some(kept)
     }
 
     fn line(&mut self, code: &str) {
@@ -650,6 +862,7 @@ impl<'a> RegionWriter<'a> {
                 return None;
             }
             self.pos = pos;
+            self.index = i;
             open = self.instruction(&ins)?;
             // Checks made through the old value of a written register no
             // longer apply.
@@ -717,6 +930,91 @@ impl<'a> RegionWriter<'a> {
             }
             None => self.leave(EXIT_JUMP, target),
         }
+    }
+
+    /// The call at `a.insns[i]`, if it is made as a native call: `jal` or
+    /// a constant `jalr` with a link register, to a region, returning to
+    /// a label of this region. `(target, callee region)`.
+    fn native_call(&self, i: usize) -> Option<(u64, RegionId)> {
+        let ins = self.a.insns.get(i)?;
+        let target = match ins.op {
+            JOp::Jal { rd, target } if rd & 31 != 0 => target,
+            JOp::Jalr { rd, .. } if rd & 31 != 0 => direct_jalr_target(self.exec, self.a, i)?,
+            _ => return None,
+        };
+        let next = ins.pc.wrapping_add(ins.len);
+        if !self.returns_here(next) {
+            return None;
+        }
+        Some((target, self.a.region_at(self.exec, target)?))
+    }
+
+    /// A call returning to `next` can be native: `next` is a label here.
+    fn returns_here(&self, next: u64) -> bool {
+        self.a.region_at(self.exec, next) == Some(self.region) && self.labels.contains(&next)
+    }
+
+    /// A native call to `callee` at `target`, returning to `next` (C++
+    /// `emit_function_call`): store the registers the callee may read,
+    /// call it, reload those it may write, and continue at `next` if it
+    /// returned there. A return elsewhere goes on to this region's caller,
+    /// and so does leaving for the host. Past `DEPTH` nested calls, it is
+    /// a tail call like any jump.
+    fn call(&mut self, callee: RegionId, target: u64, next: u64) {
+        let Some(&Summary { reads, writes }) = self.summaries.get(callee) else {
+            self.enter_block(target);
+            return;
+        };
+        self.line("if d < DEPTH {");
+        self.native_call_body(
+            &format!("r{callee}"),
+            &format!("{target:#x}"),
+            reads,
+            writes,
+            next,
+        );
+        self.line("} else {");
+        self.enter_block(target);
+        self.line("}");
+        self.enter_block(next);
+    }
+
+    /// The call itself, for a callee that may read `reads` and write
+    /// `writes`: on return to `next`, falls through (to the code that
+    /// enters `next`).
+    fn native_call_body(
+        &mut self,
+        func: &str,
+        target: &str,
+        reads: RegSet,
+        writes: RegSet,
+        next: u64,
+    ) {
+        let (store, load) = (self.written & reads, self.used & writes);
+        // Through one borrow of each file: through `s`, LLVM reloads the
+        // file's address after every store.
+        let regs = |set: RegSet, f: &dyn Fn(char, u64) -> String| {
+            let mut out = String::from("{ let xs = &mut *s.x; let fs = &mut *s.f;");
+            for n in 1..64u64 {
+                if set >> n & 1 != 0 {
+                    out.push(' ');
+                    out.push_str(&if n < 32 { f('x', n) } else { f('f', n - 32) });
+                }
+            }
+            out.push_str(" }");
+            out
+        };
+        if store & !1 != 0 {
+            self.line(&regs(store, &|k, n| format!("{k}s[{n}] = {k}{n};")));
+        }
+        self.line(&format!("let (ct, cc) = {func}(s, {target}, c, d + 1);"));
+        self.line("m = &mut *s.m; c = cc;");
+        if load & !1 != 0 {
+            self.line(&regs(load, &|k, n| format!("{k}{n} = {k}s[{n}];")));
+        }
+        self.line(&format!(
+            "if ct != {next:#x} {{ if ct == DONE {{ break 'x A::D; }} break 'x A::R(ct); }}"
+        ));
     }
 
     fn leave(&mut self, kind: u64, pc: u64) {
@@ -1100,7 +1398,24 @@ impl<'a> RegionWriter<'a> {
                     self.line(&format!("{} = {next:#x};", x(rd)));
                 }
                 self.check_counter(target);
-                self.enter_block(target);
+                match self.native_call(self.index) {
+                    Some((_, callee)) => self.call(callee, target, next),
+                    None => self.enter_block(target),
+                }
+                return Some(false);
+            }
+            // A constant target (`auipc`+`jalr`): like `jal`.
+            JOp::Jalr { rd, .. }
+                if let Some(target) = direct_jalr_target(self.exec, self.a, self.index) =>
+            {
+                if rd & 31 != 0 {
+                    self.line(&format!("{} = {next:#x};", x(rd)));
+                }
+                self.check_counter(target);
+                match self.native_call(self.index) {
+                    Some((_, callee)) => self.call(callee, target, next),
+                    None => self.enter_block(target),
+                }
                 return Some(false);
             }
             JOp::Jalr { rd, rs1, imm } => {
@@ -1119,7 +1434,21 @@ impl<'a> RegionWriter<'a> {
                 if !self.layout.unlimited {
                     self.line(&format!("if c >= max {{ break 'x A::X({EXIT_HALT}, t); }}"));
                 }
-                self.line("pc = t; continue 'e;");
+                if is_return(ins.op) {
+                    // To the native caller, which continues if `t` is its
+                    // return address (or `enter`, through the table).
+                    self.line("break 'x A::R(t);");
+                } else if rd & 31 != 0 && self.returns_here(next) {
+                    // An indirect call: a native call through the table.
+                    self.line(&format!(
+                        "if d < DEPTH && let Some(cf) = s.t.get(((t >> {SHIFT}).wrapping_sub(BEGIN >> {SHIFT})) as usize).copied().flatten() {{"
+                    ));
+                    self.native_call_body("cf", "t", !0, !0, next);
+                    self.line("} else { pc = t; continue 'e; }");
+                    self.enter_block(next);
+                } else {
+                    self.line("pc = t; continue 'e;");
+                }
                 return Some(false);
             }
             JOp::FLoad {

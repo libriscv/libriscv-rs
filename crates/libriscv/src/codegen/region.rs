@@ -11,7 +11,11 @@
 //! calls, never through the interpreter.
 //!
 //! The JIT and the ahead-of-time translator share this analysis, so both
-//! run exactly the same instructions natively, with the same entries.
+//! run exactly the same instructions natively. The translator forms its
+//! regions with [`Calls::Native`]: a call's return address stays in the
+//! caller's region (it calls the callee as a Rust function and continues
+//! there when the callee returns), and the target of an `auipc`+`jalr`
+//! pair is known, like a `jal`'s.
 
 use std::collections::BTreeSet;
 
@@ -22,6 +26,11 @@ pub(crate) use crate::native_code::block_icount;
 /// The most instructions in one region. Bounds the size of a single
 /// Cranelift (or Rust) function, which keeps compile time roughly linear.
 const MAX_REGION_INSNS: usize = 2048;
+
+/// The most instructions in one region with [`Calls::Native`], whose
+/// regions are whole functions: `rustc` (LLVM) takes superlinear time on
+/// large functions.
+const MAX_NATIVE_REGION_INSNS: usize = 512;
 
 /// A compilable instruction.
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +46,19 @@ pub(crate) struct Insn {
 
 /// Index of a region.
 pub(crate) type RegionId = usize;
+
+/// How regions treat calls (`jal`/`jalr` with a link register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Calls {
+    /// A call leaves the region, and so does its return (the JIT's
+    /// regions: the callee is tail-called, and returns through the entry
+    /// table).
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
+    Leave,
+    /// The return address is in the caller's region, and `auipc`+`jalr`
+    /// targets are entries (the AOT translator's regions).
+    Native,
+}
 
 /// One region: its instructions (ascending) and its entry points.
 #[derive(Debug, Default)]
@@ -58,6 +80,9 @@ pub(crate) struct Analysis {
     pub regions: Vec<Region>,
     /// `insns` index -> region.
     pub region_of: Vec<RegionId>,
+    /// `(insns index, target)` of every `jalr` whose target is a constant
+    /// (see [`Analysis::jalr_target`]), ascending.
+    jalr_targets: Vec<(usize, u64)>,
 }
 
 impl Analysis {
@@ -76,9 +101,50 @@ impl Analysis {
         self.insn_at(exec, pc)
             .and_then(|i| self.region_of.get(i).copied())
     }
+
+    /// The target of the `jalr` at `insns[i]` when it's a constant: the
+    /// instruction before it sets its base register to a constant
+    /// (`auipc`, `lui`, `li`) and nothing else reaches the `jalr` (it
+    /// doesn't begin a block and isn't a branch target).
+    pub(crate) fn jalr_target(&self, i: usize) -> Option<u64> {
+        self.jalr_targets
+            .binary_search_by_key(&i, |&(j, _)| j)
+            .ok()
+            .and_then(|k| self.jalr_targets.get(k))
+            .map(|&(_, t)| t)
+    }
 }
 
-pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
+/// The constant `jalr` targets of [`Analysis::jalr_target`].
+fn find_jalr_targets(exec: &DecodedSegment, a: &Analysis) -> Vec<(usize, u64)> {
+    let direct: BTreeSet<u64> = a
+        .insns
+        .iter()
+        .filter_map(|ins| match ins.op {
+            JOp::Branch { target, .. } | JOp::Jal { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, pair) in a.insns.windows(2).enumerate() {
+        let [prev, ins] = pair else { continue };
+        let (JOp::Const { rd, value }, JOp::Jalr { rs1, imm, .. }) = (prev.op, ins.op) else {
+            continue;
+        };
+        if rd != rs1
+            || rs1 == 0
+            || prev.pc.wrapping_add(prev.len) != ins.pc
+            || direct.contains(&ins.pc)
+            || a.block_starts.binary_search(&exec.index(ins.pc)).is_ok()
+        {
+            continue;
+        }
+        out.push((i + 1, value.wrapping_add(imm as u64) & !1));
+    }
+    out
+}
+
+pub(crate) fn analyse(exec: &DecodedSegment, calls: Calls) -> Analysis {
     let mut insns = Vec::new();
     let mut by_index = vec![None; exec.cache.len()];
     let mut block_starts = Vec::new();
@@ -144,24 +210,30 @@ pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
         by_index,
         block_starts,
         regions: Vec::new(),
+        jalr_targets: Vec::new(),
     };
-    form_regions(exec, &mut a);
+    a.jalr_targets = find_jalr_targets(exec, &a);
+    form_regions(exec, &mut a, calls);
     a
 }
 
 /// The direct successors of `ins` that stay in its region: fall-through,
-/// branch targets and `JAL x0` targets. Calls and indirect jumps leave.
-fn successors(ins: &Insn) -> [Option<u64>; 2] {
+/// branch targets and `JAL x0` targets. Calls and indirect jumps leave;
+/// with [`Calls::Native`], a call's return address stays.
+fn successors(ins: &Insn, calls: Calls) -> [Option<u64>; 2] {
     let next = Some(ins.pc.wrapping_add(ins.len));
     match ins.op {
         JOp::Branch { target, .. } => [Some(target), next],
         JOp::Jal { rd: 0, target } => [Some(target), None],
+        JOp::Jal { rd, .. } | JOp::Jalr { rd, .. } if rd != 0 && calls == Calls::Native => {
+            [next, None]
+        }
         JOp::Jal { .. } | JOp::Jalr { .. } => [None, None],
         _ => [next, None],
     }
 }
 
-fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
+fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
     // Entry candidates: every compilable block start and direct target, in
     // address order. Then every remaining instruction, for anything a size
     // limit cut off.
@@ -169,6 +241,24 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
     for ins in &a.insns {
         if let JOp::Branch { target, .. } | JOp::Jal { target, .. } = ins.op {
             seeds.insert(target);
+        }
+    }
+    // Function entries: what calls go to. A call's return address that is
+    // one (after a call that doesn't return) begins another function, and
+    // doesn't join the caller's region.
+    let mut functions = BTreeSet::new();
+    if calls == Calls::Native {
+        seeds.extend(a.jalr_targets.iter().map(|&(_, t)| t));
+        for (i, ins) in a.insns.iter().enumerate() {
+            match ins.op {
+                JOp::Jal { rd, target } if rd != 0 => {
+                    functions.insert(target);
+                }
+                JOp::Jalr { rd, .. } if rd != 0 => {
+                    functions.extend(a.jalr_target(i));
+                }
+                _ => {}
+            }
         }
     }
     let fallback: Vec<u64> = a.insns.iter().map(|i| i.pc).collect();
@@ -187,7 +277,11 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
         work.clear();
         work.push(start);
         while let Some(i) = work.pop() {
-            if region.insns.len() >= MAX_REGION_INSNS {
+            let max = match calls {
+                Calls::Leave => MAX_REGION_INSNS,
+                Calls::Native => MAX_NATIVE_REGION_INSNS,
+            };
+            if region.insns.len() >= max {
                 break;
             }
             match a.region_of.get_mut(i) {
@@ -196,7 +290,11 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
             }
             region.insns.push(i);
             let Some(ins) = a.insns.get(i) else { continue };
-            for succ in successors(ins).into_iter().flatten() {
+            let call = matches!(ins.op, JOp::Jal { rd, .. } | JOp::Jalr { rd, .. } if rd != 0);
+            for succ in successors(ins, calls).into_iter().flatten() {
+                if call && functions.contains(&succ) {
+                    continue;
+                }
                 if let Some(j) = a.insn_at(exec, succ) {
                     work.push(j);
                 }
@@ -218,15 +316,17 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
     for (i, ins) in a.insns.iter().enumerate() {
         let own = a.region_of.get(i).copied();
         let next = ins.pc.wrapping_add(ins.len);
+        let jalr = (calls == Calls::Native).then(|| a.jalr_target(i)).flatten();
         let targets = match ins.op {
             JOp::Branch { target, .. } => [Some(target), Some(next)],
             JOp::Jal { target, .. } => [Some(target), None],
-            JOp::Jalr { .. } => [None, None],
+            JOp::Jalr { .. } => [jalr, None],
             _ => [Some(next), None],
         };
         for t in targets.into_iter().flatten() {
             if let Some(r) = a.region_at(exec, t) {
-                let is_direct_target = matches!(ins.op, JOp::Branch { target, .. } | JOp::Jal { target, .. } if target == t);
+                let is_direct_target = jalr == Some(t)
+                    || matches!(ins.op, JOp::Branch { target, .. } | JOp::Jal { target, .. } if target == t);
                 // Native code leaves at a dyncall and comes back after it.
                 let after_dyncall = matches!(ins.op, JOp::Dyncall);
                 if Some(r) != own || is_direct_target || after_dyncall {

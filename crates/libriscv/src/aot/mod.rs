@@ -447,7 +447,7 @@ pub(crate) fn install(key: &AotKey, exec: &mut DecodedSegment) -> bool {
 
 /// Translate `exec` (a new segment, before any native code) for `layout`.
 pub(crate) fn translate(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Translation> {
-    let analysis = region::analyse(exec);
+    let analysis = region::analyse(exec, region::Calls::Native);
     emit::translate(exec, &analysis, layout)
 }
 

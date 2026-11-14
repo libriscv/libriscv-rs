@@ -744,25 +744,27 @@ of the x86-64 target features the translation was compiled with
 (`cfg!(target_feature)`, evaluated where it is compiled; `ABI_VERSION` 2),
 and a CPU lacking any refuses it instead of dying of SIGILL.
 
-**Semantics.** Exactly the JIT's: the same instruction selection and
-regions (`codegen::{classify, region}`, moved out of `jit/`), the same
-counting (block counts on entry, mid-block exits pre-subtract), the same
+**Semantics.** Exactly the JIT's: the same instruction selection
+(`codegen::{classify, region}`, moved out of `jit/`), the same counting (block counts on entry, mid-block exits pre-subtract), the same
 exits (`native_code::EXIT_*`: halt, jump, indirect, slow access,
 misaligned jump, dyncall) back to `native_enter`. F/D use Rust's IEEE
 operations; FMIN/FMAX, FCVT to integers and FCLASS are written out like
 the interpreter's, and FCVT.S.D/D.S give the canonical NaN like the
 interpreter (as does the JIT); otherwise which NaN comes out is the
-host's (as for the JIT).
+host's (as for the JIT). Regions differ (`region::Calls::Native`, see
+"Native calls").
 
 **Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
-fn r<N>(s: &mut S, pc, counter)`. Guest registers it uses are locals,
-loaded on entry and the written ones stored at the single exit (C++
-register caching). Leaving is an `A` value: return to the host with an
-exit kind, a direct tail call to another region (`become r<M>(..)`), or an
-indirect jump through the segment's entry table (`become f(..)`, a
-`OnceLock`ed table of `fn` pointers by decoder index), so calls, returns
-and loops never go back through the interpreter (C++'s translated
-functions can't call each other: C has no guaranteed tail calls). Guest
+fn r<N>(s: &mut S, pc, counter, depth) -> (target, counter)`, in modules
+of 40 regions (`rustc` splits codegen units by module: one module per
+segment compiled static glibc on one thread). Guest registers it uses are
+locals, loaded on entry and the written ones stored at the single exit
+(C++ register caching). Leaving is an `A` value: return to the host with
+an exit kind, a direct tail call to another region (`become r<M>(..)`),
+an indirect jump through the segment's entry table (`become f(..)`, a
+`OnceLock`ed table of `fn` pointers by decoder index), or a guest return
+(`jalr x0, rs1` with `rs1` `ra` or `t0`), which returns its target to the
+native caller (`enter` loops on such targets through the table). Guest
 memory is a `&mut [u8; N]`, `N` covering the layout's windows plus the
 widest access: after the window check (the interpreter's: start address
 only) every index is provably in bounds and no second check is emitted.
@@ -781,6 +783,28 @@ mode are locals: read through `s`, which escapes into the tail calls,
 they were reloaded after every guest store. With an N-bit
 address space accesses are masked, without checks.
 
+**Native calls** (2026-11-14; C++ `emit_function_call`). A call (`jal`,
+or `jalr` with a link register, including `auipc`+`jalr` with a constant
+target, `Analysis::jalr_target`, which `-mno-relax` code uses for every
+call) is a Rust call when its return address is a label of the caller's
+region: regions with `Calls::Native` keep a call's return address (unless
+something calls it: after a `noreturn` call it begins another function)
+and are capped at 512 instructions, since they are whole functions. The
+caller stores the registers the callee may read, calls (directly, or
+through the entry table for an indirect call), reloads those it may
+write, and continues at the return address if the callee returned there;
+any other return target goes on to its own caller, and so does `DONE` (an
+exit to the host, already in `S::out`). What a region may read and write
+is a `Summary`: its own registers and, to a fixed point, those of the
+regions it transfers to; all of them after an indirect jump. Region
+checks only cover base registers no native callee may write. Past `DEPTH`
+(32) nested calls, a call is a tail call as before, and the return comes
+back through the table. The register stores and reloads go through one
+borrow of each register file: through `s`, LLVM reloaded the file's
+address after every store. Before this, a call in a loop cost three
+region transfers, each storing and reloading every register (CoreMark's
+`core_bench_state` ran 9x the instructions native code does).
+
 **Control flow** (`aot/structure.rs`). A `loop { match pc { .. } }`
 dispatcher (what `structure::dispatch` writes) was 2.4x slower than the JIT
 on a static glibc program: LLVM doesn't thread constant `pc` assignments
@@ -794,9 +818,13 @@ such entries (and statically irreducible edges) go to a copy of the
 loop's body without its header, which enters the loop at its header;
 nested loops recursively (a copy made for an entry from inside an
 enclosing loop counts as inside it). Growth is bounded by the nesting
-depth; past 8x, or if the result isn't reducible, the region falls back
-to the dispatcher (the tests assert it never does; static glibc and
-CoreMark have no fallback).
+depth. With native calls every call in a loop puts a return address (an
+entry) inside it, so a region whose code would grow past 2x is laid out
+with no entries inside loops (but at their headers): the host and the
+table can't enter there, and the interpreter runs on to the next entry
+(at most to the loop header). Past 8x even so, or if the result isn't
+reducible, the region falls back to the dispatcher (static glibc has one
+such region, CoreMark none).
 
 **Performance** (2026-11-13, idle box, release `rvlinux`): static glibc
 collatz 229 ms vs JIT 237 ms (interpreter 1893 ms); CoreMark 1.0 (bench
@@ -810,9 +838,17 @@ AOT 1.48 / 1.48 s (1.50 / 1.50 s before region checks and locals), with
 and AOT 1.19 / 1.23 s. Native x86-64 `-O2` CoreMark runs the same
 iterations in ~0.63 s. What the checked build still pays is the one
 compare per access in pointer-chasing loops (no shared base to merge)
-and the precise exits it needs. Static glibc
-translates (~470 KB of code) to ~16 MB of Rust in 70 ms; `rustc` takes
-~65 s for it, CoreMark freestanding a few seconds.
+and the precise exits it needs.
+2026-11-14, same CoreMark, rv64imafdc, N-bit: no instruction limit 1.10 s
+(from 1.21), native calls 0.97 s, the call depth in a register and one
+borrow per register file 0.89 s, no side entries in large regions
+0.88 s (checked: 1.47 to ~1.2 s). Per iteration that is ~600k host
+instructions and ~165k cycles against native's ~400k and ~136k; most of
+the remaining gap is the register stores and reloads at calls and region
+entries, and callers' spills around calls (`rust-preserve-none` saves
+nothing). Static glibc translates (~470 KB of code) to ~19 MB of Rust in
+0.1 s; `rustc` takes ~47 s for it on 32 cores (one module took 72 s,
+single-threaded), CoreMark freestanding a few seconds.
 
 **Testing.** `libriscv`'s `tests/aot.rs` (feature `aot-dylib`, needs
 `rustc`): the JIT tests' programs (hand-written, 150 random integer and
@@ -821,14 +857,18 @@ at the window edges with and without a program, layouts), each test
 translating its programs into one shared object and comparing complete
 machine state with the interpreter at many instruction limits;
 `LIBRISCV_AOT_FUZZ=<programs>[:<seed>]` for longer sessions (3000 integer
-and 2000 FP programs clean). `rvlinux`'s `tests/aot.rs`: freestanding
+and 2000 FP programs clean), and native calls (recursion past `DEPTH`,
+`auipc`+`jalr` and indirect calls, a callee moving the caller's base
+register, a callee leaving for the host, a return elsewhere, FP registers
+across calls). `rvlinux`'s `tests/aot.rs`: freestanding
 CoreMark through `--aot-save-shared`/`--aot-load`, layouts, `--no-aot`,
 bad files; ignored because slow: static glibc (~1 min) and the embedded
 translation (builds `rvlinux` again in `target/aot-embed`).
 
 Not yet: lazy translation, translating only hot code, more registers
-across region transfers, saving translations of segments that came from
-the cache.
+across region transfers and calls (passed as arguments instead of through
+`S::x`), liveness-based stores and reloads at calls, saving translations
+of segments that came from the cache.
 
 ## Virtual paging
 

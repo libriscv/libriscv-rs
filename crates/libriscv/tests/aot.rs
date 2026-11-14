@@ -236,6 +236,127 @@ fn hand_written_programs_match_the_interpreter() {
     assert_eq!(m.cpu.reg(10), 3 * 5050);
 }
 
+/// `auipc rd, 0`.
+const fn auipc(rd: u32) -> u32 {
+    (rd << 7) | 0x17
+}
+
+/// Native calls (calls as Rust calls, returning to the caller's region):
+/// recursion past the native depth limit, `auipc`+`jalr` and indirect
+/// calls, a callee writing a base register the caller checks on entry, a
+/// callee leaving for the host (the caller's frame is gone: its return
+/// goes through the entry table), a return elsewhere than after the call,
+/// and FP registers live across calls.
+#[test]
+fn native_calls_match_the_interpreter() {
+    if !have_rustc() {
+        return;
+    }
+    let mut programs = Vec::new();
+    // sum(n) = n + sum(n - 1), recursively, 100 deep.
+    let mut stack_regs = [0u64; 64];
+    stack_regs[2] = SCRATCH + SCRATCH_LEN;
+    programs.push((
+        words(&[
+            itype(0x13, 0, 10, 0, 100),    // 0x00: li a0, 100
+            jtype(1, 0x0C),                // 0x04: jal ra, f (0x10)
+            jtype(0, 0),                   // 0x08: j .
+            0x13,                          // 0x0C: nop
+            itype(0x13, 0, 2, 2, -16),     // 0x10: f: addi sp, sp, -16
+            stype(3, 2, 1, 8),             // 0x14: sd ra, 8(sp)
+            stype(3, 2, 10, 0),            // 0x18: sd a0, 0(sp)
+            btype(0, 10, 0, 0x18),         // 0x1C: beqz a0, 0x34
+            itype(0x13, 0, 10, 10, -1),    // 0x20: addi a0, a0, -1
+            jtype(1, -0x14),               // 0x24: jal ra, f
+            itype(0x03, 3, 11, 2, 0),      // 0x28: ld a1, 0(sp)
+            rtype(0x33, 0, 0, 10, 10, 11), // 0x2C: add a0, a0, a1
+            jtype(0, 8),                   // 0x30: j 0x38
+            itype(0x13, 0, 10, 0, 0),      // 0x34: li a0, 0
+            itype(0x03, 3, 1, 2, 8),       // 0x38: ld ra, 8(sp)
+            itype(0x13, 0, 2, 2, 16),      // 0x3C: addi sp, sp, 16
+            itype(0x67, 0, 0, 1, 0),       // 0x40: ret
+        ]),
+        stack_regs,
+    ));
+    // `auipc`+`jalr` to g, an indirect call to h, which moves t0, the
+    // base register of the caller's loads.
+    let mut base_regs = [0u64; 64];
+    base_regs[BASE as usize] = SCRATCH;
+    programs.push((
+        words(&[
+            itype(0x13, 0, 10, 0, 0),      // 0x00: li a0, 0
+            itype(0x13, 0, 11, 0, 10),     // 0x04: li a1, 10
+            itype(0x03, 3, 13, BASE, 8),   // 0x08: loop: ld a3, 8(t0)
+            auipc(1),                      // 0x0C: auipc ra, 0
+            itype(0x67, 0, 1, 1, 0x30),    // 0x10: jalr ra, 0x30(ra): g
+            auipc(6),                      // 0x14: auipc t1, 0
+            itype(0x13, 0, 6, 6, 0x30),    // 0x18: addi t1, t1, 0x30: h
+            itype(0x67, 0, 1, 6, 0),       // 0x1C: jalr ra, 0(t1)
+            itype(0x03, 3, 12, BASE, 0),   // 0x20: ld a2, 0(t0)
+            rtype(0x33, 0, 0, 10, 10, 12), // 0x24: add a0, a0, a2
+            rtype(0x33, 0, 0, 10, 10, 13), // 0x28: add a0, a0, a3
+            itype(0x13, 0, 11, 11, -1),    // 0x2C: addi a1, a1, -1
+            btype(1, 11, 0, -0x28),        // 0x30: bnez a1, loop
+            jtype(0, 0),                   // 0x34: j .
+            0x13,                          // 0x38: nop
+            itype(0x13, 0, 10, 10, 1),     // 0x3C: g: addi a0, a0, 1
+            itype(0x67, 0, 0, 1, 0),       // 0x40: ret
+            itype(0x13, 0, BASE, BASE, 8), // 0x44: h: addi t0, t0, 8
+            stype(3, BASE, 11, 0),         // 0x48: sd a1, 0(t0)
+            itype(0x67, 0, 0, 1, 0),       // 0x4C: ret
+        ]),
+        base_regs,
+    ));
+    // f makes a system call (native code leaves for the host), k returns
+    // past the instruction after its call.
+    programs.push((
+        words(&[
+            itype(0x13, 0, 11, 0, 5),    // 0x00: li a1, 5
+            jtype(1, 0x1C),              // 0x04: loop: jal ra, f (0x20)
+            itype(0x13, 0, 11, 11, -1),  // 0x08: addi a1, a1, -1
+            btype(1, 11, 0, -8),         // 0x0C: bnez a1, loop
+            jtype(1, 0x20),              // 0x10: jal ra, k (0x30)
+            itype(0x13, 0, 10, 10, 100), // 0x14: addi a0, a0, 100 (skipped)
+            itype(0x13, 0, 10, 10, 7),   // 0x18: addi a0, a0, 7
+            jtype(0, 0),                 // 0x1C: j .
+            itype(0x13, 0, 17, 0, 300),  // 0x20: f: li a7, 300 (unhandled)
+            ECALL,                       // 0x24: ecall
+            itype(0x13, 0, 10, 10, 1),   // 0x28: addi a0, a0, 1
+            itype(0x67, 0, 0, 1, 0),     // 0x2C: ret
+            itype(0x13, 0, 1, 1, 4),     // 0x30: k: addi ra, ra, 4
+            itype(0x67, 0, 0, 1, 0),     // 0x34: ret
+        ]),
+        [0; 64],
+    ));
+    // FP registers live across calls: f0 doubles in g.
+    #[cfg(all(feature = "ext-f", not(feature = "debug-checks")))]
+    programs.push((
+        words(&[
+            itype(0x13, 0, 10, 0, 3),   // 0x00: li a0, 3
+            fp(0x1E, 1, 0, 0, 10, 0),   // 0x04: fmv.d.x f0, a0
+            itype(0x13, 0, 11, 0, 4),   // 0x08: li a1, 4
+            jtype(1, 0x14),             // 0x0C: loop: jal ra, g (0x20)
+            itype(0x13, 0, 11, 11, -1), // 0x10: addi a1, a1, -1
+            btype(1, 11, 0, -8),        // 0x14: bnez a1, loop
+            fp(0x1C, 1, 0, 12, 0, 0),   // 0x18: fmv.x.d a2, f0
+            jtype(0, 0),                // 0x1C: j .
+            fp(0x00, 1, 0, 0, 0, 0),    // 0x20: g: fadd.d f0, f0, f0
+            itype(0x67, 0, 0, 1, 0),    // 0x24: ret
+        ]),
+        [0; 64],
+    ));
+    let mut fuels = fuels();
+    fuels.extend(380..420);
+    fuels.extend([1999, 2000, 2001, 5000]);
+    let translated = check_programs("native-calls", &programs, &fuels);
+    assert_eq!(translated, programs.len());
+    // The recursion and the loops ran to the end.
+    let mut m = machine(&programs[0].0, true);
+    assert_eq!(run(&mut m, &stack_regs, 100_000).regs[10], 5050);
+    let mut m = machine(&programs[2].0, true);
+    assert_eq!(run(&mut m, &[0; 64], 100_000).regs[10], 5 + 7);
+}
+
 /// `LIBRISCV_AOT_FUZZ=<programs>[:<seed>]` runs a longer session (one
 /// translation, so more programs mean a longer compile).
 #[test]

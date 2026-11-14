@@ -35,7 +35,7 @@ use std::fmt::Write as _;
 use super::emit::{Arm, Item};
 
 /// Give up (and use [`dispatch`]) beyond this many nodes per label.
-const MAX_GROWTH: usize = 8;
+pub(super) const MAX_GROWTH: usize = 8;
 
 /// The region's control flow as a `loop { match pc { .. } }` dispatcher:
 /// the root `match` adds the entry's block count, the inner one runs the
@@ -546,10 +546,19 @@ fn count(k: u64) -> String {
     }
 }
 
-/// The region's control flow as structured code, or `None` if it can't be
-/// laid out (then use [`dispatch`]). `entry_counts` are the labels with
-/// the block count entering there adds.
-pub(super) fn structure(arms: &[Arm], entry_counts: &[(u64, u64)]) -> Option<String> {
+/// The region's control flow as structured code, and the entries it has,
+/// or `None` if it can't be laid out within `max_growth` nodes per label
+/// (then use [`dispatch`]). `entry_counts` are the labels with the block
+/// count entering there adds. Without `side_entries`, the entries that
+/// would enter a loop anywhere but at its header are left out, and need
+/// no copies: what arrives there from outside must go elsewhere (the
+/// interpreter runs on to an entry).
+pub(super) fn structure(
+    arms: &[Arm],
+    entry_counts: &[(u64, u64)],
+    max_growth: usize,
+    side_entries: bool,
+) -> Option<(String, Vec<u64>)> {
     let index: HashMap<u64, usize> = arms.iter().enumerate().map(|(i, a)| (a.pc, i)).collect();
     let n = arms.len();
     let mut succ = vec![Vec::new(); n];
@@ -577,17 +586,31 @@ pub(super) fn structure(arms: &[Arm], entry_counts: &[(u64, u64)]) -> Option<Str
         succ: vec![Vec::new()],
         work: Vec::new(),
     };
-    // The root: every label is an entry.
+    // The root: every label is an entry (or every one outside loops and
+    // at their headers).
     let mut root = Vec::with_capacity(entry_counts.len());
     let mut entries = Vec::with_capacity(entry_counts.len());
+    let mut kept = Vec::with_capacity(entry_counts.len());
     for &(pc, k) in entry_counts {
         let label = *index.get(&pc)?;
+        if !side_entries {
+            let top = b.scopes.first()?;
+            let side = top
+                .chains
+                .get(label)?
+                .iter()
+                .any(|&l| top.loops.get(l).is_some_and(|lp| lp.header != label));
+            if side {
+                continue;
+            }
+        }
         entries.push(b.resolve(0, &[], label)?);
         root.push(format!("{pc:#x} => {{ {}", count(k)));
+        kept.push(pc);
     }
     *b.succ.get_mut(0)? = entries;
     while let Some(v) = b.work.pop() {
-        if b.label.len() > MAX_GROWTH * n + 16 {
+        if b.label.len() > max_growth * n + 16 {
             return None;
         }
         let (label, scope) = (*b.label.get(v)?, *b.scope_of.get(v)?);
@@ -611,7 +634,7 @@ pub(super) fn structure(arms: &[Arm], entry_counts: &[(u64, u64)]) -> Option<Str
     w.out.push_str("'e: loop {\n");
     w.do_tree(0)?;
     w.out.push_str("}\n");
-    Some(w.out)
+    Some((w.out, kept))
 }
 
 #[cfg(test)]
@@ -628,7 +651,7 @@ mod tests {
             items: vec![Item::Branch(0x1000)],
         }];
         let entries = [(0x1000, 1), (0x2000, 3)];
-        assert!(structure(&arms, &entries).is_none());
+        assert!(structure(&arms, &entries, MAX_GROWTH, true).is_none());
         let code = dispatch(&arms, &entries);
         assert!(
             code.contains("0x1000 => { c = c.wrapping_add(1); }"),
