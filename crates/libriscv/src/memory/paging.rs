@@ -658,7 +658,7 @@ impl Memory {
     }
 
     /// `create_writable_pageno` and its bytes.
-    fn writable_page(&mut self, pageno: u64) -> Result<&mut PageBytes> {
+    pub(super) fn writable_page(&mut self, pageno: u64) -> Result<&mut PageBytes> {
         let slot = self.create_writable_pageno(pageno)?;
         self.writable_bytes(pageno, slot)
     }

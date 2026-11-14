@@ -1188,4 +1188,127 @@ mod tests {
         assert_eq!(mem.memcmp_guest_diff(a, a + len + 1, len).unwrap(), 0);
         assert!(start.elapsed().as_secs() < 5, "{:?}", start.elapsed());
     }
+
+    /// The native memcpy outside the arena copies a page-bounded chunk at
+    /// a time; it must leave memory, faults and created pages exactly as
+    /// C++'s loop of loads and stores (`memcpy_within_elementwise`) does.
+    #[test]
+    fn memcpy_in_chunks_matches_the_element_loop() {
+        const P: u64 = PAGE_SIZE;
+        let far = 0x10_0000_0000;
+        let top = 0u64.wrapping_sub(2 * P); // wraps into the arena
+        let none = PageAttributes {
+            read: false,
+            write: false,
+            exec: false,
+            ..PageAttributes::default()
+        };
+        let read_only = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        // (memory_max, dst, src, len, unreadable source page, read-only
+        // destination page)
+        type Case = (u64, u64, u64, u64, Option<u64>, Option<u64>);
+        let cases: Vec<Case> = vec![
+            // Apart, aligned alike (words) and not (bytes).
+            (MIB, far + 0x10_0000 + 8, far + 8, 5 * P + 13, None, None),
+            (MIB, far + 0x10_0000 + 3, far + 8, 5 * P + 13, None, None),
+            (MIB, far + 0x10_0000, far + 0x7F9, 3 * P, None, None),
+            // Overlapping: dst ahead (forward copies repeat), behind, same.
+            (MIB, far + 1, far, 3 * P, None, None),
+            (MIB, far + 8, far, 3 * P, None, None),
+            (MIB, far + 40, far + 8, 3 * P, None, None),
+            (MIB, far + P + 24, far + 24, 3 * P, None, None),
+            (MIB, far, far + 8, 3 * P, None, None),
+            (MIB, far, far + 1, 3 * P, None, None),
+            (MIB, far + 16, far + 16, 3 * P, None, None),
+            // A fault part of the way: the source, then the destination.
+            (
+                MIB,
+                far + 0x10_0000 + 8,
+                far + 8,
+                5 * P,
+                Some(far + 2 * P),
+                None,
+            ),
+            (
+                MIB,
+                far + 0x10_0000 + 5,
+                far + 9,
+                5 * P,
+                Some(far + 3 * P),
+                None,
+            ),
+            (
+                MIB,
+                far + 0x10_0000 + 8,
+                far + 8,
+                5 * P,
+                None,
+                Some(far + 0x10_0000 + 2 * P),
+            ),
+            // Out of memory part of the way (zero pages to new pages).
+            (MIB, far + 0x100_0000, far + 0x200_0000, 400 * P, None, None),
+            (MIB, far + 0x100_0003, far + 0x200_0000, 400 * P, None, None),
+            // Between the arena and the pages outside it.
+            (MIB, far + 8, 0x3008, 3 * P, None, None),
+            (MIB, MIB - P + 8, far + 8, 3 * P, None, None),
+            // src wrapping into the arena, its 32-byte steps landing on 0
+            // (the arena shortcut) or not (a load from the guard page).
+            (MIB, far + 0x10_0000, top, 2 * P + 0x3000, None, None),
+            (MIB, far + 0x10_0008, top + 8, 2 * P + 0x3000, None, None),
+            (MIB, far + 0x10_0010, top + 16, 2 * P + 0x3000, None, None),
+            (MIB, far + 0x10_0003, top + 5, 2 * P + 0x3000, None, None),
+            // dst wrapping.
+            (MIB, top + 8, far + 8, 3 * P, None, None),
+        ];
+        for (i, &(max, dst, src, len, unreadable, read_only_page)) in cases.iter().enumerate() {
+            let setup = || {
+                let mut mem = empty_memory(max);
+                let data: Vec<u8> = (0..4 * P).map(|i| (i * 13 % 251) as u8 + 1).collect();
+                for base in [far, far + 0x10_0000, 0x3000, top] {
+                    let _ = mem.memcpy(base, &data);
+                }
+                if let Some(page) = unreadable {
+                    mem.set_page_attr(page, P, none).unwrap();
+                }
+                if let Some(page) = read_only_page {
+                    mem.set_page_attr(page, P, read_only).unwrap();
+                }
+                mem
+            };
+            let (mut chunked, mut reference) = (setup(), setup());
+            let got = chunked
+                .memcpy_within(dst, src, len)
+                .map_err(|e| (e.kind, e.data));
+            let expected = reference
+                .memcpy_within_elementwise(dst, src, len)
+                .map_err(|e| (e.kind, e.data));
+            assert_eq!(got, expected, "case {i}");
+            assert_eq!(chunked.pages_active(), reference.pages_active(), "case {i}");
+            for base in [dst, src] {
+                for off in (0..len.min(8 * P) + 64).step_by(7) {
+                    let addr = base.wrapping_add(off);
+                    assert_eq!(
+                        chunked.read_u8(addr).map_err(|e| e.data),
+                        reference.read_u8(addr).map_err(|e| e.data),
+                        "case {i} at {addr:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A native memcpy of 16 MiB between pages outside the arena, not
+    /// aligned alike (a byte at a time in C++'s loop): `nativefuzzer`
+    /// inputs took 14 s copying a byte at a time.
+    #[test]
+    fn a_long_memcpy_outside_the_arena_is_fast() {
+        let mut mem = empty_memory(64 * MIB);
+        let start = std::time::Instant::now();
+        let a = 0x10_0000_0000;
+        mem.memcpy_within(a + 0x1000_0003, a, 16 * MIB).unwrap();
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+    }
 }

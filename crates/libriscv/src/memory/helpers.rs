@@ -605,6 +605,81 @@ impl Memory {
                     let tmp = self.arena.get(s).unwrap_or_default().to_vec();
                     return self.memcpy(dst, &tmp);
                 }
+                // Whole steps if `src` wraps, see `paged_copy_chunk`.
+                let step = if src.checked_add(len).is_none() {
+                    4 * W
+                } else {
+                    1
+                };
+                let n = self.paged_copy_chunk(dst, src, len) / step * step;
+                if n > 0 {
+                    self.copy_paged_chunk(dst, src, n)?;
+                    dst = dst.wrapping_add(n);
+                    src = src.wrapping_add(n);
+                    len -= n;
+                    continue;
+                }
+                for i in 0..4 {
+                    let v = self.read_u64(src.wrapping_add(i * W))?;
+                    self.write_u64(dst.wrapping_add(i * W), v)?;
+                }
+                dst = dst.wrapping_add(4 * W);
+                src = src.wrapping_add(4 * W);
+                len -= 4 * W;
+            }
+            while len >= W {
+                let v = self.read_u64(src)?;
+                self.write_u64(dst, v)?;
+                dst = dst.wrapping_add(W);
+                src = src.wrapping_add(W);
+                len -= W;
+            }
+        }
+        while len > 0 {
+            let n = self.paged_copy_chunk(dst, src, len);
+            if n > 0 {
+                self.copy_paged_chunk(dst, src, n)?;
+                dst = dst.wrapping_add(n);
+                src = src.wrapping_add(n);
+                len -= n;
+                continue;
+            }
+            let v = self.read_u8(src)?;
+            self.write_u8(dst, v)?;
+            dst = dst.wrapping_add(1);
+            src = src.wrapping_add(1);
+            len -= 1;
+        }
+        Ok(())
+    }
+
+    /// The element-wise loop [`memcpy_within`](Self::memcpy_within) had
+    /// before copying in chunks (C++'s), to test the chunks against.
+    #[cfg(test)]
+    pub(super) fn memcpy_within_elementwise(&mut self, dst: u64, src: u64, len: u64) -> Result<()> {
+        let (mut dst, mut src, mut len) = (dst, src, len);
+        if let Some(s) = self.write_window_range(src, len) {
+            if let Some(d) = self.write_window_range(dst, len) {
+                self.arena.copy_within(s, d.start);
+                return Ok(());
+            }
+            let tmp = self.arena.get(s).unwrap_or_default().to_vec();
+            return self.memcpy(dst, &tmp);
+        }
+        const W: u64 = 8;
+        if (dst & (W - 1)) == (src & (W - 1)) {
+            while (src & (W - 1)) != 0 && len > 0 {
+                let v = self.read_u8(src)?;
+                self.write_u8(dst, v)?;
+                dst = dst.wrapping_add(1);
+                src = src.wrapping_add(1);
+                len -= 1;
+            }
+            while len >= 4 * W {
+                if let Some(s) = self.write_window_range(src, len) {
+                    let tmp = self.arena.get(s).unwrap_or_default().to_vec();
+                    return self.memcpy(dst, &tmp);
+                }
                 for i in 0..4 {
                     let v = self.read_u64(src.wrapping_add(i * W))?;
                     self.write_u64(dst.wrapping_add(i * W), v)?;
@@ -627,6 +702,67 @@ impl Memory {
             dst = dst.wrapping_add(1);
             src = src.wrapping_add(1);
             len -= 1;
+        }
+        Ok(())
+    }
+
+    /// How many of the next `len` bytes [`memcpy_within`](Self::memcpy_within)
+    /// can copy at once instead of a byte or word at a time (C++'s loop,
+    /// with a page lookup per element; a native memcpy of up to 512 MiB
+    /// runs before its penalty is charged), or 0. The chunk must give
+    /// exactly what the loop gives:
+    ///
+    /// - Both ranges stay within one page, outside the arena: every load
+    ///   and store of the loop goes through the page table (no arena
+    ///   window), to the same two pages, so the loop's first element
+    ///   already faults, creates or resolves copy-on-write as the chunk
+    ///   does, in the same order (the load, then the store).
+    /// - With `dst` ahead of `src` by `d`, at most `d` bytes: the loop
+    ///   copies forwards, so no load of the chunk may see one of its stores.
+    ///   (Behind or equal, the loop never loads what it stored.)
+    ///
+    /// The 32-byte loop checks for its arena shortcut at each step, and a
+    /// chunk is outside the arena, where the check fails. If `src` wraps
+    /// around the address space it can reach the arena later, so there
+    /// the caller takes whole steps, keeping the check at the same places.
+    /// Otherwise `src` never comes back to the arena after a chunk.
+    fn paged_copy_chunk(&self, dst: u64, src: u64, len: u64) -> u64 {
+        let outside = |addr: u64| {
+            let pageno = addr / PAGE_SIZE;
+            pageno >= self.arena_pages
+                && pageno.saturating_mul(PAGE_SIZE) >= self.arena.len() as u64
+        };
+        if !outside(src) || !outside(dst) {
+            return 0;
+        }
+        let mut n = len
+            .min(PAGE_SIZE - (src & PAGE_MASK))
+            .min(PAGE_SIZE - (dst & PAGE_MASK));
+        let ahead = dst.wrapping_sub(src);
+        if ahead != 0 {
+            n = n.min(ahead);
+        }
+        n
+    }
+
+    /// Copy `n` bytes within one source and one destination page (see
+    /// [`paged_copy_chunk`](Self::paged_copy_chunk)): load the source page,
+    /// then make the destination page writable, as the loop's first
+    /// element does.
+    fn copy_paged_chunk(&mut self, dst: u64, src: u64, n: u64) -> Result<()> {
+        let mut buf = [0u8; PAGE];
+        let (so, d_o, n) = (
+            (src & PAGE_MASK) as usize,
+            (dst & PAGE_MASK) as usize,
+            n as usize,
+        );
+        let page = self.get_readable_pageno(src / PAGE_SIZE)?;
+        if let (Some(b), Some(s)) = (buf.get_mut(..n), page.get(so..so + n)) {
+            b.copy_from_slice(s);
+        }
+        let page = self.writable_page(dst / PAGE_SIZE)?;
+        if let (Some(d), Some(b)) = (page.get_mut(d_o..d_o + n), buf.get(..n)) {
+            d.copy_from_slice(b);
         }
         Ok(())
     }
