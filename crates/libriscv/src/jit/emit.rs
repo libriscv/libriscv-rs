@@ -2,16 +2,23 @@
 //! code for the regions of one execute segment.
 //!
 //! Every region becomes one function with Cranelift's `tail` calling
-//! convention and the signature `(state, pc, counter)`. It switches on `pc`
-//! to the entry point, keeps the guest registers it uses in SSA variables,
-//! and leaves in one of three ways:
+//! convention and the signature `(state, pc, counter, depth) -> (target,
+//! counter)`. It switches on `pc` to the entry point, keeps the guest
+//! registers it uses in SSA variables, and leaves in one of four ways:
 //!
 //! * a native tail call (`return_call`) to the region owning the next
-//!   instruction, so guest calls, returns and loops never come back through
-//!   the interpreter; indirect jumps go through the entry table
+//!   instruction, so loops and jumps never come back through the
+//!   interpreter; indirect jumps go through the entry table
 //!   (`return_call_indirect`);
-//! * a return to the trampoline with an exit kind in the state block (the
-//!   instruction limit, an instruction the JIT doesn't compile, a fault);
+//! * a guest return (`jalr x0, ra` or `t0`), which returns its target to
+//!   the native caller: a guest call whose return address is in the
+//!   caller's region is a native call (C++ asmjit's `emit_direct_call`),
+//!   which continues there if the callee returned there (see
+//!   `codegen::calls`). The trampoline continues other returns through the
+//!   entry table;
+//! * a return of [`DONE`] with an exit kind in the state block (the
+//!   instruction limit, an instruction the JIT doesn't compile, a fault),
+//!   which every native caller passes on;
 //! * never by unwinding: faults are exits.
 //!
 //! # Instruction counting
@@ -77,6 +84,9 @@ use cranelift_codegen::{Context, RelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch, Variable};
 use libriscv_jit_rt::{CodeMemory, JitState, MemoryLayout};
 
+use crate::codegen::calls::{
+    DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, region_regs, summaries,
+};
 use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
 use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
@@ -265,10 +275,18 @@ fn host_isa() -> Option<OwnedTargetIsa> {
 pub(crate) static BASELINE_ISA: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A region function: `(state, pc, counter, depth) -> (target, counter)`,
+/// where `target` is where a guest return went (to the native caller,
+/// which continues if it is its return address), or [`DONE`] if the code
+/// left for the host (the exit is in the state block), and `depth` the
+/// native calls in progress (see [`DEPTH`]).
 fn tail_signature() -> Signature {
     let mut sig = Signature::new(CallConv::Tail);
-    for _ in 0..3 {
+    for _ in 0..4 {
         sig.params.push(AbiParam::new(I64));
+    }
+    for _ in 0..2 {
+        sig.returns.push(AbiParam::new(I64));
     }
     sig
 }
@@ -399,19 +417,26 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, layout: MemoryLayout)
         return None;
     }
     let isa = host_isa()?;
+    let summaries = summaries(exec, a)?;
     let mut ctx = Context::new();
     let mut fctx = FunctionBuilderContext::new();
     let mut objects = Vec::with_capacity(a.regions.len() + 1);
     for r in 0..a.regions.len() {
         ctx.clear();
         ctx.func = Function::with_name_signature(UserFuncName::user(0, r as u32), tail_signature());
-        RegionEmitter::emit(exec, a, r, layout, &mut ctx.func, &mut fctx, &isa)?;
+        let segment = Segment {
+            exec,
+            a,
+            layout,
+            summaries: &summaries,
+        };
+        RegionEmitter::emit(&segment, r, &mut ctx.func, &mut fctx, &isa)?;
         objects.push(compile_function(&mut ctx, &isa)?);
     }
     // The trampoline: called from Rust with the C calling convention as
     // `(state, function, pc, counter)`, it enters the `tail` world.
     ctx.clear();
-    ctx.func = trampoline(&isa, &mut fctx);
+    ctx.func = trampoline(exec, &isa, &mut fctx);
     objects.push(compile_function(&mut ctx, &isa)?);
 
     // Link: lay out the functions, then resolve the direct calls. Libcalls
@@ -468,7 +493,15 @@ pub(crate) fn compile(exec: &DecodedSegment, a: &Analysis, layout: MemoryLayout)
     })
 }
 
-fn trampoline(isa: &OwnedTargetIsa, fctx: &mut FunctionBuilderContext) -> Function {
+/// The trampoline: calls the region function, and while it returns a
+/// guest return target (a return that no native caller took), continues
+/// there through the entry table, as an indirect jump would. A target
+/// without an entry leaves with `EXIT_INDIRECT`.
+fn trampoline(
+    exec: &DecodedSegment,
+    isa: &OwnedTargetIsa,
+    fctx: &mut FunctionBuilderContext,
+) -> Function {
     let mut sig = Signature::new(isa.default_call_conv());
     for _ in 0..4 {
         sig.params.push(AbiParam::new(I64));
@@ -478,13 +511,91 @@ fn trampoline(isa: &OwnedTargetIsa, fctx: &mut FunctionBuilderContext) -> Functi
     let tail = b.import_signature(tail_signature());
     let entry = b.create_block();
     b.append_block_params_for_function_params(entry);
+    let run = b.create_block();
+    for _ in 0..3 {
+        b.append_block_param(run, I64);
+    }
+    let returned = b.create_block();
+    let lookup = b.create_block();
+    let miss = b.create_block();
+    let done = b.create_block();
+    for blk in [returned, lookup, miss] {
+        b.append_block_param(blk, I64);
+        b.append_block_param(blk, I64);
+    }
     b.switch_to_block(entry);
-    b.seal_block(entry);
     let p = b.block_params(entry).to_vec();
-    if let [state, function, pc, counter] = p[..] {
-        b.ins().call_indirect(tail, function, &[state, pc, counter]);
+    let &[state, function, pc, counter] = &p[..] else {
+        return func;
+    };
+    b.ins().jump(run, &args(&[function, pc, counter]));
+
+    b.switch_to_block(run);
+    let p = b.block_params(run).to_vec();
+    if let &[function, pc, counter] = &p[..] {
+        let zero = b.ins().iconst(I64, 0);
+        let call = b
+            .ins()
+            .call_indirect(tail, function, &[state, pc, counter, zero]);
+        let r = b.inst_results(call).to_vec();
+        if let &[target, counter] = &r[..] {
+            let is_done = b.ins().icmp_imm_s(IntCC::Equal, target, DONE as i64);
+            b.ins()
+                .brif(is_done, done, &[], returned, &args(&[target, counter]));
+        }
+    }
+
+    b.switch_to_block(returned);
+    let p = b.block_params(returned).to_vec();
+    if let &[target, counter] = &p[..] {
+        // slot = (target >> SHIFT) - (begin >> SHIFT), as `DecodedSegment::index`
+        let shifted = b.ins().ushr_imm_s(target, i64::from(SHIFT));
+        let begin = (exec.exec_begin() >> SHIFT) as i64;
+        let slot = b.ins().iadd_imm_s(shifted, begin.wrapping_neg());
+        let len = b
+            .ins()
+            .load(I64, host_flags(), state, JitState::OFFSET_TABLE_LEN);
+        let in_table = b.ins().icmp(IntCC::UnsignedLessThan, slot, len);
+        let table = b
+            .ins()
+            .load(I64, host_flags(), state, JitState::OFFSET_TABLE);
+        let byte_off = b.ins().ishl_imm_s(slot, 3);
+        let addr = b.ins().iadd(table, byte_off);
+        b.ins().brif(
+            in_table,
+            lookup,
+            &args(&[target, counter]),
+            miss,
+            &args(&[target, counter]),
+        );
+        b.switch_to_block(lookup);
+        let p = b.block_params(lookup).to_vec();
+        if let &[target, counter] = &p[..] {
+            let function = b.ins().load(I64, host_flags(), addr, 0);
+            let next = b.create_block();
+            b.ins()
+                .brif(function, next, &[], miss, &args(&[target, counter]));
+            b.switch_to_block(next);
+            b.ins().jump(run, &args(&[function, target, counter]));
+        }
+    }
+
+    b.switch_to_block(miss);
+    let p = b.block_params(miss).to_vec();
+    if let &[target, counter] = &p[..] {
+        let kind = b.ins().iconst(I64, EXIT_INDIRECT as i64);
+        b.ins()
+            .store(host_flags(), kind, state, JitState::OFFSET_EXIT_KIND);
+        b.ins()
+            .store(host_flags(), target, state, JitState::OFFSET_EXIT_PC);
+        b.ins()
+            .store(host_flags(), counter, state, JitState::OFFSET_COUNTER);
     }
     b.ins().return_(&[]);
+
+    b.switch_to_block(done);
+    b.ins().return_(&[]);
+    b.seal_all_blocks();
     b.finalize(isa.frontend_config());
     func
 }
@@ -537,42 +648,55 @@ struct RegionEmitter<'a, 'f> {
     xfer: HashMap<RegionId, Block>,
     /// `(target, counter)`: an indirect jump through the entry table.
     indirect: Option<Block>,
+    /// `(target, counter)`: store the registers, then return `target` to
+    /// the native caller (a guest return, or on after a callee that left
+    /// for the host: `DONE`).
+    ret: Option<Block>,
     funcs: HashMap<RegionId, FuncRef>,
     tail_sig: SigRef,
+    /// The native calls in progress (see [`DEPTH`]).
+    depth: Value,
+    /// Every region's [`Summary`].
+    summaries: &'a [Summary],
+    /// The registers this region uses and writes.
+    used_set: RegSet,
+    written_set: RegSet,
+    /// Index in `a.insns` of the instruction being emitted.
+    index: usize,
+}
+
+/// What every region of a segment is compiled from.
+struct Segment<'a> {
+    exec: &'a DecodedSegment,
+    a: &'a Analysis,
+    /// Guest address mask (or 0) and the windows checked against.
+    layout: MemoryLayout,
+    /// Every region's [`Summary`].
+    summaries: &'a [Summary],
 }
 
 impl<'a, 'f> RegionEmitter<'a, 'f> {
     fn emit(
-        exec: &'a DecodedSegment,
-        a: &'a Analysis,
+        segment: &Segment<'a>,
         region: RegionId,
-        layout: MemoryLayout,
         func: &'f mut Function,
         fctx: &'f mut FunctionBuilderContext,
         isa: &OwnedTargetIsa,
     ) -> Option<()> {
+        let &Segment {
+            exec,
+            a,
+            layout,
+            summaries,
+        } = segment;
         let r = a.regions.get(region)?;
-        let (mut used, mut written) = ([false; 32], [false; 32]);
-        let (mut fused, mut fwritten) = ([false; 32], [false; 32]);
-        for &i in &r.insns {
-            let u = operands(a.insns.get(i)?.op);
-            // x0 is a constant: never loaded, never stored.
-            for s in u.x.into_iter().flatten().filter(|&s| s != 0) {
-                *used.get_mut(s as usize)? = true;
-            }
-            if let Some(d) = u.xw.filter(|&d| d != 0) {
-                *used.get_mut(d as usize)? = true;
-                *written.get_mut(d as usize)? = true;
-            }
-            for s in u.f.into_iter().flatten() {
-                *fused.get_mut(s as usize)? = true;
-            }
-            if let Some(d) = u.fw {
-                // A single-precision write keeps the upper half: read it too.
-                *fused.get_mut(d as usize)? = true;
-                *fwritten.get_mut(d as usize)? = true;
-            }
-        }
+        // x0 is a constant: never loaded, never stored.
+        let (used_set, written_set) = region_regs(a, region)?;
+        let bit = |set: RegSet, n: usize| set >> n & 1 != 0;
+        let used: [bool; 32] = std::array::from_fn(|n| n != 0 && bit(used_set, n));
+        let written: [bool; 32] = std::array::from_fn(|n| n != 0 && bit(written_set, n));
+        let fused: [bool; 32] = std::array::from_fn(|n| bit(used_set, 32 + n));
+        let fwritten: [bool; 32] = std::array::from_fn(|n| bit(written_set, 32 + n));
 
         let mut b = FunctionBuilder::new(func, fctx);
         let regs: [Variable; 32] = std::array::from_fn(|_| b.declare_var(I64));
@@ -584,8 +708,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         b.seal_block(entry);
-        let (state, pc_in, counter_in) = match b.block_params(entry) {
-            &[s, p, c] => (s, p, c),
+        let (state, pc_in, counter_in, depth) = match b.block_params(entry) {
+            &[s, p, c, d] => (s, p, c, d),
             _ => return None,
         };
         let ld =
@@ -638,8 +762,14 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             exit_stored,
             xfer: HashMap::new(),
             indirect: None,
+            ret: None,
             funcs: HashMap::new(),
             tail_sig,
+            depth,
+            summaries,
+            used_set,
+            written_set,
+            index: 0,
         };
 
         // Entry dispatch: one block per entry point adds the block's count
@@ -784,6 +914,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 return None;
             }
             self.pos = pos;
+            self.index = i;
             open = self.instruction(&ins)?;
             if open && ins.funcblock {
                 // C++ `RV32I_BC_FUNCBLOCK`: `NEXT_BLOCK` with the overflow
@@ -945,8 +1076,9 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             self.b
                 .ins()
                 .store(host_flags(), counter, st, JitState::OFFSET_COUNTER);
+            let done = self.b.ins().iconst(I64, DONE as i64);
+            self.b.ins().return_(&[done, counter]);
         }
-        self.b.ins().return_(&[]);
 
         let mut xfer: Vec<_> = self.xfer.iter().map(|(&r, &b)| (r, b)).collect();
         xfer.sort_unstable();
@@ -956,8 +1088,17 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             self.store_regs();
             let func = self.func_ref(region);
             if let &[pc, counter] = &p[..] {
-                self.b.ins().return_call(func, &[self.state, pc, counter]);
+                self.b
+                    .ins()
+                    .return_call(func, &[self.state, pc, counter, self.depth]);
             }
+        }
+
+        if let Some(blk) = self.ret {
+            self.b.switch_to_block(blk);
+            let p = self.b.block_params(blk).to_vec();
+            self.store_regs();
+            self.b.ins().return_(&p);
         }
 
         if let Some(blk) = self.indirect {
@@ -991,9 +1132,11 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             self.b.ins().brif(func, call, &[], miss, &[]);
 
             self.b.switch_to_block(call);
-            self.b
-                .ins()
-                .return_call_indirect(self.tail_sig, func, &[st, target, counter]);
+            self.b.ins().return_call_indirect(
+                self.tail_sig,
+                func,
+                &[st, target, counter, self.depth],
+            );
 
             self.b.switch_to_block(miss);
             let kind = self.b.ins().iconst(I64, EXIT_INDIRECT as i64);
@@ -1253,7 +1396,25 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.set_reg(rd, link);
                 }
                 self.check_counter(target);
-                self.enter_block(target);
+                match self.native_call(self.index) {
+                    Some((_, callee)) => self.call(callee, target, next),
+                    None => self.enter_block(target),
+                }
+                return Some(false);
+            }
+            // A constant target (`auipc`+`jalr`): like `jal`.
+            JOp::Jalr { rd, .. }
+                if let Some(target) = direct_jalr_target(self.exec, self.a, self.index) =>
+            {
+                if rd != 0 {
+                    let link = self.b.ins().iconst(I64, next as i64);
+                    self.set_reg(rd, link);
+                }
+                self.check_counter(target);
+                match self.native_call(self.index) {
+                    Some((_, callee)) => self.call(callee, target, next),
+                    None => self.enter_block(target),
+                }
                 return Some(false);
             }
             JOp::Jalr { rd, rs1, imm } => {
@@ -1274,8 +1435,18 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.exit_if(over, EXIT_HALT, ExitPc::Value(target));
                 }
                 let c = self.count();
-                let blk = self.indirect_block();
-                self.b.ins().jump(blk, &args(&[target, c]));
+                if is_return(ins.op) {
+                    // To the native caller, which continues if `target` is
+                    // its return address (or to the trampoline, which
+                    // continues through the entry table).
+                    let blk = self.ret_block();
+                    self.b.ins().jump(blk, &args(&[target, c]));
+                } else if rd != 0 && self.returns_here(next) {
+                    self.indirect_call(target, next);
+                } else {
+                    let blk = self.indirect_block();
+                    self.b.ins().jump(blk, &args(&[target, c]));
+                }
                 return Some(false);
             }
             JOp::FLoad {
@@ -1605,6 +1776,177 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         ins.ins().select(is_max, special, v)
     }
 
+    /// The call at `a.insns[i]`, if it is made as a native call: `jal` or
+    /// a constant `jalr` with a link register, to a region, returning to
+    /// a label of this region. `(target, callee region)`.
+    fn native_call(&self, i: usize) -> Option<(u64, RegionId)> {
+        let ins = self.a.insns.get(i)?;
+        let target = match ins.op {
+            JOp::Jal { rd, target } if rd & 31 != 0 => target,
+            JOp::Jalr { rd, .. } if rd & 31 != 0 => direct_jalr_target(self.exec, self.a, i)?,
+            _ => return None,
+        };
+        let next = ins.pc.wrapping_add(ins.len);
+        if !self.returns_here(next) {
+            return None;
+        }
+        Some((target, self.a.region_at(self.exec, target)?))
+    }
+
+    /// A call returning to `next` can be native: `next` is a label here.
+    fn returns_here(&self, next: u64) -> bool {
+        self.a.region_at(self.exec, next) == Some(self.region) && self.labels.contains_key(&next)
+    }
+
+    /// `depth < DEPTH`: another native call fits.
+    fn call_room(&mut self) -> Value {
+        self.b
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedLessThan, self.depth, i64::from(DEPTH))
+    }
+
+    /// A native call to `callee` at `target`, returning to `next` (C++
+    /// asmjit `emit_direct_call`): store the registers the callee may
+    /// read, call it, reload those it may write, and continue at `next` if
+    /// it returned there. A return elsewhere goes on to this region's
+    /// caller, and so does leaving for the host. Past `DEPTH` nested calls,
+    /// it is a tail call like any jump.
+    fn call(&mut self, callee: RegionId, target: u64, next: u64) {
+        let Some(&Summary { reads, writes }) = self.summaries.get(callee) else {
+            self.enter_block(target);
+            return;
+        };
+        let room = self.call_room();
+        let call = self.b.create_block();
+        let deeper = self.b.create_block();
+        self.b.set_cold_block(deeper);
+        self.b.ins().brif(room, call, &[], deeper, &[]);
+        self.b.switch_to_block(call);
+        let func = self.func_ref(callee);
+        let t = self.b.ins().iconst(I64, target as i64);
+        self.native_call_body(Callee::Direct(func), t, reads, writes, next);
+        self.b.switch_to_block(deeper);
+        self.enter_block(target);
+    }
+
+    /// An indirect call to `target` (a register's value) returning to
+    /// `next`: a native call through the entry table, which may read and
+    /// write every register; otherwise (no entry, too deep) the indirect
+    /// jump it is.
+    fn indirect_call(&mut self, target: Value, next: u64) {
+        let c = self.count();
+        let jump = self.indirect_block();
+        let room = self.call_room();
+        let lookup = self.b.create_block();
+        self.b
+            .ins()
+            .brif(room, lookup, &[], jump, &args(&[target, c]));
+        self.b.switch_to_block(lookup);
+        // slot = (target >> SHIFT) - (begin >> SHIFT), as `DecodedSegment::index`
+        let shifted = self.b.ins().ushr_imm_s(target, i64::from(SHIFT));
+        let begin = (self.exec.exec_begin() >> SHIFT) as i64;
+        let slot = self.b.ins().iadd_imm_s(shifted, begin.wrapping_neg());
+        let st = self.state;
+        let len = self
+            .b
+            .ins()
+            .load(I64, host_flags(), st, JitState::OFFSET_TABLE_LEN);
+        let in_table = self.b.ins().icmp(IntCC::UnsignedLessThan, slot, len);
+        let load = self.b.create_block();
+        self.b
+            .ins()
+            .brif(in_table, load, &[], jump, &args(&[target, c]));
+        self.b.switch_to_block(load);
+        let table = self
+            .b
+            .ins()
+            .load(I64, host_flags(), st, JitState::OFFSET_TABLE);
+        let byte_off = self.b.ins().ishl_imm_s(slot, 3);
+        let addr = self.b.ins().iadd(table, byte_off);
+        let func = self.b.ins().load(I64, host_flags(), addr, 0);
+        let call = self.b.create_block();
+        self.b
+            .ins()
+            .brif(func, call, &[], jump, &args(&[target, c]));
+        self.b.switch_to_block(call);
+        self.native_call_body(Callee::Indirect(func), target, !0, !0, next);
+    }
+
+    /// The call itself, for a callee that may read `reads` and write
+    /// `writes`: on return to `next`, enters `next`.
+    fn native_call_body(
+        &mut self,
+        callee: Callee,
+        target: Value,
+        reads: RegSet,
+        writes: RegSet,
+        next: u64,
+    ) {
+        let (store, load) = (self.written_set & reads, self.used_set & writes);
+        for n in 1..64u32 {
+            if store >> n & 1 == 0 {
+                continue;
+            }
+            let (v, ptr) = if n < 32 {
+                (self.reg(n), self.regs_ptr)
+            } else {
+                (self.freg(n - 32), self.fregs_ptr)
+            };
+            self.b
+                .ins()
+                .store(host_flags(), v, ptr, ((n & 31) * 8) as i32);
+        }
+        let c = self.count();
+        let depth = self.b.ins().iadd_imm_s(self.depth, 1);
+        let call_args = [self.state, target, c, depth];
+        let call = match callee {
+            Callee::Direct(func) => self.b.ins().call(func, &call_args),
+            Callee::Indirect(func) => self.b.ins().call_indirect(self.tail_sig, func, &call_args),
+        };
+        let results = self.b.inst_results(call).to_vec();
+        let &[ct, cc] = &results[..] else { return };
+        for n in 1..64u32 {
+            if load >> n & 1 == 0 {
+                continue;
+            }
+            let ptr = if n < 32 {
+                self.regs_ptr
+            } else {
+                self.fregs_ptr
+            };
+            let v = self
+                .b
+                .ins()
+                .load(I64, host_flags(), ptr, ((n & 31) * 8) as i32);
+            // The index is masked to 0..32, so it is always in bounds.
+            #[allow(clippy::indexing_slicing)]
+            let var = if n < 32 {
+                self.regs[(n & 31) as usize]
+            } else {
+                self.fregs[(n & 31) as usize]
+            };
+            self.b.def_var(var, v);
+        }
+        self.b.def_var(self.counter, cc);
+        let at_next = self.b.ins().icmp_imm_s(IntCC::Equal, ct, next as i64);
+        let cont = self.b.create_block();
+        let ret = self.ret_block();
+        self.b.ins().brif(at_next, cont, &[], ret, &args(&[ct, cc]));
+        self.b.switch_to_block(cont);
+        self.enter_block(next);
+    }
+
+    fn ret_block(&mut self) -> Block {
+        if let Some(b) = self.ret {
+            return b;
+        }
+        let blk = self.b.create_block();
+        self.b.append_block_param(blk, I64);
+        self.b.append_block_param(blk, I64);
+        self.ret = Some(blk);
+        blk
+    }
+
     fn indirect_block(&mut self) -> Block {
         if let Some(b) = self.indirect {
             return b;
@@ -1924,6 +2266,14 @@ const fn intcc(cond: Cond) -> IntCC {
 
 /// Offsets `lo..=hi` of guest memory accesses through one base register.
 type Span = (i64, i64);
+
+/// What a native call calls.
+#[derive(Debug, Clone, Copy)]
+enum Callee {
+    Direct(FuncRef),
+    /// A function pointer from the entry table.
+    Indirect(Value),
+}
 
 /// The PC an exit leaves with.
 #[derive(Debug, Clone, Copy)]

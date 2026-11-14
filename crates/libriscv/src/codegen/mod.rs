@@ -5,6 +5,7 @@
 //! turns each region into machine code, the ahead-of-time translator
 //! (`aot`) into a Rust function.
 
+pub(crate) mod calls;
 pub(crate) mod classify;
 pub(crate) mod region;
 
@@ -127,6 +128,7 @@ impl NativeKey {
 pub(crate) const SHARED_SOURCES: &[&str] = &[
     include_str!("mod.rs"),
     include_str!("region.rs"),
+    include_str!("calls.rs"),
     include_str!("classify.rs"),
     include_str!("../native_code.rs"),
     include_str!("../decoder_cache.rs"),

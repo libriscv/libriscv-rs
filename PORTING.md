@@ -376,9 +376,8 @@ ratios to within 0.2% on every ELF. The remaining JIT difference is mostly
 register allocation:
 guest registers live across a whole region (loaded at entry, stored at
 every exit, as in asmjit), and in high-pressure loops regalloc2 keeps
-loop-carried ones in spill slots. Guest calls are still tail calls with
-returns through the entry table, where asmjit makes native calls
-(`emit_direct_call`) whose returns the host predicts.
+loop-carried ones in spill slots. (Guest calls were still tail calls
+with returns through the entry table then; see "Native calls" under JIT.)
 
 ## JIT
 
@@ -410,14 +409,17 @@ system linker's GOT, pointing at `libm`.
 - Execute segments are compiled when created, or with
   `MachineOptions::jit_background` (`rvlinux`'s default, as in C++) on a
   background thread while the interpreter runs them (see "Background
-  compilation" below). Compilable instructions are grouped into regions that grow along fall-through and
-  direct branches (loops stay inside), stopping at calls, indirect jumps,
-  uncompiled instructions and other regions. One Cranelift function per
-  region, `tail` calling convention, signature `(state, pc, counter)`.
+  compilation" below). Compilable instructions are grouped into regions
+  (`codegen::region`, shared with AOT) that grow along fall-through,
+  direct branches (loops stay inside) and over calls to their return
+  address, stopping at called functions' entries, indirect jumps,
+  uncompiled instructions and other regions, at most 512 instructions.
+  One Cranelift function per region, `tail` calling convention, signature
+  `(state, pc, counter, depth) -> (target, counter)`.
 - Region-to-region transfers are native tail calls (`return_call`; indirect
-  jumps via the entry table and `return_call_indirect`), so calls, returns
-  and loops never go back through the interpreter, and the stack doesn't
-  grow.
+  jumps via the entry table and `return_call_indirect`), and guest calls
+  are native calls (see "Native calls" below), so calls, returns and loops
+  never go back through the interpreter.
 - Guest registers (integer and FP, the latter as raw 64-bit patterns) live
   in SSA variables, loaded on function entry and stored on exit; `x0` is
   the constant zero (C++ asmjit's `get(0)`; nothing writes it, the
@@ -530,6 +532,29 @@ branch a plain label instead of an entry (asmjit's leaders aren't these),
 so checks could carry across not-taken branches. It increased host
 instructions by 2% and branch misses by 12% on CoreMark.
 
+**Native calls** (2026-11-14; C++ asmjit `emit_direct_call`, the same
+design as AOT's, see "Native calls" under AOT, sharing
+`codegen::calls`). A guest call whose return address is a label of the
+caller's region is a Cranelift `call` (`call_indirect` through the entry
+table for an indirect call) instead of a tail call: the caller stores the
+registers the callee's `Summary` may read, calls with `depth + 1`,
+reloads those it may write, and continues at the return address if the
+callee returned there; any other return target goes on to its own
+caller. A guest return (`jalr x0` through `ra` or `t0`) returns its
+target; leaving for the host stores the exit in the state block and
+returns `DONE`, which every caller passes on. The trampoline loops on
+returned targets through the entry table (`EXIT_INDIRECT` if there's no
+entry). Past `DEPTH` (32) nested calls a call is a tail call as before.
+Before, the return came back through the entry table into a fresh frame
+with every register reloaded, and the host never predicted it.
+Freestanding CoreMark (30000 iterations, rv64imafdc, no instruction
+limit): N-bit 1.28 to 1.07 s, checked 1.57 to 1.35 s; `--accurate`
+retires the same instruction count, 1.61 to 1.38 s. Compiling takes
+longer: static glibc CoreMark 1.5 to 2.0 s (`--fuel 1`), mostly
+regalloc2 around the calls, which clobber every register in Cranelift's
+`tail` convention. Regions of up to 2048 instructions compiled 15% slower
+still and ran no faster.
+
 **Background compilation** (C++ `asmjit_background_callback` +
 `livepatch.hpp`). C++ compiles on an embedder thread, patches a *copy* of
 the decoder cache and then live-patches the running one so that threads
@@ -570,8 +595,10 @@ libriscv/jit,rvlinux/jit`). `crates/libriscv/tests/jit.rs` compares complete
 machine state (registers, PC, counter, memory, error) between JIT and
 interpreter for hand-written and random programs at ~50 instruction limits
 each, and the same with background compilation (where the code arrives at
-an arbitrary point); `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer
-sessions (400k programs clean on 2026-11-12). FP programs are straight-line
+an arbitrary point), and the native-call programs shared with
+`tests/aot.rs` (also in the background and N-bit);
+`LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs longer sessions (400k
+programs clean on 2026-11-12, 30k with native calls on 2026-11-14). FP programs are straight-line
 code with a block end after every instruction, compared exactly up to the
 first NaN in an FP register (then with any NaN matching any NaN, once);
 the integer programs also contain the FP instructions that only move bits
@@ -751,8 +778,8 @@ misaligned jump, dyncall) back to `native_enter`. F/D use Rust's IEEE
 operations; FMIN/FMAX, FCVT to integers and FCLASS are written out like
 the interpreter's, and FCVT.S.D/D.S give the canonical NaN like the
 interpreter (as does the JIT); otherwise which NaN comes out is the
-host's (as for the JIT). Regions differ (`region::Calls::Native`, see
-"Native calls").
+host's (as for the JIT). The JIT makes native calls the same way (see
+"Native calls" here and under JIT).
 
 **Code shape** (`aot/emit.rs`): per region, `extern "rust-preserve-none"
 fn r<N>(s: &mut S, pc, counter, depth) -> (target, counter)`, in modules
@@ -787,7 +814,7 @@ address space accesses are masked, without checks.
 or `jalr` with a link register, including `auipc`+`jalr` with a constant
 target, `Analysis::jalr_target`, which `-mno-relax` code uses for every
 call) is a Rust call when its return address is a label of the caller's
-region: regions with `Calls::Native` keep a call's return address (unless
+region: regions keep a call's return address (unless
 something calls it: after a `noreturn` call it begins another function)
 and are capped at 512 instructions, since they are whole functions. The
 caller stores the registers the callee may read, calls (directly, or
@@ -795,7 +822,7 @@ through the entry table for an indirect call), reloads those it may
 write, and continues at the return address if the callee returned there;
 any other return target goes on to its own caller, and so does `DONE` (an
 exit to the host, already in `S::out`). What a region may read and write
-is a `Summary`: its own registers and, to a fixed point, those of the
+is a `Summary` (`codegen::calls`, shared with the JIT): its own registers and, to a fixed point, those of the
 regions it transfers to; all of them after an indirect jump. Region
 checks only cover base registers no native callee may write. Past `DEPTH`
 (32) nested calls, a call is a tail call as before, and the return comes
@@ -857,10 +884,11 @@ at the window edges with and without a program, layouts), each test
 translating its programs into one shared object and comparing complete
 machine state with the interpreter at many instruction limits;
 `LIBRISCV_AOT_FUZZ=<programs>[:<seed>]` for longer sessions (3000 integer
-and 2000 FP programs clean), and native calls (recursion past `DEPTH`,
-`auipc`+`jalr` and indirect calls, a callee moving the caller's base
-register, a callee leaving for the host, a return elsewhere, FP registers
-across calls). `rvlinux`'s `tests/aot.rs`: freestanding
+and 2000 FP programs clean), and native calls
+(`support::native_call_programs`, shared with `tests/jit.rs`: recursion
+past `DEPTH`, also leaving for the host at the bottom, `auipc`+`jalr` and
+indirect calls, a callee moving the caller's base register, a callee
+leaving for the host, a return elsewhere, FP registers across calls). `rvlinux`'s `tests/aot.rs`: freestanding
 CoreMark through `--aot-save-shared`/`--aot-load`, layouts, `--no-aot`,
 bad files; ignored because slow: static glibc (~1 min) and the embedded
 translation (builds `rvlinux` again in `target/aot-embed`).
@@ -1454,6 +1482,7 @@ no references into guest memory, so:
 - [x] JIT: F/D (FCVT to integers exact, NaNs the host's)
 - [x] JIT: code cache, Cranelift output saved as an object to link in or a shared object to load (`jit_cache`, `rvlinux --jit-save-object`/`--jit-save-shared`/`--jit-load`, `RVLINUX_JIT_EMBED`; the role of C++'s translation cache and embedded translations); see "Code cache" under "JIT"
 - [x] JIT: automatic N-bit address space (`jit_automatic_nbit_address_space`, `rvlinux --nbit-address-space`; port of `nbit_arena.cpp`)
+- [x] JIT: native calls between regions (asmjit `emit_direct_call`, shared with AOT in `codegen::calls`); see "Native calls" under "JIT"
 - [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`; see "AOT"
 - [ ] JIT: lazy compilation, AArch64 (icache flush in `libriscv-jit-rt`). Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 

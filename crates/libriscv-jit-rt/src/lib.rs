@@ -34,9 +34,10 @@
 //! * Only the 32 integer registers behind `regs`, the 32 floating-point
 //!   registers behind `fregs` and the fields of [`JitState`] are accessed
 //!   besides guest memory.
-//! * Control only moves between functions of the same [`CodeMemory`], through
-//!   direct calls or through the entry table, and every function returns to
-//!   the trampoline.
+//! * Control only moves between functions of the same [`CodeMemory`], by
+//!   tail calls and calls, direct or through the entry table, and every
+//!   function returns to its caller (another function of the same
+//!   [`CodeMemory`], or the trampoline).
 //!
 //! # Cached code
 //!

@@ -4,18 +4,17 @@
 //! boundaries. Each instruction native code can run becomes an [`Insn`];
 //! everything else stays with the interpreter. The compilable instructions
 //! are then partitioned into non-overlapping *regions*, each compiled to one
-//! native function: a region grows from an entry point along fall-through
-//! and direct branches (so loops stay inside it), and stops at calls,
-//! indirect jumps, instructions it can't compile and instructions an earlier
-//! region already claimed. Control moves between regions with native tail
-//! calls, never through the interpreter.
+//! native function: a region grows from an entry point along fall-through,
+//! direct branches (so loops stay inside it) and over calls to their return
+//! address, and stops at the entries of called functions, indirect jumps,
+//! instructions it can't compile and instructions an earlier region already
+//! claimed. Control moves between regions with native calls (a guest call
+//! whose return address is in the caller's region, see [`super::calls`]) and tail
+//! calls, never through the interpreter. The target of an `auipc`+`jalr`
+//! pair is known, like a `jal`'s.
 //!
 //! The JIT and the ahead-of-time translator share this analysis, so both
-//! run exactly the same instructions natively. The translator forms its
-//! regions with [`Calls::Native`]: a call's return address stays in the
-//! caller's region (it calls the callee as a Rust function and continues
-//! there when the callee returns), and the target of an `auipc`+`jalr`
-//! pair is known, like a `jal`'s.
+//! run exactly the same instructions natively.
 
 use std::collections::BTreeSet;
 
@@ -23,14 +22,11 @@ use super::classify::{JOp, classify, precise_rejects};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment};
 pub(crate) use crate::native_code::block_icount;
 
-/// The most instructions in one region. Bounds the size of a single
-/// Cranelift (or Rust) function, which keeps compile time roughly linear.
-const MAX_REGION_INSNS: usize = 2048;
-
-/// The most instructions in one region with [`Calls::Native`], whose
-/// regions are whole functions: `rustc` (LLVM) takes superlinear time on
-/// large functions.
-const MAX_NATIVE_REGION_INSNS: usize = 512;
+/// The most instructions in one region. Regions are whole functions:
+/// `rustc` (LLVM) takes superlinear time on large ones, and Cranelift's
+/// register allocator slows down on the calls in them (2048 compiled
+/// static glibc 15% slower than 512 and ran no faster).
+const MAX_REGION_INSNS: usize = 512;
 
 /// A compilable instruction.
 #[derive(Debug, Clone, Copy)]
@@ -46,19 +42,6 @@ pub(crate) struct Insn {
 
 /// Index of a region.
 pub(crate) type RegionId = usize;
-
-/// How regions treat calls (`jal`/`jalr` with a link register).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Calls {
-    /// A call leaves the region, and so does its return (the JIT's
-    /// regions: the callee is tail-called, and returns through the entry
-    /// table).
-    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
-    Leave,
-    /// The return address is in the caller's region, and `auipc`+`jalr`
-    /// targets are entries (the AOT translator's regions).
-    Native,
-}
 
 /// One region: its instructions (ascending) and its entry points.
 #[derive(Debug, Default)]
@@ -144,7 +127,7 @@ fn find_jalr_targets(exec: &DecodedSegment, a: &Analysis) -> Vec<(usize, u64)> {
     out
 }
 
-pub(crate) fn analyse(exec: &DecodedSegment, calls: Calls) -> Analysis {
+pub(crate) fn analyse(exec: &DecodedSegment) -> Analysis {
     let mut insns = Vec::new();
     let mut by_index = vec![None; exec.cache.len()];
     let mut block_starts = Vec::new();
@@ -213,27 +196,25 @@ pub(crate) fn analyse(exec: &DecodedSegment, calls: Calls) -> Analysis {
         jalr_targets: Vec::new(),
     };
     a.jalr_targets = find_jalr_targets(exec, &a);
-    form_regions(exec, &mut a, calls);
+    form_regions(exec, &mut a);
     a
 }
 
 /// The direct successors of `ins` that stay in its region: fall-through,
-/// branch targets and `JAL x0` targets. Calls and indirect jumps leave;
-/// with [`Calls::Native`], a call's return address stays.
-fn successors(ins: &Insn, calls: Calls) -> [Option<u64>; 2] {
+/// branch targets, `JAL x0` targets and a call's return address. Calls
+/// and indirect jumps leave.
+fn successors(ins: &Insn) -> [Option<u64>; 2] {
     let next = Some(ins.pc.wrapping_add(ins.len));
     match ins.op {
         JOp::Branch { target, .. } => [Some(target), next],
         JOp::Jal { rd: 0, target } => [Some(target), None],
-        JOp::Jal { rd, .. } | JOp::Jalr { rd, .. } if rd != 0 && calls == Calls::Native => {
-            [next, None]
-        }
+        JOp::Jal { rd, .. } | JOp::Jalr { rd, .. } if rd != 0 => [next, None],
         JOp::Jal { .. } | JOp::Jalr { .. } => [None, None],
         _ => [next, None],
     }
 }
 
-fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
+fn form_regions(exec: &DecodedSegment, a: &mut Analysis) {
     // Entry candidates: every compilable block start and direct target, in
     // address order. Then every remaining instruction, for anything a size
     // limit cut off.
@@ -247,18 +228,16 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
     // one (after a call that doesn't return) begins another function, and
     // doesn't join the caller's region.
     let mut functions = BTreeSet::new();
-    if calls == Calls::Native {
-        seeds.extend(a.jalr_targets.iter().map(|&(_, t)| t));
-        for (i, ins) in a.insns.iter().enumerate() {
-            match ins.op {
-                JOp::Jal { rd, target } if rd != 0 => {
-                    functions.insert(target);
-                }
-                JOp::Jalr { rd, .. } if rd != 0 => {
-                    functions.extend(a.jalr_target(i));
-                }
-                _ => {}
+    seeds.extend(a.jalr_targets.iter().map(|&(_, t)| t));
+    for (i, ins) in a.insns.iter().enumerate() {
+        match ins.op {
+            JOp::Jal { rd, target } if rd != 0 => {
+                functions.insert(target);
             }
+            JOp::Jalr { rd, .. } if rd != 0 => {
+                functions.extend(a.jalr_target(i));
+            }
+            _ => {}
         }
     }
     let fallback: Vec<u64> = a.insns.iter().map(|i| i.pc).collect();
@@ -277,11 +256,7 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
         work.clear();
         work.push(start);
         while let Some(i) = work.pop() {
-            let max = match calls {
-                Calls::Leave => MAX_REGION_INSNS,
-                Calls::Native => MAX_NATIVE_REGION_INSNS,
-            };
-            if region.insns.len() >= max {
+            if region.insns.len() >= MAX_REGION_INSNS {
                 break;
             }
             match a.region_of.get_mut(i) {
@@ -291,7 +266,7 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
             region.insns.push(i);
             let Some(ins) = a.insns.get(i) else { continue };
             let call = matches!(ins.op, JOp::Jal { rd, .. } | JOp::Jalr { rd, .. } if rd != 0);
-            for succ in successors(ins, calls).into_iter().flatten() {
+            for succ in successors(ins).into_iter().flatten() {
                 if call && functions.contains(&succ) {
                     continue;
                 }
@@ -316,7 +291,7 @@ fn form_regions(exec: &DecodedSegment, a: &mut Analysis, calls: Calls) {
     for (i, ins) in a.insns.iter().enumerate() {
         let own = a.region_of.get(i).copied();
         let next = ins.pc.wrapping_add(ins.len);
-        let jalr = (calls == Calls::Native).then(|| a.jalr_target(i)).flatten();
+        let jalr = a.jalr_target(i);
         let targets = match ins.op {
             JOp::Branch { target, .. } => [Some(target), Some(next)],
             JOp::Jal { target, .. } => [Some(target), None],

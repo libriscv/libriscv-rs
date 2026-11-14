@@ -36,12 +36,18 @@
 use std::fmt::Write as _;
 
 use super::structure::{MAX_GROWTH, dispatch, structure};
+use crate::codegen::calls::{
+    DEPTH, DONE, RegSet, Summary, direct_jalr_target, is_return, region_regs, summaries,
+};
 use crate::codegen::classify::{AluI, AluR, Cond, FBin, FCmp, FFma, FInt, JOp, Unary, operands};
 use crate::codegen::region::{Analysis, Insn, RegionId, block_icount};
 use crate::decoder_cache::{COMPRESSED, DecodedSegment, SHIFT};
 use crate::native_code::{
     EXIT_DYNCALL, EXIT_HALT, EXIT_INDIRECT, EXIT_JUMP, EXIT_MISALIGNED, EXIT_SLOW, MemoryLayout,
 };
+
+// `RUNTIME` spells out the shared constants.
+const _: () = assert!(DONE == 1 && DEPTH == 32);
 
 /// The widest guest memory access, in bytes (FLD/FSD/LD/SD).
 const MAX_ACCESS: u64 = 8;
@@ -509,135 +515,6 @@ struct RegionWriter<'a> {
     written: u64,
     /// Index in `a.insns` of the instruction being written.
     index: usize,
-}
-
-/// Registers as a bit set: `x<n>` is bit `n`, `f<n>` bit `32 + n`.
-type RegSet = u64;
-
-/// What a region may read and write before it returns (a guest return,
-/// or leaving for the host): its own registers and those of every region
-/// it may transfer to, transitively; all of them if it may jump
-/// indirectly. A native call to it stores the caller's registers it may
-/// read, and reloads those it may write.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct Summary {
-    reads: RegSet,
-    writes: RegSet,
-}
-
-/// The registers region `r` uses and writes (`x0` excluded). A
-/// single-precision FP write keeps the upper half, so it reads it too.
-fn region_regs(a: &Analysis, r: RegionId) -> Option<(RegSet, RegSet)> {
-    let (mut used, mut written) = (0u64, 0u64);
-    for &i in &a.regions.get(r)?.insns {
-        let u = operands(a.insns.get(i)?.op);
-        for s in u.x.into_iter().flatten().filter(|&s| s & 31 != 0) {
-            used |= 1 << (s & 31);
-        }
-        if let Some(d) = u.xw.filter(|&d| d & 31 != 0) {
-            used |= 1 << (d & 31);
-            written |= 1 << (d & 31);
-        }
-        for s in u.f.into_iter().flatten() {
-            used |= 1 << (32 + (s & 31));
-        }
-        if let Some(d) = u.fw {
-            used |= 1 << (32 + (d & 31));
-            written |= 1 << (32 + (d & 31));
-        }
-    }
-    Some((used, written))
-}
-
-/// A guest return: `jalr x0, imm(ra)` or `jalr x0, imm(t0)`. It goes back
-/// to the native caller (or `enter`) instead of through the entry table.
-fn is_return(op: JOp) -> bool {
-    matches!(op, JOp::Jalr { rd, rs1, .. } if rd & 31 == 0 && matches!(rs1 & 31, 1 | 5))
-}
-
-/// The constant target of the `jalr` at `a.insns[i]` that the code jumps
-/// to directly, if any: one in a region (or else it goes through the
-/// entry table), and aligned.
-fn direct_jalr_target(exec: &DecodedSegment, a: &Analysis, i: usize) -> Option<u64> {
-    a.jalr_target(i)
-        .filter(|&t| COMPRESSED || t & 3 == 0)
-        .filter(|&t| a.region_at(exec, t).is_some())
-}
-
-/// Every region's [`Summary`]: its own registers, then those of the
-/// regions it may transfer to, to a fixed point.
-fn summaries(exec: &DecodedSegment, a: &Analysis) -> Option<Vec<Summary>> {
-    let n = a.regions.len();
-    let mut out = Vec::with_capacity(n);
-    let mut succ: Vec<Vec<RegionId>> = Vec::with_capacity(n);
-    for (r, region) in a.regions.iter().enumerate() {
-        let (used, written) = region_regs(a, r)?;
-        let mut targets = std::collections::BTreeSet::new();
-        let mut indirect = false;
-        for &i in &region.insns {
-            let ins = a.insns.get(i)?;
-            let next = ins.pc.wrapping_add(ins.len);
-            let mut to = |pc: u64| {
-                if let Some(t) = a.region_at(exec, pc).filter(|&t| t != r) {
-                    targets.insert(t);
-                }
-            };
-            match ins.op {
-                JOp::Branch { target, .. } => {
-                    to(target);
-                    to(next);
-                }
-                JOp::Jal { rd, target } => {
-                    to(target);
-                    if rd & 31 != 0 {
-                        to(next);
-                    }
-                }
-                JOp::Jalr { rd, .. } => {
-                    match direct_jalr_target(exec, a, i) {
-                        Some(t) => to(t),
-                        None if is_return(ins.op) => {}
-                        None => indirect = true,
-                    }
-                    if rd & 31 != 0 {
-                        to(next);
-                    }
-                }
-                _ => to(next),
-            }
-        }
-        out.push(if indirect {
-            Summary {
-                reads: !0,
-                writes: !0,
-            }
-        } else {
-            Summary {
-                reads: used,
-                writes: written,
-            }
-        });
-        succ.push(targets.into_iter().collect());
-    }
-    loop {
-        let mut changed = false;
-        for (r, targets) in succ.iter().enumerate() {
-            let mut s = *out.get(r)?;
-            for &t in targets {
-                let o = *out.get(t)?;
-                s.reads |= o.reads;
-                s.writes |= o.writes;
-            }
-            let slot = out.get_mut(r)?;
-            if *slot != s {
-                *slot = s;
-                changed = true;
-            }
-        }
-        if !changed {
-            return Some(out);
-        }
-    }
 }
 
 /// Offsets `lo..=hi` of guest memory accesses through one base register.

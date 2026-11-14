@@ -112,7 +112,7 @@ fn compile_and_load(
 /// it (C++ `aj_machine_info`'s baked arena bounds); machines whose
 /// windows don't contain them interpret the segment instead.
 fn compile(exec: &DecodedSegment, layout: MemoryLayout) -> Option<Image> {
-    let analysis = region::analyse(exec, region::Calls::Leave);
+    let analysis = region::analyse(exec);
     emit::compile(exec, &analysis, layout)
 }
 
@@ -304,10 +304,7 @@ pub(crate) mod tests {
                 )
                 .unwrap();
                 m.init_execute_area(&code, V).unwrap();
-                let a = crate::codegen::region::analyse(
-                    m.cpu.current_execute_segment(),
-                    crate::codegen::region::Calls::Leave,
-                );
+                let a = crate::codegen::region::analyse(m.cpu.current_execute_segment());
                 let compiled = a.insns.iter().any(|i| i.pc == V);
                 assert_eq!(compiled, expect, "{w:#010x}");
             }

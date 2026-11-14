@@ -1123,3 +1123,30 @@ fn unlimited_native_code_neither_counts_nor_stops() {
     assert_eq!(limited, run(&mut machine(&code, false), &[0; 64], 1000));
     assert_ne!(limited.regs[10], sum);
 }
+
+/// Native calls (guest calls as host calls returning to the caller's
+/// region, C++ asmjit `emit_direct_call`): the programs of
+/// [`native_call_programs`], against the interpreter at many limits,
+/// compiled up front, in the background, and with an N-bit address space.
+#[test]
+fn native_calls_match_the_interpreter() {
+    let mut fuels = fuels();
+    fuels.extend(380..420);
+    fuels.extend([1999, 2000, 2001, 5000]);
+    for (n, ((code, regs), expect)) in native_call_programs()
+        .iter()
+        .zip(NATIVE_CALL_RESULTS)
+        .enumerate()
+    {
+        let what = format!("native calls {n}");
+        let entries = compare(code, regs, &fuels, &what);
+        assert!(entries > 0, "{what}: nothing was compiled");
+        for slice in [1, 7, 100] {
+            compare_machines(background_machine(code, slice), code, regs, &fuels, &what);
+        }
+        // N-bit: memory accesses stay inside the scratch area.
+        compare_machines(nbit_machine(code, 1 << 20), code, regs, &fuels, &what);
+        let finished = run(&mut machine(code, true), regs, 100_000);
+        assert!(expect.is_none_or(|e| e == finished.regs[10]), "{what}");
+    }
+}
