@@ -144,6 +144,19 @@ pub(crate) struct Page {
 }
 
 impl Page {
+    /// Set the page's protections (`Memory::set_page_attr`), keeping its
+    /// copy-on-write state. A writable page showing the zero page is
+    /// copy-on-write, and so is a fork's loaned page (C++ would write to
+    /// the master's data).
+    pub(crate) fn set_attr(&mut self, attr: PageAttributes) {
+        let is_cow = self.attr.is_cow;
+        self.attr = attr;
+        if is_cow || (attr.write && (self.is_zero_page() || self.is_loaned())) {
+            self.attr.is_cow = true;
+            self.attr.write = false;
+        }
+    }
+
     /// C++ `Page::is_cow_page`: the page shows the shared zero page.
     pub(crate) const fn is_zero_page(&self) -> bool {
         matches!(self.data, PageData::Zero)

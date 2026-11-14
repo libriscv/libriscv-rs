@@ -950,6 +950,10 @@ of segments that came from the cache.
   without one; then `OUT_OF_MEMORY`. Attribute-only pages (from
   `mmap`/`mprotect`) are bounded by 64 × the memory limit in pages. A
   writable attribute-only page is the zero page, copy-on-write.
+  `set_page_attr` changes a page at a time in order, like C++, but walks
+  the page index for runs of existing pages instead of looking each up
+  (same pages and failures, tested against the loop): one `mprotect` can
+  cover every page.
 - **Execute segments from pages** (`CPU::next_execute_segment`): jumping
   outside every known segment looks at the page; if it's executable, all
   adjacent executable pages are copied out and decoded as a new segment
