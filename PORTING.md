@@ -584,7 +584,13 @@ safe Rust can't do without slowing every dispatch. Instead:
   (running, or finished but not switched to), `dispatch_simulate` runs in
   slices of `jit_background_slice` instructions (default 2^20). Between
   slices the machine switches its segments, and the current one, to
-  their published copies.
+  their published copies. A segment created during an unsliced run
+  (`init_execute_area`: code mapped at runtime) that starts compiling
+  begins a slice at the next limit check that host code or a segment
+  change hands back (`dispatch::begin_slice`). Before, slicing was only
+  decided when the run began, so when nothing was compiling then (`ld.so`
+  from the code cache), `libc.so` and the program `ld.so` mapped stayed
+  interpreted for good.
 - Slices end at the dispatcher's own instruction-limit checks, and the next
   slice begins the block there, exactly what the uninterrupted run does, so
   results and counts are the same whenever the code arrives. System calls

@@ -89,6 +89,11 @@ pub(crate) struct DispatchState {
     error: Option<MachineError>,
     /// The slice being run while a background compilation is pending.
     slice: Option<Slice>,
+    /// A background compilation began during the run (an execute segment
+    /// created at runtime): begin a slice at the next chance, so that its
+    /// code gets installed.
+    #[cfg(feature = "jit")]
+    pub(crate) jit_spawned: bool,
 }
 
 /// A dispatcher run that stops early, at `end`, on the way to the real limit
@@ -123,6 +128,34 @@ impl DispatchState {
             None => visible,
         }
     }
+}
+
+/// The chain's limit after host code ran (`DispatchState::chain_max`),
+/// beginning a slice if a background compilation started meanwhile.
+#[inline]
+fn chain_max(m: &mut Machine) -> u64 {
+    #[cfg(feature = "jit")]
+    if m.dispatch.jit_spawned && m.dispatch.slice.is_none() {
+        return begin_slice(m, m.counter, m.max_counter);
+    }
+    m.dispatch.chain_max(m.max_counter)
+}
+
+/// Begin a slice at `counter` on the way to the real limit `max`, as
+/// `Machine::dispatch_sliced` does, for a background compilation that
+/// started during an unsliced run (the slice loop goes on from where the
+/// slice ends). Returns the chain's new limit.
+#[cfg(feature = "jit")]
+#[cold]
+#[inline(never)]
+fn begin_slice(m: &mut Machine, counter: u64, max: u64) -> u64 {
+    m.dispatch.jit_spawned = false;
+    let end = counter.saturating_add(m.options().jit_background_slice.max(1));
+    if end >= max {
+        return max;
+    }
+    m.dispatch.slice = Some(Slice { end, max });
+    end
 }
 
 /// Decoder entries per 4-byte instruction (C++ `NEXT_INSTR`).
@@ -393,7 +426,7 @@ pub(crate) extern "rust-preserve-none" fn syscall(
     }
     let c = Counter {
         value: m.counter,
-        max: m.dispatch.chain_max(m.max_counter),
+        max: chain_max(m),
     };
     // Stopped, or a clone-like system call changed PC. System calls are
     // always full-length instructions, so execution resumes after PC.
@@ -444,7 +477,7 @@ pub(crate) extern "rust-preserve-none" fn system(
     }
     let c = Counter {
         value: m.counter,
-        max: m.dispatch.chain_max(m.max_counter),
+        max: chain_max(m),
     };
     // Stopped, or PC changed: continue *at* PC (so a stopped machine
     // resumes at this instruction).
@@ -477,7 +510,7 @@ pub(crate) extern "rust-preserve-none" fn execute_invalid(
         };
         let c = Counter {
             value: m.counter,
-            max: m.dispatch.chain_max(m.max_counter),
+            max: chain_max(m),
         };
         if c.overflowed() {
             return halt(m, pc, c);
@@ -610,7 +643,7 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                 let touched = m.counter != counter || m.max_counter != visible_max;
                 c = Counter {
                     value: m.counter,
-                    max: m.dispatch.chain_max(m.max_counter),
+                    max: chain_max(m),
                 };
                 let next = pc.wrapping_add(4);
                 let ends_block = exec
@@ -744,40 +777,52 @@ impl Machine {
     pub(crate) fn dispatch_simulate(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
         let outer = self.dispatch.slice.take();
         #[cfg(feature = "jit")]
-        let result = if self.jit_pending() {
-            self.dispatch_sliced(pc, counter, max)
-        } else {
-            self.dispatch_run(pc, counter, max)
-        };
+        let result = self.dispatch_sliced(pc, counter, max);
         #[cfg(not(feature = "jit"))]
         let result = self.dispatch_run(pc, counter, max);
         self.dispatch.slice = outer;
+        // A compilation this (nested) run started concerns the outer run too.
+        #[cfg(feature = "jit")]
+        if outer.is_none() && self.jit_pending() {
+            self.dispatch.jit_spawned = true;
+        }
         result
     }
 
-    /// `dispatch_simulate` while background compilations are pending: run in
-    /// slices of `jit_background_slice` instructions, installing finished
-    /// native code in between. A slice ends at an instruction-limit check,
-    /// exactly where a run with that limit would halt, and the next one
-    /// begins the block there, as the uninterrupted run would have: results
-    /// and counts don't depend on where the slices fall.
+    /// `dispatch_simulate` with the JIT: while background compilations are
+    /// pending, run in slices of `jit_background_slice` instructions,
+    /// installing finished native code in between. A slice ends at an
+    /// instruction-limit check, exactly where a run with that limit would
+    /// halt, and the next one begins the block there, as the uninterrupted
+    /// run would have: results and counts don't depend on where the slices
+    /// fall. A compilation that starts during an unsliced run (a segment
+    /// created at runtime) begins a slice there (`begin_slice`).
     #[cfg(feature = "jit")]
     fn dispatch_sliced(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
-        let (mut pc, mut counter) = (pc, counter);
+        let (mut pc, mut counter, mut max) = (pc, counter, max);
         let slice = self.options().jit_background_slice.max(1);
         loop {
-            self.refresh_execute_segments(false);
+            self.dispatch.jit_spawned = false;
+            let pending = self.jit_pending() && {
+                self.refresh_execute_segments(false);
+                self.jit_pending()
+            };
             let end = counter.saturating_add(slice);
-            if !self.jit_pending() || end >= max {
-                return self.dispatch_run(pc, counter, max);
-            }
-            self.dispatch.slice = Some(Slice { end, max });
-            let result = self.dispatch_chain(pc, counter, end);
+            let limit = if pending && end < max {
+                self.dispatch.slice = Some(Slice { end, max });
+                end
+            } else {
+                max
+            };
+            let result = self.dispatch_chain(pc, counter, limit);
             let slice = self.dispatch.slice.take();
             let (c, halt_pc) = result?;
             // The slice ran out: nothing stopped the machine or changed the
-            // limit.
-            if slice.is_some() && c.max == end {
+            // limit. (A slice begun during the run has the limit of then.)
+            if let Some(s) = slice
+                && c.max == s.end
+            {
+                max = s.max;
                 // At this check, the real limit is reached too: an
                 // uninterrupted run would halt here as well.
                 if c.value >= max {
@@ -798,6 +843,7 @@ impl Machine {
         }
     }
 
+    #[cfg(not(feature = "jit"))]
     fn dispatch_run(&mut self, pc: u64, counter: u64, max: u64) -> Result<Counter> {
         let (c, halt_pc) = self.dispatch_chain(pc, counter, max)?;
         self.cpu.regs.pc = halt_pc;
@@ -844,6 +890,11 @@ impl Machine {
                 Exit::Jump => {
                     c = self.dispatch.counter;
                     pc = self.next_execute_segment(self.dispatch.pc)?;
+                    // The new segment may be compiling in the background.
+                    #[cfg(feature = "jit")]
+                    if self.dispatch.jit_spawned && self.dispatch.slice.is_none() {
+                        c.max = begin_slice(self, c.value, c.max);
+                    }
                 }
                 Exit::Fault => {
                     return Err(self

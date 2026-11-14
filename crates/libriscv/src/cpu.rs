@@ -131,6 +131,12 @@ impl Machine {
         self.cpu.exec = self
             .memory
             .create_execute_segment(code, begin, false, false)?;
+        // Compiling in the background: the dispatcher has to run in slices
+        // to switch to the native code (`dispatch_sliced`).
+        #[cfg(feature = "jit")]
+        if self.cpu.exec.jit_outstanding() {
+            self.dispatch.jit_spawned = true;
+        }
         Ok(&self.cpu.exec)
     }
 

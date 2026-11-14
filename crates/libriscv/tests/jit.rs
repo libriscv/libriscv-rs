@@ -1150,3 +1150,61 @@ fn native_calls_match_the_interpreter() {
         assert!(expect.is_none_or(|e| e == finished.regs[10]), "{what}");
     }
 }
+
+/// A segment created during a run (code mapped at runtime, like the
+/// libraries a dynamic linker maps) compiles in the background, and the
+/// run switches to its native code, also when nothing was compiling when
+/// the run began: the run has to begin slicing then. (It didn't: with
+/// `ld.so` from the JIT cache, the libraries and the program it mapped
+/// stayed interpreted for good.)
+#[test]
+fn segments_created_during_a_run_switch_to_native_code() {
+    const AREA: u64 = V + 0x10000;
+    let setup = |jit: bool| {
+        let mut m = machine_with(
+            &words(&[
+                ((AREA as u32 >> 12) << 12) | (5 << 7) | 0x37, // lui t0, AREA
+                itype(0x67, 0, 0, 5, 0),                       // jr t0
+            ]),
+            MachineOptions {
+                jit,
+                jit_background: true,
+                jit_background_slice: 100,
+                use_shared_execute_segments: false,
+                ..Default::default()
+            },
+        );
+        let area = words(&[
+            itype(0x13, 0, 11, 0, 200), // li a1, 200
+            itype(0x13, 0, 17, 0, 500), // li a7, 500
+            0x73,                       // ecall
+            itype(0x13, 0, 11, 11, -1), // addi a1, a1, -1
+            btype(1, 11, 0, -12),       // bnez a1, -12
+            itype(0x13, 0, 10, 10, 1),  // addi a0, a0, 1
+            jtype(0, -4),               // j -4
+        ]);
+        m.copy_to_guest(AREA, &area).unwrap();
+        m.memory
+            .set_page_attr(
+                AREA,
+                4096,
+                libriscv::memory::PageAttributes::rwx(true, false, true),
+            )
+            .unwrap();
+        // The loop takes a while (the compilation finishes meanwhile).
+        m.install_syscall_handler(500, |_| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(())
+        });
+        // Nothing is compiling when the run begins.
+        m.wait_for_jit();
+        assert!(!m.jit_pending());
+        m
+    };
+    let mut m = setup(true);
+    let native = run(&mut m, &[0; 64], 100_000);
+    let segment = m.cpu.current_execute_segment();
+    assert_eq!(segment.exec_begin(), AREA, "{native:?}");
+    assert!(segment.jit_entry_count() > 0, "still interpreted");
+    assert_eq!(native, run(&mut setup(false), &[0; 64], 100_000));
+}
