@@ -294,6 +294,10 @@ fn main() -> ExitCode {
         // C++ rvlinux compiles in the background by default too.
         jit_background: !args.no_background,
         jit_automatic_nbit_address_space: args.nbit,
+        // C++ rvlinux: `translate_ignore_instruction_limit = !accurate`.
+        // Native code then runs without counting; translations and saved
+        // JIT code are only used by runs with the same setting.
+        jit_ignore_instruction_limit: !args.accurate,
         jit_cache: !args.no_jit_cache,
         #[cfg(feature = "jit")]
         jit_cache_output: jit_cache_output.clone(),

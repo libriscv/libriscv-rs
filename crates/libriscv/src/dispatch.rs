@@ -530,7 +530,15 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
         become handler(exec, cache, i, m, pc, c, ins)
     }
     let (mut slot, mut entry_pc) = (i, start);
-    let mut before = c.value.wrapping_sub(e.instruction_count());
+    // Native code counts the block it begins at, so it's entered with the
+    // counter from before the block. Code ignoring the limit counts
+    // nothing: the block stays counted, and the counter never goes down.
+    let counts = !jit.unlimited();
+    let mut before = if counts {
+        c.value.wrapping_sub(e.instruction_count())
+    } else {
+        c.value
+    };
     let mut c = c;
     loop {
         match jit.run(m, slot, entry_pc, before, c.max) {
@@ -611,7 +619,7 @@ pub(crate) extern "rust-preserve-none" fn native_enter(
                     .is_none_or(|e| e.block_bytes() == 0);
                 // Counted up to the dyncall: the block's instructions after it
                 // aren't retired yet (native entries count them again).
-                let retired = if ends_block {
+                let retired = if ends_block || !counts {
                     c.value
                 } else {
                     c.value

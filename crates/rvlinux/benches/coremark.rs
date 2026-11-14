@@ -56,20 +56,24 @@ const BUILDS: &[(&str, &str)] = &[
 /// Enough instructions for 10+ seconds of JIT-compiled CoreMark.
 const FUEL: &str = "10000000000000";
 
+type Prepare = fn(&Path, &[&str]) -> Vec<String>;
+
 struct Variant {
     name: String,
     emulator: PathBuf,
     flags: Vec<&'static str>,
-    /// Prepares an ELF for this variant (untimed); returns extra flags.
-    prepare: Option<fn(&Path) -> Vec<String>>,
+    /// Prepares an ELF for this variant (untimed), given its flags;
+    /// returns extra flags.
+    prepare: Option<Prepare>,
 }
 
 /// Translate `elf` to Rust and compile it into a shared object next to it
 /// (`--aot-save-shared`; again whenever `rvlinux` or the ELF is newer,
 /// since a translation of another translator or of other code would be
 /// ignored, and the column would time the interpreter): the flags that
-/// load it.
-fn prepare_aot(elf: &Path) -> Vec<String> {
+/// load it. Translated with `--accurate` if the run uses it: without, the
+/// translation ignores the instruction limit, and only such runs use it.
+fn prepare_aot(elf: &Path, flags: &[&str]) -> Vec<String> {
     let rust = PathBuf::from(env!("CARGO_BIN_EXE_rvlinux"));
     let mut so = elf.as_os_str().to_owned();
     so.push(".aot.so");
@@ -78,6 +82,7 @@ fn prepare_aot(elf: &Path) -> Vec<String> {
     let built = modified(&so);
     if built < modified(&rust) || built < modified(elf) {
         let status = Command::new(&rust)
+            .args(flags.iter().filter(|&&f| f == "--accurate"))
             .arg("-Q")
             .arg("--aot-save-shared")
             .arg(&so)
@@ -153,7 +158,10 @@ fn variants() -> Vec<Variant> {
 /// One run: CoreMark's Iterations/Sec, or `None` (with the output printed)
 /// if the run didn't validate.
 fn run(variant: &Variant, elf: &Path) -> Option<f64> {
-    let extra = variant.prepare.map(|p| p(elf)).unwrap_or_default();
+    let extra = variant
+        .prepare
+        .map(|p| p(elf, &variant.flags))
+        .unwrap_or_default();
     let out = Command::new(&variant.emulator)
         .args(&variant.flags)
         .args(&extra)

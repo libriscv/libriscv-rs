@@ -50,13 +50,11 @@ pub(super) fn dispatch(arms: &[Arm], entry_counts: &[(u64, u64)]) -> String {
     let _ = writeln!(o, "'e: loop {{");
     let _ = writeln!(o, "match pc {{");
     for &(pc, k) in entry_counts {
+        let add = count(k);
         if arms.iter().any(|a| a.pc == pc) {
-            let _ = writeln!(o, "{pc:#x} => c = c.wrapping_add({k}),");
+            let _ = writeln!(o, "{pc:#x} => {{ {add} }}");
         } else {
-            let _ = writeln!(
-                o,
-                "{pc:#x} => {{ c = c.wrapping_add({k}); break 'x A::X({EXIT_SLOW}, pc) }}"
-            );
+            let _ = writeln!(o, "{pc:#x} => {{ {add} break 'x A::X({EXIT_SLOW}, pc) }}");
         }
     }
     let _ = writeln!(o, "_ => break 'x A::I(pc),");
@@ -538,6 +536,16 @@ impl Writer<'_> {
     }
 }
 
+/// Add an entry's block count `k` to the counter (nothing for 0: code
+/// ignoring the instruction limit doesn't count).
+fn count(k: u64) -> String {
+    if k == 0 {
+        String::new()
+    } else {
+        format!("c = c.wrapping_add({k});")
+    }
+}
+
 /// The region's control flow as structured code, or `None` if it can't be
 /// laid out (then use [`dispatch`]). `entry_counts` are the labels with
 /// the block count entering there adds.
@@ -575,7 +583,7 @@ pub(super) fn structure(arms: &[Arm], entry_counts: &[(u64, u64)]) -> Option<Str
     for &(pc, k) in entry_counts {
         let label = *index.get(&pc)?;
         entries.push(b.resolve(0, &[], label)?);
-        root.push(format!("{pc:#x} => {{ c = c.wrapping_add({k});"));
+        root.push(format!("{pc:#x} => {{ {}", count(k)));
     }
     *b.succ.get_mut(0)? = entries;
     while let Some(v) = b.work.pop() {
@@ -622,7 +630,10 @@ mod tests {
         let entries = [(0x1000, 1), (0x2000, 3)];
         assert!(structure(&arms, &entries).is_none());
         let code = dispatch(&arms, &entries);
-        assert!(code.contains("0x1000 => c = c.wrapping_add(1),"), "{code}");
+        assert!(
+            code.contains("0x1000 => { c = c.wrapping_add(1); }"),
+            "{code}"
+        );
         assert!(
             code.contains(&format!(
                 "0x2000 => {{ c = c.wrapping_add(3); break 'x A::X({EXIT_SLOW}, pc) }}"

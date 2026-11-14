@@ -642,7 +642,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             tail_sig,
         };
 
-        // Entry dispatch: one block per entry point adds the block's count.
+        // Entry dispatch: one block per entry point adds the block's count
+        // (nothing without the limit, `MemoryLayout::unlimited`).
         let mut switch = Switch::new();
         let mut enters = Vec::with_capacity(r.entries.len());
         for &pc in &r.entries {
@@ -656,9 +657,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         switch.emit(&mut e.b, pc_in, unknown);
         for (pc, enter, label) in enters {
             e.b.switch_to_block(enter);
-            let c =
-                e.b.ins()
-                    .iadd_imm_s(counter_in, block_icount(exec, pc) as i64);
+            let k = if layout.unlimited {
+                0
+            } else {
+                block_icount(exec, pc)
+            };
+            let c = e.b.ins().iadd_imm_s(counter_in, k as i64);
             e.b.def_var(counter, c);
             e.b.ins().jump(label, &[]);
         }
@@ -810,10 +814,8 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             Some(r) if r == self.region => {
                 let label = self.labels.get(&target).copied();
                 if let Some(label) = label {
-                    let c = self
-                        .b
-                        .ins()
-                        .iadd_imm_s(c, block_icount(self.exec, target) as i64);
+                    let k = self.block_count(target);
+                    let c = self.b.ins().iadd_imm_s(c, k as i64);
                     self.b.def_var(self.counter, c);
                     self.b.ins().jump(label, &[]);
                 } else {
@@ -830,19 +832,30 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// the block count for `target` again, so subtract it first.
     fn leave_mid_block(&mut self, target: u64) {
         let c = self.count();
-        let c = self
-            .b
-            .ins()
-            .iadd_imm_s(c, (block_icount(self.exec, target) as i64).wrapping_neg());
+        let k = self.block_count(target);
+        let c = self.b.ins().iadd_imm_s(c, (k as i64).wrapping_neg());
         match self.a.region_at(self.exec, target) {
             Some(r) => self.tail_call(r, target, c),
             None => self.leave(EXIT_JUMP, target, c),
         }
     }
 
+    /// The instruction count beginning a block at `target` adds: none in
+    /// code that ignores the limit.
+    fn block_count(&self, target: u64) -> u64 {
+        if self.layout.unlimited {
+            0
+        } else {
+            block_icount(self.exec, target)
+        }
+    }
+
     /// `if counter >= max { halt at target }`, as the dispatcher checks
-    /// before jumping.
+    /// before jumping. Nothing in code that ignores the limit.
     fn check_counter(&mut self, target: u64) {
+        if self.layout.unlimited {
+            return;
+        }
         let over = self.over_limit();
         self.exit_if(over, EXIT_HALT, ExitPc::Const(target));
     }
@@ -1256,8 +1269,10 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                     self.exit_if(low, EXIT_MISALIGNED, ExitPc::Value(target));
                 }
                 // overflow_checked_jump
-                let over = self.over_limit();
-                self.exit_if(over, EXIT_HALT, ExitPc::Value(target));
+                if !self.layout.unlimited {
+                    let over = self.over_limit();
+                    self.exit_if(over, EXIT_HALT, ExitPc::Value(target));
+                }
                 let c = self.count();
                 let blk = self.indirect_block();
                 self.b.ins().jump(blk, &args(&[target, c]));

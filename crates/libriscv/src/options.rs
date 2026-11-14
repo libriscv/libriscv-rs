@@ -59,6 +59,17 @@ pub struct MachineOptions {
     /// interpreter is otherwise unaffected. Translations are only used by
     /// machines with the same setting.
     pub jit_automatic_nbit_address_space: bool,
+    /// With `jit` (and in translations made with `aot_output`), let native
+    /// code run without counting instructions or checking the instruction
+    /// limit (C++ `translate_ignore_instruction_limit`): loops in native
+    /// code then run until they leave it, however long that takes, so the
+    /// program needs another way to be stopped. The interpreter still
+    /// counts the blocks it runs and stops at the limit, so the counter
+    /// becomes an undercount, only good for telling progress (`rvlinux`
+    /// sets this unless `--accurate`, like C++). Native code leaves at
+    /// system calls, so `stop()` still works. Translations are only used
+    /// by machines with the same setting.
+    pub jit_ignore_instruction_limit: bool,
     /// Use JIT code compiled by an earlier run for the execute segments it
     /// was compiled for (default on): code linked into the program, and
     /// code from shared objects loaded with
@@ -144,6 +155,7 @@ impl Default for MachineOptions {
             jit_background: false,
             jit_background_slice: crate::JIT_BACKGROUND_SLICE,
             jit_automatic_nbit_address_space: false,
+            jit_ignore_instruction_limit: false,
             jit_cache: true,
             #[cfg(feature = "jit")]
             jit_cache_output: None,

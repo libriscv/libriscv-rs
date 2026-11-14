@@ -532,10 +532,20 @@ impl<'a> RegionWriter<'a> {
         };
         w.region_checks(&r.insns, &written)?;
         w.body(&r.insns)?;
+        // Without the limit nothing is counted (`MemoryLayout::unlimited`).
         let entry_counts: Vec<(u64, u64)> = r
             .entries
             .iter()
-            .map(|&pc| (pc, block_icount(exec, pc)))
+            .map(|&pc| {
+                (
+                    pc,
+                    if layout.unlimited {
+                        0
+                    } else {
+                        block_icount(exec, pc)
+                    },
+                )
+            })
             .collect();
         let control =
             structure(&w.arms, &entry_counts).unwrap_or_else(|| dispatch(&w.arms, &entry_counts));
@@ -677,8 +687,10 @@ impl<'a> RegionWriter<'a> {
     fn enter_block(&mut self, target: u64) {
         match self.a.region_at(self.exec, target) {
             Some(r) if r == self.region && self.labels.contains(&target) => {
-                let k = block_icount(self.exec, target);
-                self.line(&format!("c = c.wrapping_add({k});"));
+                if !self.layout.unlimited {
+                    let k = block_icount(self.exec, target);
+                    self.line(&format!("c = c.wrapping_add({k});"));
+                }
                 self.branch(target);
             }
             // Every in-region target is an entry; be safe anyway.
@@ -694,8 +706,10 @@ impl<'a> RegionWriter<'a> {
     /// Continue at `target` in the middle of a block: whoever runs it adds
     /// the block count for `target` again, so subtract it first.
     fn leave_mid_block(&mut self, target: u64) {
-        let k = block_icount(self.exec, target);
-        self.line(&format!("c = c.wrapping_sub({k});"));
+        if !self.layout.unlimited {
+            let k = block_icount(self.exec, target);
+            self.line(&format!("c = c.wrapping_sub({k});"));
+        }
         match self.a.region_at(self.exec, target) {
             Some(r) => {
                 self.calls.insert(r);
@@ -710,8 +724,11 @@ impl<'a> RegionWriter<'a> {
     }
 
     /// `if counter >= max { halt at target }`, as the dispatcher checks
-    /// before jumping.
+    /// before jumping. Nothing without the limit.
     fn check_counter(&mut self, target: u64) {
+        if self.layout.unlimited {
+            return;
+        }
         self.line(&format!(
             "if c >= max {{ break 'x A::X({EXIT_HALT}, {target:#x}); }}"
         ));
@@ -1099,7 +1116,9 @@ impl<'a> RegionWriter<'a> {
                 }
                 // overflow_checked_jump, then the entry dispatch (or the
                 // entry table, outside this region).
-                self.line(&format!("if c >= max {{ break 'x A::X({EXIT_HALT}, t); }}"));
+                if !self.layout.unlimited {
+                    self.line(&format!("if c >= max {{ break 'x A::X({EXIT_HALT}, t); }}"));
+                }
                 self.line("pc = t; continue 'e;");
                 return Some(false);
             }

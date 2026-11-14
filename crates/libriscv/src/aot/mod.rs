@@ -208,9 +208,15 @@ pub(crate) struct AotCode {
     segment: usize,
     /// Bit `i`: native code can be entered at decoder entry `i`.
     entries: Arc<[u64]>,
+    /// Translated without instruction counting (the key's layout).
+    unlimited: bool,
 }
 
 impl AotCode {
+    pub(crate) const fn unlimited(&self) -> bool {
+        self.unlimited
+    }
+
     pub(crate) fn has_entry(&self, i: usize) -> bool {
         self.entries
             .get(i / 64)
@@ -424,6 +430,7 @@ pub(crate) fn install(key: &AotKey, exec: &mut DecodedSegment) -> bool {
                         module: reg.module.clone(),
                         segment: reg.segment,
                         entries: Arc::clone(&reg.entries),
+                        unlimited: key.layout.unlimited,
                     },
                     reg.patch.to_vec(),
                 )

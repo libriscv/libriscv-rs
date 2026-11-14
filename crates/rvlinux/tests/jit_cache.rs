@@ -152,8 +152,10 @@ fn quit_after_loading_saves_code() {
     let elf = build("-O2 -static");
     let so = scratch("quit", "code.so");
     let so_s = so.to_str().unwrap();
+    // `-a` like `run`: code saved without it ignores the instruction
+    // limit, and only runs without `-a` use it.
     let out = Command::new(rvlinux())
-        .args(["-Q", "--jit-save-shared", so_s])
+        .args(["-a", "-Q", "--jit-save-shared", so_s])
         .arg(&elf)
         .output()
         .unwrap();

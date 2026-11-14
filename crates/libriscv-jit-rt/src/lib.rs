@@ -75,11 +75,15 @@ pub const MAX_ACCESS: u64 = 8;
 /// The guest memory layout generated code is built for, see the crate
 /// documentation: a non-zero `mask` (masked accesses, no windows), or the
 /// `(base, len)` windows of the arena that loads and stores check against.
+/// Also whether the code ignores the instruction limit (`unlimited`: it
+/// neither counts instructions nor checks the limit), which is baked into
+/// the code the same way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MemoryLayout {
     pub mask: u64,
     pub read: (u64, u64),
     pub write: (u64, u64),
+    pub unlimited: bool,
 }
 
 /// True if the window `inner` lies inside `outer`. An empty window lies
@@ -225,6 +229,11 @@ impl std::fmt::Debug for CodeMemory {
 }
 
 impl CodeMemory {
+    /// The memory layout the code was built for.
+    pub const fn layout(&self) -> MemoryLayout {
+        self.layout
+    }
+
     /// Marker for "no function" in the `entries` passed to [`CodeMemory::new`].
     pub const NO_ENTRY: u32 = u32::MAX;
 
@@ -452,6 +461,7 @@ mod tests {
             mask: 0,
             read,
             write,
+            unlimited: false,
         };
         for (read, write) in [
             ((0x1000, 0x1001), (0x1800, 0x800)),
