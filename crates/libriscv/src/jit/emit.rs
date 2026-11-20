@@ -1630,9 +1630,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                         let a = ins.ins().fneg(a);
                         ins.ins().fma(a, b, c)
                     }
+                    // fma(-a, b, -c): the interpreter's FNMADD (not -fma, whose
+                    // zero has the wrong sign).
                     FFma::Nmadd => {
-                        let r = ins.ins().fma(a, b, c);
-                        ins.ins().fneg(r)
+                        let a = ins.ins().fneg(a);
+                        let c = ins.ins().fneg(c);
+                        ins.ins().fma(a, b, c)
                     }
                 };
                 self.set_fval(rd, v);

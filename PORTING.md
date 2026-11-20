@@ -497,6 +497,25 @@ Integer FCVT honors the encoded rounding mode, including DYN from FCSR.frm,
 saturates, and converts NaN to the maximum. Single-precision writes preserve
 the upper register half without NaN-boxing.
 
+**FNMADD** (and the vector VFNMADD/VFNMACC) computes `-(rs1*rs2) - rs3` as
+`fma(-rs1, rs2, -rs3)`. That is the spec's definition, and it differs from
+`-fma(rs1, rs2, rs3)` only in the sign of an exact zero. An example is
+rs1 = +0, rs2 = -0, rs3 = +0: the spec gives +0, the negated fma gives -0.
+The interpreter, the JIT and AOT all use the same formula.
+
+Not reproduced (C++ bug): C++ uses `-fma` (`rvf_instr.cpp`, and
+`rvv_instr.cpp` for the vector forms), so on x86-64 it returns -0. On
+AArch64, where FMA is baseline, an optimizing compiler folds `-fma` into the
+host's FNMADD instruction, which gives +0. The C++ result therefore depends
+on the host and the build: the reference emulator built with `gcc -O2` on
+AArch64 returns +0. The port used to copy `-fma`, with the same effect. On
+AArch64, its release interpreter and AOT code returned +0, while the debug
+interpreter and the Cranelift JIT returned -0; the AOT test
+`fp_special_values_match_up_to_nan` caught it.
+
+NaN results still aren't canonicalized, so their sign and payload can differ
+from C++ as before.
+
 ### Dyncalls
 
 Valid `dyncall.rs` words invoke the system call selected by their immediate.

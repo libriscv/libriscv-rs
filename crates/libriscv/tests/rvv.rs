@@ -258,6 +258,16 @@ static void t_float(void)
 	asm volatile("vfmacc.vv v10, v1, v2");
 	asm volatile("vrgather.vi v6, v10, 0"); asm volatile("vfmv.f.s %0, v6" : "=f"(res)); put(fbits(res));
 	asm volatile("vrgather.vi v6, v10, 7"); asm volatile("vfmv.f.s %0, v6" : "=f"(res)); put(fbits(res));
+	/* vfnmacc/vfnmadd: -(a*b) - c is +0 when the product is -0 and c is +0 */
+	ulong pz = 0, nz = 0x80000000ul;
+	asm volatile("vmv.v.x v14, %0" :: "r"(pz));
+	asm volatile("vmv.v.x v15, %0" :: "r"(nz));
+	asm volatile("vmv.v.x v16, %0" :: "r"(pz));
+	asm volatile("vfnmacc.vv v16, v14, v15");
+	asm volatile("vmv.x.s %0, v16" : "=r"(v)); put(v & 0xffffffff);
+	asm volatile("vmv.v.x v17, %0" :: "r"(nz));
+	asm volatile("vfnmadd.vv v17, v14, v14");
+	asm volatile("vmv.x.s %0, v17" : "=r"(v)); put(v & 0xffffffff);
 	/* vfadd.vf with 10.0f */
 	float ten = 10.0f;
 	asm volatile("vfadd.vf v11, v1, %0" :: "f"(ten));
@@ -776,6 +786,8 @@ fn rvv_basics() {
         36,                    // vfredusum
         f32b(1.0 * 0.5 + 1.0), // vfmacc
         f32b(8.0 * 0.5 + 1.0),
+        0,                // vfnmacc: -(+0 * -0) - +0 = +0
+        0,                // vfnmadd: -(+0 * -0) - +0 = +0
         f32b(1.0 + 10.0), // vfadd.vf
         1,                // vfcvt.rtz 1.5
         8,                // vfcvt.rtz 8.5

@@ -657,19 +657,20 @@ fn vfrec7<F: FpBits>(value: F, frm: u32) -> F {
 }
 
 /// The fused multiply-adds of OPFVV/OPFVF: `a` is vs1 (or the scalar), `b`
-/// vs2 and `c` vd. The `n` forms negate the whole expression.
+/// vs2 and `c` vd. The `n` forms negate the product and the addend
+/// (`fma(-a, b, -c)`, not `-fma(a, b, c)`: see "FNMADD" in PORTING.md).
 macro_rules! fused {
     ($funct6:expr, $a:expr, $b:expr, $c:expr) => {{
         let (a, b, c) = ($a, $b, $c);
         match $funct6 {
-            0b101000 => a.mul_add(c, b),    // VFMADD:  +(vs1*vd) + vs2
-            0b101001 => -a.mul_add(c, b),   // VFNMADD: -(vs1*vd) - vs2
-            0b101010 => a.mul_add(c, -b),   // VFMSUB:  +(vs1*vd) - vs2
-            0b101011 => (-a).mul_add(c, b), // VFNMSUB: -(vs1*vd) + vs2
-            0b101100 => a.mul_add(b, c),    // VFMACC:  +(vs1*vs2) + vd
-            0b101101 => -a.mul_add(b, c),   // VFNMACC: -(vs1*vs2) - vd
-            0b101110 => a.mul_add(b, -c),   // VFMSAC:  +(vs1*vs2) - vd
-            _ => (-a).mul_add(b, c),        // VFNMSAC: -(vs1*vs2) + vd
+            0b101000 => a.mul_add(c, b),     // VFMADD:  +(vs1*vd) + vs2
+            0b101001 => (-a).mul_add(c, -b), // VFNMADD: -(vs1*vd) - vs2
+            0b101010 => a.mul_add(c, -b),    // VFMSUB:  +(vs1*vd) - vs2
+            0b101011 => (-a).mul_add(c, b),  // VFNMSUB: -(vs1*vd) + vs2
+            0b101100 => a.mul_add(b, c),     // VFMACC:  +(vs1*vs2) + vd
+            0b101101 => (-a).mul_add(b, -c), // VFNMACC: -(vs1*vs2) - vd
+            0b101110 => a.mul_add(b, -c),    // VFMSAC:  +(vs1*vs2) - vd
+            _ => (-a).mul_add(b, c),         // VFNMSAC: -(vs1*vs2) + vd
         }
     }};
 }

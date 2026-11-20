@@ -714,8 +714,11 @@ ops! {
     FMadd = |m, i| { fused(m, i, f32::mul_add, f64::mul_add) }
     /// `rs1*rs2 - rs3`
     FMsub = |m, i| { fused(m, i, |a, b, c| a.mul_add(b, -c), |a, b, c| a.mul_add(b, -c)) }
-    /// `-(rs1*rs2) - rs3`
-    FNMadd = |m, i| { fused(m, i, |a, b, c| -a.mul_add(b, c), |a, b, c| -a.mul_add(b, c)) }
+    /// `-(rs1*rs2) - rs3`, as `fma(-rs1, rs2, -rs3)`. C++ computes
+    /// `-fma(rs1, rs2, rs3)`, which gives -0 instead of +0 when the exact
+    /// result is zero (and which compilers fold into the host's FNMADD on
+    /// AArch64, so its result depends on the build); see "FNMADD" in PORTING.md.
+    FNMadd = |m, i| { fused(m, i, |a, b, c| (-a).mul_add(b, -c), |a, b, c| (-a).mul_add(b, -c)) }
     /// `-(rs1*rs2) + rs3`
     FNMsub = |m, i| { fused(m, i, |a, b, c| (-a).mul_add(b, c), |a, b, c| (-a).mul_add(b, c)) }
     /// C++ `RV32F_BC_FMADD`: the fast-path FMADD, which (unlike the precise
