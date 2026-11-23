@@ -983,9 +983,10 @@ static void __attribute__((noinline)) bin(ulong a, ulong b, ulong c, ulong d) {
 /* FMA NaN results are the host fma()'s: C++ calls glibc's, which uses the
    CPU's FMA instruction, and which NaN that returns varies between CPUs;
    Rust uses compiler-builtins' software fma(). Only fold whether it's NaN.
-   FNMADD is -fma(a, b, c) in both emulators, whose exact zero is -0, but
-   AArch64 compilers may emit the host's FNMADD (-(a*b) - c, rounded once),
-   whose exact zero is +0: its zeros fold without their sign. */
+   FNMADD's exact zero is +0 in Rust (fma(-a, b, -c), as RISC-V specifies);
+   C++ computes -fma(a, b, c), whose exact zero is -0, unless an AArch64
+   compiler emits the host's FNMADD (+0): its zeros fold without their sign
+   (see "FNMADD" in PORTING.md). */
 static ulong nz32(ulong v) { v = canon32(v); return (v & 0x7fffffff) == 0 ? v & ~0x80000000ul : v; }
 static ulong nz64(ulong v) { v = canon64(v); return (v << 1) == 0 ? 0 : v; }
 static void __attribute__((noinline)) fused(ulong a, ulong b, ulong c, ulong d) {

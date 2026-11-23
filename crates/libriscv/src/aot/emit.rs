@@ -1606,7 +1606,9 @@ impl<'a> RegionWriter<'a> {
                     FFma::Madd => format!("{a}.mul_add({b}, {c})"),
                     FFma::Msub => format!("{a}.mul_add({b}, -{c})"),
                     FFma::Nmsub => format!("(-{a}).mul_add({b}, {c})"),
-                    FFma::Nmadd => format!("-({a}.mul_add({b}, {c}))"),
+                    // fma(-a, b, -c), as the interpreter: `-fma` has the wrong
+                    // zero sign, and rustc folds it into FNMADD on AArch64.
+                    FFma::Nmadd => format!("(-{a}).mul_add({b}, -{c})"),
                 };
                 self.line(&set_fval(&f(rd), dbl, &v));
             }

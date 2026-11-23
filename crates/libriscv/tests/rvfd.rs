@@ -256,3 +256,69 @@ fn illegal_formats_raise_illegal_operation() {
     let err = machine.try_simulate(MAX_CYCLES, 0).unwrap_err();
     assert_eq!(err.kind, ExceptionKind::IllegalOperation);
 }
+
+/// `fmt` field and register of an R4-type fused multiply-add.
+const fn enc_r4(opcode: u32, fmt: u32, rd: u32, rs1: u32, rs2: u32, rs3: u32) -> u32 {
+    (rs3 << 27) | (fmt << 25) | (rs2 << 20) | (rs1 << 15) | (DYN << 12) | (rd << 7) | opcode
+}
+
+#[test]
+fn fused_multiply_add_zero_signs_follow_the_spec() {
+    // The sign of an exact zero result, round to nearest (spec §11.6):
+    // FNMADD is -(rs1*rs2) - rs3, i.e. fma(-rs1, rs2, -rs3). C++ computes
+    // -fma(rs1, rs2, rs3), whose zero has the opposite sign (and which
+    // compilers fold into the host's FNMADD on AArch64, so the C++ result
+    // depends on the build); see "FNMADD" in PORTING.md.
+    const FMADD: u32 = 0x43;
+    const FMSUB: u32 = 0x47;
+    const FNMSUB: u32 = 0x4B;
+    const FNMADD: u32 = 0x4F;
+    // (rs1, rs2, rs3) signs as -0.0 flags, then the expected result signs
+    // for FMADD, FMSUB, FNMSUB and FNMADD (true: -0.0).
+    let cases: [((bool, bool, bool), [bool; 4]); 3] = [
+        // product -0, addend +0
+        ((false, true, false), [false, true, false, false]),
+        // product +0, addend -0
+        ((false, false, true), [false, false, true, false]),
+        // product +0, addend +0
+        ((false, false, false), [false, false, false, true]),
+    ];
+    for fmt in [0, 1] {
+        let program = [
+            enc_r4(FMADD, fmt, 10, 0, 1, 2),
+            enc_r4(FMSUB, fmt, 11, 0, 1, 2),
+            enc_r4(FNMSUB, fmt, 12, 0, 1, 2),
+            enc_r4(FNMADD, fmt, 13, 0, 1, 2),
+            ENC_JSELF,
+        ];
+        let zero = |negative: bool| match (fmt, negative) {
+            (0, false) => 0xFFFF_FFFF_0000_0000,
+            (0, true) => 0xFFFF_FFFF_8000_0000,
+            (_, false) => 0,
+            (_, true) => 0x8000_0000_0000_0000,
+        };
+        for ((s1, s2, s3), expected) in cases {
+            run_both(
+                &program,
+                |m| {
+                    let regs = m.cpu.registers_mut();
+                    regs.set_fp_bits(0, zero(s1));
+                    regs.set_fp_bits(1, zero(s2));
+                    regs.set_fp_bits(2, zero(s3));
+                },
+                |m| {
+                    let names = ["FMADD", "FMSUB", "FNMSUB", "FNMADD"];
+                    for ((rd, name), negative) in (10..).zip(names).zip(expected) {
+                        // A single-precision result only writes the low half.
+                        let mask = if fmt == 0 { 0xFFFF_FFFF } else { u64::MAX };
+                        assert_eq!(
+                            m.cpu.registers().fp_bits(rd) & mask,
+                            zero(negative) & mask,
+                            "{name} fmt {fmt}: signs {s1} {s2} {s3}"
+                        );
+                    }
+                },
+            );
+        }
+    }
+}
