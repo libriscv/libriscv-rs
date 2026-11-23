@@ -5,7 +5,9 @@
 //! the same output, exit code and instruction count, and it must only be
 //! used for the segments and memory layout it was compiled for.
 
-#![cfg(feature = "jit")]
+// Saved code is linked into and loaded from shared objects, on Linux only
+// (`load_shared_object` returns `Unsupported` elsewhere).
+#![cfg(all(feature = "jit", target_os = "linux"))]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,

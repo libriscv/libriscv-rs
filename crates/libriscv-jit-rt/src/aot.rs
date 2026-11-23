@@ -12,6 +12,7 @@
 //! cannot verify that a native object contains a valid translation; loading
 //! executes native code and requires a trusted object.
 
+#[cfg(target_os = "linux")]
 use std::ffi::c_void;
 use std::io;
 use std::path::Path;
@@ -47,10 +48,12 @@ pub struct RawMeta {
     pub len: u64,
 }
 
+#[cfg(target_os = "linux")]
 type MetaFn = extern "C" fn() -> RawMeta;
 type EnterFn = unsafe extern "C" fn(*mut RawCall) -> u8;
 
 /// Refuse metadata beyond this many words: no real translation comes close.
+#[cfg(target_os = "linux")]
 const MAX_META: u64 = 1 << 32;
 
 /// A loaded translation.

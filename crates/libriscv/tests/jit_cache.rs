@@ -131,6 +131,11 @@ fn saved_segments_run_like_the_interpreter() {
     assert_eq!(state(&mut m), expected);
     assert_eq!(output.len(), 2);
     assert!(output.object().unwrap().starts_with(b"\x7FELF"));
+    // Shared objects of cached code are linked and loaded on Linux only
+    // (`load_shared_object` returns `Unsupported` elsewhere).
+    if !cfg!(target_os = "linux") {
+        return;
+    }
 
     let dir = testutil::workspace_root()
         .join("target")

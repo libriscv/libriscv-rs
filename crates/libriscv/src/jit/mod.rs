@@ -412,6 +412,10 @@ pub(crate) mod tests {
                 jit,
                 jit_background: background,
                 jit_background_slice: slice,
+                // Counting compiles: build every segment here, not take
+                // the entry stub (the same in other tests) from a machine
+                // of a concurrent test.
+                use_shared_execute_segments: false,
                 ..Default::default()
             },
         )
@@ -570,6 +574,8 @@ pub(crate) mod tests {
                     jit,
                     jit_background: false,
                     free_decode_bytes: u64::MAX,
+                    // Counting compiles: as in `run_page`.
+                    use_shared_execute_segments: false,
                     ..Default::default()
                 },
             )

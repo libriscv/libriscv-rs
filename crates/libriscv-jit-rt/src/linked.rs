@@ -36,6 +36,7 @@ pub const RECORD_WORDS: usize = 6;
 pub const TABLE_WORDS: usize = 3;
 
 /// Refuse sizes beyond this: no real segment's code or metadata comes close.
+#[cfg(target_os = "linux")]
 const MAX_LEN: u64 = 1 << 36;
 
 /// A shared object loaded with `dlopen`, closed when the last
@@ -43,7 +44,8 @@ const MAX_LEN: u64 = 1 << 36;
 #[derive(Debug)]
 pub struct SharedObject {
     /// The `dlopen` handle, as an address (so that this is `Send + Sync`:
-    /// the handle is only ever passed back to `dlclose`).
+    /// the handle is only ever passed back to `dlclose`, on Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     handle: usize,
 }
 
@@ -100,6 +102,7 @@ pub struct CachedUnit {
 /// they are a record (the magic matches), its code and metadata must be
 /// where it says, in memory that stays mapped as long as `owner`, or for
 /// the program's lifetime if that is `None`.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 unsafe fn read_record(record: *const u64, owner: Option<&Arc<SharedObject>>) -> Option<CachedUnit> {
     // SAFETY: the caller guarantees `record` points at a whole record.

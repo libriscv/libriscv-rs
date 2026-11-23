@@ -13,12 +13,31 @@
 //! compilation). Code in the program or in a `dlopen`ed shared object is
 //! mapped from files by the kernel or loader, which keep it coherent.
 //!
+//! macOS traps reads of CTR_EL0 from user space (SIGILL), so there [`flush`]
+//! calls libSystem's `sys_icache_invalidate` (`<libkern/OSCacheControl.h>`),
+//! which does the same clean and invalidate.
+//!
 //! [`CodeMemory::new`]: crate::CodeMemory::new
 //! [`CodeMemory::enter`]: crate::CodeMemory::enter
 
 /// Make `code`, just written through a data mapping of the same addresses,
 /// visible to instruction fetch on every core.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[allow(unsafe_code)]
+pub(crate) fn flush(code: &[u8]) {
+    // In libSystem, which every program on Apple platforms links.
+    unsafe extern "C" {
+        fn sys_icache_invalidate(start: *mut std::ffi::c_void, len: usize);
+    }
+    // SAFETY: `code` is mapped and readable for its whole length; the call
+    // only cleans and invalidates cache lines, changing no memory.
+    unsafe { sys_icache_invalidate(code.as_ptr().cast_mut().cast(), code.len()) };
+    synchronize();
+}
+
+/// Make `code`, just written through a data mapping of the same addresses,
+/// visible to instruction fetch on every core.
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
 #[allow(unsafe_code)]
 pub(crate) fn flush(code: &[u8]) {
     use std::arch::asm;

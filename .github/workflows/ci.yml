@@ -245,6 +245,42 @@ jobs:
             run jit -j --jit-cache-dir "$cache"
             run jit-again -j --jit-cache-dir "$cache"
 
+  # macOS on Apple Silicon: lint and test there, the JIT included. macOS
+  # traps reads of CTR_EL0, so the JIT flushes the instruction cache through
+  # libSystem. There is no riscv64 Linux cross compiler or C++ reference
+  # emulator here, so the tests that need them skip; shared objects of cached
+  # JIT code are Linux-only and their tests are compiled out.
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # Sources only: native.rs reads the C++ unit tests' headers.
+      - name: Fetch C++ libriscv
+        run: |
+          git init libriscv-cpp
+          git -C libriscv-cpp fetch --depth 1 https://github.com/libriscv/libriscv.git "$LIBRISCV_CPP_REF"
+          git -C libriscv-cpp checkout FETCH_HEAD
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: Test (with the JIT, the default)
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+        run: cargo test --workspace
+
+      - name: Test without the JIT (interpreter only)
+        env:
+          LIBRISCV_CPP: ${{ github.workspace }}/libriscv-cpp
+        run: cargo test --workspace --no-default-features
+
+      - name: Check the stable dispatch's tail calls (release)
+        run: cargo test --release -p libriscv --test dispatch
+
   features:
     runs-on: ubuntu-24.04
     steps:

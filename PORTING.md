@@ -487,6 +487,11 @@ caching are in `jit/`. Executable memory and native entry are isolated in
 `CodeMemory::new` cleans the data cache and invalidates the instruction cache
 for new code (`dc cvau`/`ic ivau`, as `__clear_cache`), and `CodeMemory::enter`
 issues an `isb`, because background compilation writes code on another thread.
+macOS traps reads of `CTR_EL0` (the cache line sizes) from user space, so
+there the flush is libSystem's `sys_icache_invalidate`; CI lints and tests
+on macOS AArch64 too. On macOS, shared objects of cached code
+(`--jit-save-shared`, `--jit-load`) are unsupported and their tests are
+compiled out.
 Cranelift's AArch64 backend rounds and fuses natively, so its code has no
 libcalls. Cranelift x64 tail calls require `preserve_frame_pointers`.
 
