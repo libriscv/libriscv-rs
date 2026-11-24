@@ -68,3 +68,7 @@ harness = false
 [[bench]]
 name = "vmcall"
 harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
