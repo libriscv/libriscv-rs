@@ -7,7 +7,7 @@
 //! instead: [`PageData::Arena`] means "the bytes are in the arena at this
 //! page's address", the shared pages are `'static` arrays, and a page's
 //! own bytes are reference counted, so that a fork can share them with its
-//! master until either side writes (see `Memory::fork`).
+//! master until either side writes (see `Memory::fork_page_table`).
 
 use std::sync::Arc;
 
@@ -127,9 +127,10 @@ pub(crate) enum PageData {
     /// that are shared makes a private copy first (`Arc::make_mut`).
     Owned(Arc<PageBytes>),
     /// Another machine's page, loaned to a fork (C++: a non-owning page
-    /// pointing at the master's data). Never written in place: it becomes
-    /// `Owned` first.
-    Loaned(Arc<PageBytes>),
+    /// pointing at the master's data): page `n` of the fork's snapshot
+    /// (`PageTable::base`). Never written in place: it becomes `Owned`
+    /// first.
+    Loaned(usize),
     /// The shared zero page (C++ `cow_page`/`guard_page` data).
     Zero,
     /// The shared host code page.

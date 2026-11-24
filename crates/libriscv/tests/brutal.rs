@@ -580,3 +580,123 @@ fn mprotect_of_a_loaned_page_does_not_reach_the_master() {
     assert_eq!(call(&mut fork, "read_at", 3), 0);
     assert_eq!(call(&mut machine, "read_at", 3), 103);
 }
+
+/// Forks of a machine without an arena share a snapshot of its pages,
+/// cached until the pages change. Every kind of change must drop it: a fork
+/// made after the change sees it, one made before does not.
+#[test]
+#[cfg_attr(
+    not(all(feature = "ext-a", feature = "ext-c", feature = "ext-f")),
+    ignore = "glibc guests are RV64GC"
+)]
+fn forks_see_every_change_made_since_the_last_fork() {
+    let Some(mut master) = boot_page_cache_program() else {
+        return;
+    };
+    let page = |m: &mut Machine, a: i64| call(m, "page_addr", a) as u64;
+    let (p0, p1, p2, p3) = (
+        page(&mut master, 0),
+        page(&mut master, 1),
+        page(&mut master, 2),
+        page(&mut master, 3),
+    );
+    let read = |m: &Machine, addr: u64| m.memory.read_u64(addr).unwrap_or(u64::MAX);
+
+    // `change` is made to the master between two forks; `seen` tells
+    // whether a machine shows it.
+    let mut check = |name: &str, change: &dyn Fn(&mut Machine), seen: &dyn Fn(&Machine) -> bool| {
+        let before = master.fork().unwrap();
+        // Forks of the unchanged master, which share the cached snapshot.
+        let again = master.fork().unwrap();
+        assert!(!seen(&before) && !seen(&again), "{name}: seen too early");
+        change(&mut master);
+        assert!(seen(&master), "{name}: not made");
+        let after = master.fork().unwrap();
+        assert!(seen(&after), "{name}: a later fork does not see it");
+        assert!(!seen(&before), "{name}: an earlier fork sees it");
+        // ... nor a fork of a fork made before.
+        assert!(
+            !seen(&before.fork().unwrap()),
+            "{name}: a fork of a fork sees it"
+        );
+    };
+
+    check(
+        "guest store",
+        &|m| vmcall2(m, "write_at", 0, 1000).map(drop).unwrap(),
+        &|m| read(m, p0) == 1000,
+    );
+    check(
+        "second guest store to the same page",
+        &|m| vmcall2(m, "write_at", 0, 1001).map(drop).unwrap(),
+        &|m| read(m, p0) == 1001,
+    );
+    check(
+        "memcpy",
+        &|m| m.memory.memcpy(p1, &2000u64.to_le_bytes()).unwrap(),
+        &|m| read(m, p1) == 2000,
+    );
+    check(
+        "memset",
+        &|m| m.memory.memset(p1 + 8, 0x11, 8).unwrap(),
+        &|m| read(m, p1 + 8) == 0x1111_1111_1111_1111,
+    );
+    check(
+        "memview_mut",
+        &|m| {
+            let v = m.memory.memview_mut(p1 + 16, 8).unwrap();
+            v.copy_from_slice(&3000u64.to_le_bytes());
+        },
+        &|m| read(m, p1 + 16) == 3000,
+    );
+    check(
+        "memcpy_within",
+        &|m| m.memory.memcpy_within(p2 + 8, p1, 8).unwrap(),
+        &|m| read(m, p2 + 8) == 2000,
+    );
+    check(
+        "memdiscard",
+        &|m| m.memory.memdiscard(p2, PAGE_SIZE, true).unwrap(),
+        &|m| read(m, p2 + 8) == 0,
+    );
+    check(
+        "set_page_attr",
+        &|m| {
+            m.memory
+                .set_page_attr(p3, PAGE_SIZE, PageAttributes::rwx(true, false, false))
+                .unwrap();
+        },
+        &|m| {
+            let attr = m.memory.page_attributes(p3).unwrap();
+            !attr.write && !attr.is_cow
+        },
+    );
+    check(
+        "dont_fork",
+        &|m| {
+            m.memory
+                .set_page_attr(
+                    p0,
+                    PAGE_SIZE,
+                    PageAttributes {
+                        dont_fork: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        },
+        // In the master, the attribute; in a fork, the page is missing.
+        &|m| {
+            if m.is_forked() {
+                read(m, p0) == 0
+            } else {
+                m.memory.page_attributes(p0).unwrap().dont_fork
+            }
+        },
+    );
+    check(
+        "free_pages",
+        &|m| m.memory.free_pages(p1, PAGE_SIZE),
+        &|m| read(m, p1) == 0,
+    );
+}

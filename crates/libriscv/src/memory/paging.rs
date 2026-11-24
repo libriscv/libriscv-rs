@@ -18,8 +18,8 @@
 //! Custom page-fault handlers and memory traps remain unimplemented.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 
 use super::page::{HOST_PAGE, Page, PageAttributes, PageBytes, PageData, ZERO_PAGE};
 use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault, shared};
@@ -158,6 +158,101 @@ impl Slot {
     }
 }
 
+/// The slots of a page table, and the [`Snapshot`] forks are made from
+/// while the pages do not change.
+///
+/// Every mutable access drops the snapshot, so that a cached snapshot
+/// always shows the current pages. Page table changes (entries, attributes,
+/// copies) all go through a slot; the index and the free list only change
+/// along with one. The exception is [`exclusive_bytes`], for guest stores.
+///
+/// [`exclusive_bytes`]: Self::exclusive_bytes
+#[derive(Debug, Default)]
+struct Slots {
+    v: Vec<Slot>,
+    snapshot: OnceLock<Arc<Snapshot>>,
+}
+
+impl Slots {
+    fn from_vec(v: Vec<Slot>) -> Self {
+        Self {
+            v,
+            snapshot: OnceLock::new(),
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, slot: usize) -> Option<&Slot> {
+        self.v.get(slot)
+    }
+
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, Slot> {
+        self.v.iter()
+    }
+
+    /// Drop the cached snapshot: the pages are about to change.
+    #[inline(always)]
+    fn changed(&mut self) {
+        if self.snapshot.get().is_some() {
+            self.snapshot = OnceLock::new();
+        }
+    }
+
+    #[inline(always)]
+    fn get_mut(&mut self, slot: usize) -> Option<&mut Slot> {
+        self.changed();
+        self.v.get_mut(slot)
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, Slot> {
+        self.changed();
+        self.v.iter_mut()
+    }
+
+    fn push(&mut self, entry: Slot) {
+        self.changed();
+        self.v.push(entry);
+    }
+
+    /// The bytes of the writable page in `slot` if it owns them and nothing
+    /// else holds them (`Arc::get_mut`), keeping the snapshot: a snapshot
+    /// holds the bytes of every page it shows, so these are not among them.
+    #[inline(always)]
+    fn exclusive_bytes(&mut self, slot: usize) -> Option<&mut PageBytes> {
+        let entry = self.v.get_mut(slot)?;
+        if !entry.page.attr.write {
+            return None;
+        }
+        match &mut entry.page.data {
+            PageData::Owned(data) => Arc::get_mut(data),
+            _ => None,
+        }
+    }
+}
+
+/// A page table frozen for forking (see `Memory::fork_page_table`): the
+/// bytes of its pages, and the page table of a fork, whose loaned pages
+/// are indices into `pages`.
+///
+/// A fork copies the page table and holds `pages` through one `Arc`, so
+/// that making or dropping a fork updates one reference count rather than
+/// one per page, which threads forking the same machine would all contend
+/// on. C++ loans the pages without counting; here the master may go first.
+#[derive(Debug)]
+pub(super) struct Snapshot {
+    pages: LoanedPages,
+    index: BTreeMap<u64, usize>,
+    slots: Vec<Slot>,
+    free_slots: Vec<usize>,
+}
+
+/// The bytes of a fork's loaned pages ([`PageData::Loaned`] indices).
+type LoanedPages = Arc<[Arc<PageBytes>]>;
+
 /// Page number of a free slot (no page number is this large).
 const FREE: u64 = u64::MAX;
 /// Entries of the page cache, a power of two.
@@ -181,8 +276,10 @@ const PAGE_CACHE_SIZE: usize = 512;
 pub(super) struct PageTable {
     /// Page number to slot.
     index: BTreeMap<u64, usize>,
-    slots: Vec<Slot>,
+    slots: Slots,
     free_slots: Vec<usize>,
+    /// The bytes of a fork's loaned pages.
+    base: Option<LoanedPages>,
     /// The page cache (relaxed atomics: hints, filled through `&self`
     /// like C++'s `mutable` caches).
     cache: Box<[AtomicUsize]>,
@@ -213,8 +310,9 @@ impl PageTable {
     ) -> Self {
         Self {
             index: BTreeMap::new(),
-            slots: Vec::new(),
+            slots: Slots::default(),
             free_slots: Vec::new(),
+            base: None,
             cache: empty_page_cache(),
             arena: ArenaSet::new(arena_pages),
             arena_indexed: ArenaSet::new(arena_pages),
@@ -374,12 +472,14 @@ impl PageTable {
         index: BTreeMap<u64, usize>,
         slots: Vec<Slot>,
         free_slots: Vec<usize>,
+        base: Option<LoanedPages>,
     ) -> Self {
         let owned = slots.iter().filter(|s| s.page.is_owned()).count();
         Self {
             index,
-            slots,
+            slots: Slots::from_vec(slots),
             free_slots,
+            base,
             cache: empty_page_cache(),
             arena: ArenaSet::default(),
             arena_indexed: ArenaSet::default(),
@@ -429,11 +529,13 @@ impl PageTable {
 
     /// `make_writable` of the page in `slot`.
     fn make_writable_slot(&mut self, slot: usize) {
-        let Self { slots, owned, .. } = self;
+        let Self {
+            slots, owned, base, ..
+        } = self;
         let Some(Slot { page, .. }) = slots.get_mut(slot) else {
             return;
         };
-        private_bytes(page, owned);
+        private_bytes(page, owned, base.as_deref());
         page.attr.write = true;
         page.attr.is_cow = false;
     }
@@ -451,6 +553,13 @@ fn empty_page_cache() -> Box<[AtomicUsize]> {
     (0..PAGE_CACHE_SIZE).map(|_| AtomicUsize::new(0)).collect()
 }
 
+/// The bytes of loaned page `n` of `base`. A table only has loaned pages
+/// from its own `base`, so the zero page is never actually returned.
+#[inline(always)]
+fn loaned_bytes(base: Option<&[Arc<PageBytes>]>, n: usize) -> &PageBytes {
+    base.and_then(|b| b.get(n)).map_or(&ZERO_PAGE, |p| p)
+}
+
 /// The bytes of `page`, writable and its own: data it does not own (a
 /// fork's loaned page, the zero page, the host code page) becomes an owned
 /// copy first (counted in `owned`), and owned bytes a fork still shares
@@ -462,8 +571,12 @@ fn empty_page_cache() -> Box<[AtomicUsize]> {
 /// made writable with `mprotect` (in its master). Here no write reaches
 /// another page's bytes.
 #[inline(always)]
-fn private_bytes<'a>(page: &'a mut Page, owned: &mut usize) -> Option<&'a mut PageBytes> {
-    if !page.is_owned() && !own_page(page, owned) {
+fn private_bytes<'a>(
+    page: &'a mut Page,
+    owned: &mut usize,
+    base: Option<&[Arc<PageBytes>]>,
+) -> Option<&'a mut PageBytes> {
+    if !page.is_owned() && !own_page(page, owned, base) {
         return None;
     }
     match &mut page.data {
@@ -472,19 +585,17 @@ fn private_bytes<'a>(page: &'a mut Page, owned: &mut usize) -> Option<&'a mut Pa
     }
 }
 
-/// Give `page` data of its own (a copy of what it shows, except loaned
-/// bytes nobody else holds any more). False for arena pages.
+/// Give `page` data of its own (a copy of what it shows). False for arena
+/// pages.
 #[cold]
 #[inline(never)]
-fn own_page(page: &mut Page, owned: &mut usize) -> bool {
+fn own_page(page: &mut Page, owned: &mut usize, base: Option<&[Arc<PageBytes>]>) -> bool {
     let data = match std::mem::replace(&mut page.data, PageData::Zero) {
         PageData::Arena => {
             page.data = PageData::Arena;
             return false;
         }
-        // Copied by `make_mut` in `private_bytes`, unless the master is
-        // gone.
-        PageData::Loaned(data) => data,
+        PageData::Loaned(n) => Arc::new(*loaned_bytes(base, n)),
         PageData::Host => Arc::new(HOST_PAGE),
         PageData::Zero | PageData::Owned(_) => Arc::new(ZERO_PAGE),
     };
@@ -588,7 +699,8 @@ impl Memory {
         match data {
             // Arena pages are always below `arena_pages`.
             PageData::Arena => self.arena_page(pageno).unwrap_or(&ZERO_PAGE),
-            PageData::Owned(b) | PageData::Loaned(b) => b,
+            PageData::Owned(b) => b,
+            PageData::Loaned(n) => loaned_bytes(self.paging.base.as_deref(), *n),
             PageData::Zero => &ZERO_PAGE,
             PageData::Host => &HOST_PAGE,
         }
@@ -702,9 +814,11 @@ impl Memory {
         if self.is_arena_slot(slot) {
             return self.arena_page_mut(pageno).ok_or_else(fault);
         }
-        let PageTable { slots, owned, .. } = &mut self.paging;
+        let PageTable {
+            slots, owned, base, ..
+        } = &mut self.paging;
         slot.and_then(|s| slots.get_mut(s))
-            .and_then(|e| private_bytes(&mut e.page, owned))
+            .and_then(|e| private_bytes(&mut e.page, owned, base.as_deref()))
             .ok_or_else(fault)
     }
 
@@ -767,16 +881,10 @@ impl Memory {
         let Some(slot) = self.paging.cached_slot(pageno) else {
             return false;
         };
-        let Some(entry) = self.paging.slots.get_mut(slot) else {
-            return false;
-        };
-        if !entry.page.attr.write {
-            return false;
-        }
-        let PageData::Owned(data) = &mut entry.page.data else {
-            return false;
-        };
-        let Some(dst) = Arc::get_mut(data)
+        let Some(dst) = self
+            .paging
+            .slots
+            .exclusive_bytes(slot)
             .and_then(|d| d.get_mut(off..))
             .and_then(|d| d.first_chunk_mut::<N>())
         else {
@@ -821,12 +929,14 @@ impl Memory {
     #[inline(always)]
     fn cached_writable_bytes(&mut self, pageno: u64) -> Option<&mut PageBytes> {
         let slot = self.paging.slot_of(pageno)?;
-        let PageTable { slots, owned, .. } = &mut self.paging;
+        let PageTable {
+            slots, owned, base, ..
+        } = &mut self.paging;
         let entry = slots.get_mut(slot)?;
         if !entry.page.attr.write {
             return None;
         }
-        private_bytes(&mut entry.page, owned)
+        private_bytes(&mut entry.page, owned, base.as_deref())
     }
 
     /// Guest store outside the arena's write window (C++ `write<T>`):
@@ -1134,14 +1244,15 @@ impl Memory {
             let PageTable {
                 slots: entries,
                 owned,
+                base,
                 ..
             } = &mut self.paging;
             for entry in entries.iter_mut() {
                 let Some(&(off, len, i)) = page_pieces.get(&entry.pageno) else {
                     continue;
                 };
-                let data =
-                    private_bytes(&mut entry.page, owned).and_then(|d| d.get_mut(off..off + len));
+                let data = private_bytes(&mut entry.page, owned, base.as_deref())
+                    .and_then(|d| d.get_mut(off..off + len));
                 if let (Some(slot), Some(d)) = (slots.get_mut(i), data) {
                     *slot = Some(d);
                 }
@@ -1402,9 +1513,11 @@ impl Memory {
             self.arena_page_mut(pageno)
         } else {
             let slot = self.paging.slot_of(pageno);
-            let PageTable { slots, owned, .. } = &mut self.paging;
+            let PageTable {
+                slots, owned, base, ..
+            } = &mut self.paging;
             slot.and_then(|s| slots.get_mut(s))
-                .and_then(|e| private_bytes(&mut e.page, owned))
+                .and_then(|e| private_bytes(&mut e.page, owned, base.as_deref()))
         };
         if let Some(d) = bytes.and_then(|b| b.get_mut(off..off + size)) {
             zero_lazily(d);
@@ -1568,11 +1681,16 @@ impl Memory {
     ///
     /// Every page except the `dont_fork` ones is loaned to the fork: it
     /// shares the bytes, and writable pages become copy-on-write in the
-    /// fork. Loaning is a reference count increment, so a fork costs one
-    /// page table entry per page, as in C++. Unlike C++, the master stays
-    /// free to change (and to go away): a write to bytes a fork shares
-    /// copies them first, on either side, so a fork sees its master as it
-    /// was at the fork.
+    /// fork. The fork costs one page table entry per page, as in C++. Unlike
+    /// C++, the master stays free to change (and to go away): a write to
+    /// bytes a fork shares copies them first, on either side, so a fork
+    /// sees its master as it was at the fork.
+    ///
+    /// The pages are loaned through a [`Snapshot`], which a memory without
+    /// an arena caches until its pages change (see [`Slots`]), so that
+    /// forks of an unchanged machine, also made on many threads at once,
+    /// share one. A machine with an arena makes a new one every time: guest
+    /// stores change the arena without going through the page table.
     ///
     /// The fork has no arena. The arena pages C++ has in its page table
     /// are copied (C++ loans them out of the master's arena); like in C++,
@@ -1592,16 +1710,49 @@ impl Memory {
                     page: guard.clone(),
                 });
             }
-            return paging.forked(index, slots, Vec::new());
+            return paging.forked(index, slots, Vec::new(), None);
         }
-        let loan = |pageno: u64, page: &Page| {
-            let data = match &page.data {
-                PageData::Owned(b) | PageData::Loaned(b) => PageData::Loaned(Arc::clone(b)),
-                PageData::Arena => {
-                    PageData::Loaned(Arc::new(*self.arena_page(pageno).unwrap_or(&ZERO_PAGE)))
+        let snapshot = if self.arena_pages == 0 {
+            Arc::clone(
+                paging
+                    .slots
+                    .snapshot
+                    .get_or_init(|| Arc::new(self.snapshot())),
+            )
+        } else {
+            Arc::new(self.snapshot())
+        };
+        paging.forked(
+            snapshot.index.clone(),
+            snapshot.slots.clone(),
+            snapshot.free_slots.clone(),
+            Some(Arc::clone(&snapshot.pages)),
+        )
+    }
+
+    /// The pages as they are now, for [`fork_page_table`].
+    ///
+    /// [`fork_page_table`]: Self::fork_page_table
+    fn snapshot(&self) -> Snapshot {
+        let paging = &self.paging;
+        let base = paging.base.as_deref();
+        let mut pages: Vec<Arc<PageBytes>> = Vec::new();
+        let mut loan = |pageno: u64, page: &Page| {
+            let bytes = match &page.data {
+                PageData::Owned(b) => Some(Arc::clone(b)),
+                PageData::Loaned(n) => Some(
+                    base.and_then(|b| b.get(*n))
+                        .map_or_else(|| Arc::new(ZERO_PAGE), Arc::clone),
+                ),
+                PageData::Arena => Some(Arc::new(*self.arena_page(pageno).unwrap_or(&ZERO_PAGE))),
+                PageData::Zero | PageData::Host => None,
+            };
+            let data = match bytes {
+                Some(b) => {
+                    pages.push(b);
+                    PageData::Loaned(pages.len() - 1)
                 }
-                PageData::Zero => PageData::Zero,
-                PageData::Host => PageData::Host,
+                None => page.data.clone(),
             };
             let mut attr = page.attr;
             if attr.write {
@@ -1649,7 +1800,12 @@ impl Memory {
                 }
             }
         }
-        paging.forked(index, slots, free_slots)
+        Snapshot {
+            pages: pages.into(),
+            index,
+            slots,
+            free_slots,
+        }
     }
 
     /// Install an inaccessible guard page at page `pageno` (C++
