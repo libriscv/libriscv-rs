@@ -66,6 +66,8 @@ planned features.
   feature uses guaranteed tail calls with `become`. See "Dispatch".
 - **Features.** Behavioral CMake options map to Cargo features, including
   `ext-a`, `ext-c`, `ext-f`, `ext-v`, `fcsr`, and `debug-checks`.
+  `syscalls-600` stands in for `RISCV_SYSCALLS_MAX=601` (the default
+  table has 512 entries, EBREAK at the last one).
   `ext-c` selects one decoder entry per 2 bytes instead of 4, affecting
   block structure and timeout locations. Default features match the
   default C++ decoder configuration. Dispatch-selection options have no

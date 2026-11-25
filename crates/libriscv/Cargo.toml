@@ -25,6 +25,10 @@ nightly-dispatch = []
 # Software FCSR rounding-mode/flags emulation (C++: RISCV_FCSR). Not ported
 # yet (C++ needs long double for it): enabling it is a compile error.
 fcsr = []
+# A system call table of 601 entries instead of 512 (C++:
+# RISCV_SYSCALLS_MAX=601): system calls 0..=599 and EBREAK at 600
+# (`SYSCALL_EBREAK_NR`), for embedders numbering their own calls up to 599.
+syscalls-600 = []
 # Extra runtime checks (C++: RISCV_DEBUG).
 debug-checks = []
 # Cranelift JIT (the counterpart of C++'s asmjit backend). Compiled code is

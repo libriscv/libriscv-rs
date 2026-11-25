@@ -156,8 +156,14 @@ pub const DISPATCH_SLICE: u64 = if cfg!(feature = "nightly-dispatch") {
     1 << 16
 };
 
-/// Size of the system call handler table, matching C++ `RISCV_SYSCALLS_MAX`.
-pub const SYSCALLS_MAX: usize = 512;
+/// Size of the system call handler table, matching C++ `RISCV_SYSCALLS_MAX`:
+/// 512 by default, 601 with the `syscalls-600` feature (system calls 0..=599,
+/// EBREAK at 600; libvmod-riscv's `RISCV_SYSCALLS_MAX=601`).
+pub const SYSCALLS_MAX: usize = if cfg!(feature = "syscalls-600") {
+    601
+} else {
+    512
+};
 
 /// The system call that `EBREAK` is routed to, matching C++ `RISCV_SYSCALL_EBREAK_NR`.
 pub const SYSCALL_EBREAK_NR: usize = SYSCALLS_MAX - 1;

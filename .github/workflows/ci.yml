@@ -116,6 +116,11 @@ jobs:
       - name: Test the JIT without the C extension
         run: cargo test -p libriscv --no-default-features --features jit
 
+      - name: Test the 601-entry system call table
+        env:
+          LIBRISCV_REQUIRE_TOOLCHAIN: "1"
+        run: cargo test -p libriscv --features syscalls-600 --test basic --test dispatch --test libc_fastpath
+
       # The default dispatch relies on LLVM turning handler calls into
       # jumps; optimized, they must not grow the stack.
       - name: Check the stable dispatch's tail calls (release)
@@ -290,7 +295,7 @@ jobs:
       - run: cargo build -p libriscv --no-default-features
       # Everything except `fcsr`, which is a deliberate compile error until
       # it is ported.
-      - run: cargo build -p libriscv --features ext-a,ext-c,ext-f,ext-v,debug-checks,jit
+      - run: cargo build -p libriscv --features ext-a,ext-c,ext-f,ext-v,debug-checks,syscalls-600,jit
       # The opt-in nightly features: AOT (which enables `nightly-dispatch`).
       - run: rustup toolchain install "$NIGHTLY" --profile minimal
       - run: cargo +$NIGHTLY build -p libriscv --features ext-a,ext-c,ext-f,ext-v,jit,aot-dylib

@@ -83,6 +83,46 @@ fn execute_minimal_machine() {
     assert_eq!(machine.instruction_counter(), 3);
 }
 
+/// `syscalls-600`: system calls up to 599 have handlers, and EBREAK is 600.
+#[cfg(feature = "syscalls-600")]
+#[test]
+fn system_calls_up_to_599() {
+    if !testutil::need_compiler() {
+        return;
+    }
+    assert_eq!(libriscv::SYSCALLS_MAX, 601);
+    assert_eq!(libriscv::SYSCALL_EBREAK_NR, 600);
+    let binary = build(
+        r#"
+        __asm__(".global _start\n"
+        ".section .text\n"
+        "_start:\n"
+        "	li a0, 1\n"
+        "	li a7, 599\n"
+        "	ecall\n"
+        "	ebreak\n"
+        "	li a7, 1\n"
+        "	ecall\n");
+        "#,
+        &format!("-static -ffreestanding -nostartfiles {RV64IM}"),
+    );
+    let mut machine = Machine::new(binary.as_slice().into(), options()).unwrap();
+    machine.install_syscall_handler(599, |m| {
+        m.set_result(m.return_value() + 10);
+        Ok(())
+    });
+    machine.install_syscall_handler(libriscv::SYSCALL_EBREAK_NR, |m| {
+        m.set_result(m.return_value() * 3);
+        Ok(())
+    });
+    machine.install_syscall_handler(1, |m| {
+        m.stop();
+        Ok(())
+    });
+    machine.simulate(100).unwrap();
+    assert_eq!(machine.return_value(), 33);
+}
+
 /// Machines share the input ELF and retain it independently of the caller.
 #[test]
 fn machines_share_one_binary() {
