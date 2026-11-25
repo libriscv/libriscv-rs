@@ -579,20 +579,42 @@ impl Memory {
     /// check against, as `read_*`/`write_*` do; and whether it ignores the
     /// instruction limit. The windows are final once
     /// the program is loaded, before any execute segment is created.
+    /// Without an arena (forks, and the machines they are made from), JIT
+    /// code reaches guest memory through the native page cache instead
+    /// (`paged`, C++ asmjit's `paged_memory`).
     #[cfg(any(feature = "jit", feature = "aot"))]
     pub(crate) const fn native_layout(&self) -> crate::native_code::MemoryLayout {
+        #[cfg(feature = "jit")]
+        if self.arena_pages == 0 {
+            return crate::native_code::MemoryLayout {
+                mask: 0,
+                read: (0, 0),
+                write: (0, 0),
+                unlimited: self.jit_unlimited,
+                unguarded: self.jit_unguarded,
+                paged: true,
+            };
+        }
         crate::native_code::MemoryLayout {
             mask: self.jit_arena_mask,
             read: (RWREAD_BEGIN, self.read_boundary),
             write: (self.initial_rodata_end, self.write_boundary),
             unlimited: self.jit_unlimited,
             unguarded: self.jit_unguarded,
+            paged: false,
         }
     }
     /// The whole arena including the padding page, for native code.
-    #[cfg(any(feature = "jit", feature = "aot"))]
+    #[cfg(feature = "aot")]
     pub(crate) fn arena_mut(&mut self) -> &mut [u8] {
         &mut self.arena
+    }
+    /// [`arena_mut`](Self::arena_mut) and the native page cache
+    /// ([`native_pages`](Self::native_pages)): what JIT code reaches.
+    #[cfg(feature = "jit")]
+    pub(crate) fn native_memory(&mut self) -> (&mut [u8], Option<&mut libriscv_jit_rt::PageCache>) {
+        let pages = (self.arena_pages == 0).then(|| self.paging.native_pages());
+        (&mut self.arena, pages)
     }
 
     /// The ELF binary the machine was created from, shared with every

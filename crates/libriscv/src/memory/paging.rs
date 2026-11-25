@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 
-use super::page::{HOST_PAGE, Page, PageAttributes, PageBytes, PageData, ZERO_PAGE};
+use super::page::{HOST_PAGE, Page, PageArc, PageAttributes, PageBytes, PageData, ZERO_PAGE};
 use super::{Memory, PAGE_SIZE, RWREAD_BEGIN, protection_fault, shared};
 use crate::error::{ExceptionKind, MachineError, Result};
 
@@ -162,15 +162,25 @@ impl Slot {
 /// while the pages do not change.
 ///
 /// Every mutable access drops the snapshot, so that a cached snapshot
-/// always shows the current pages. Page table changes (entries, attributes,
-/// copies) all go through a slot; the index and the free list only change
-/// along with one. The exception is [`exclusive_bytes`], for guest stores.
+/// always shows the current pages, and removes the page from the native
+/// page cache (JIT code built for a paged layout reads page bytes through
+/// it). Page table changes (entries, attributes, copies) all go through a
+/// slot; the index and the free list only change along with one. The
+/// exception is [`exclusive_bytes`], for guest stores, which changes
+/// neither the bytes a page has nor who holds them.
 ///
 /// [`exclusive_bytes`]: Self::exclusive_bytes
 #[derive(Debug, Default)]
 struct Slots {
     v: Vec<Slot>,
     snapshot: OnceLock<Arc<Snapshot>>,
+    /// The pages JIT code reaches directly: entries show bytes these
+    /// slots hold (or static pages), and store entries only bytes no one
+    /// else holds. The cache keeps that memory safe by itself (it holds
+    /// the bytes it shows, and refuses shared ones for stores); the
+    /// removals here keep what it shows current.
+    #[cfg(feature = "jit")]
+    native: libriscv_jit_rt::PageCache,
 }
 
 impl Slots {
@@ -178,6 +188,8 @@ impl Slots {
         Self {
             v,
             snapshot: OnceLock::new(),
+            #[cfg(feature = "jit")]
+            native: libriscv_jit_rt::PageCache::new(),
         }
     }
 
@@ -205,17 +217,37 @@ impl Slots {
     #[inline(always)]
     fn get_mut(&mut self, slot: usize) -> Option<&mut Slot> {
         self.changed();
-        self.v.get_mut(slot)
+        let entry = self.v.get_mut(slot)?;
+        #[cfg(feature = "jit")]
+        if entry.pageno != FREE {
+            self.native.invalidate(entry.pageno);
+        }
+        Some(entry)
     }
 
     fn iter_mut(&mut self) -> std::slice::IterMut<'_, Slot> {
         self.changed();
+        #[cfg(feature = "jit")]
+        self.native.clear();
         self.v.iter_mut()
     }
 
     fn push(&mut self, entry: Slot) {
         self.changed();
+        #[cfg(feature = "jit")]
+        self.native.invalidate(entry.pageno);
         self.v.push(entry);
+    }
+
+    /// A page is about to take page number `pageno`, maybe in a slot that
+    /// held another one: the native page cache may show the zero page
+    /// there (a missing page reads as zeroes).
+    #[inline(always)]
+    fn adding(&mut self, pageno: u64) {
+        #[cfg(feature = "jit")]
+        self.native.invalidate(pageno);
+        #[cfg(not(feature = "jit"))]
+        let _ = pageno;
     }
 
     /// The bytes of the writable page in `slot` if it owns them and nothing
@@ -227,10 +259,16 @@ impl Slots {
         if !entry.page.attr.write {
             return None;
         }
-        match &mut entry.page.data {
-            PageData::Owned(data) => Arc::get_mut(data),
-            _ => None,
+        let PageData::Owned(data) = &mut entry.page.data else {
+            return None;
+        };
+        // The native page cache holds the bytes it shows: not a sharer, so
+        // its entries go (bytes the cache alone shares become exclusive).
+        #[cfg(feature = "jit")]
+        if !data.is_unique() {
+            self.native.invalidate(entry.pageno);
         }
+        PageArc::get_mut(data)
     }
 }
 
@@ -251,7 +289,7 @@ pub(super) struct Snapshot {
 }
 
 /// The bytes of a fork's loaned pages ([`PageData::Loaned`] indices).
-type LoanedPages = Arc<[Arc<PageBytes>]>;
+type LoanedPages = Arc<[PageArc]>;
 
 /// Page number of a free slot (no page number is this large).
 const FREE: u64 = u64::MAX;
@@ -411,6 +449,7 @@ impl PageTable {
 
     /// Add or replace page `pageno`; returns its slot.
     fn insert(&mut self, pageno: u64, page: Page) -> usize {
+        self.slots.adding(pageno);
         if page.is_owned() {
             self.owned += 1;
         }
@@ -540,6 +579,12 @@ impl PageTable {
         page.attr.is_cow = false;
     }
 
+    /// The native page cache (see [`Slots`]).
+    #[cfg(feature = "jit")]
+    pub(super) const fn native_pages(&mut self) -> &mut libriscv_jit_rt::PageCache {
+        &mut self.slots.native
+    }
+
     /// The readable page `pageno` (C++ `cached_readable_page`), if it has
     /// an entry.
     #[inline(always)]
@@ -556,7 +601,7 @@ fn empty_page_cache() -> Box<[AtomicUsize]> {
 /// The bytes of loaned page `n` of `base`. A table only has loaned pages
 /// from its own `base`, so the zero page is never actually returned.
 #[inline(always)]
-fn loaned_bytes(base: Option<&[Arc<PageBytes>]>, n: usize) -> &PageBytes {
+fn loaned_bytes(base: Option<&[PageArc]>, n: usize) -> &PageBytes {
     base.and_then(|b| b.get(n)).map_or(&ZERO_PAGE, |p| p)
 }
 
@@ -574,13 +619,13 @@ fn loaned_bytes(base: Option<&[Arc<PageBytes>]>, n: usize) -> &PageBytes {
 fn private_bytes<'a>(
     page: &'a mut Page,
     owned: &mut usize,
-    base: Option<&[Arc<PageBytes>]>,
+    base: Option<&[PageArc]>,
 ) -> Option<&'a mut PageBytes> {
     if !page.is_owned() && !own_page(page, owned, base) {
         return None;
     }
     match &mut page.data {
-        PageData::Owned(data) => Some(Arc::make_mut(data)),
+        PageData::Owned(data) => Some(PageArc::make_mut(data)),
         _ => None,
     }
 }
@@ -589,15 +634,15 @@ fn private_bytes<'a>(
 /// pages.
 #[cold]
 #[inline(never)]
-fn own_page(page: &mut Page, owned: &mut usize, base: Option<&[Arc<PageBytes>]>) -> bool {
+fn own_page(page: &mut Page, owned: &mut usize, base: Option<&[PageArc]>) -> bool {
     let data = match std::mem::replace(&mut page.data, PageData::Zero) {
         PageData::Arena => {
             page.data = PageData::Arena;
             return false;
         }
-        PageData::Loaned(n) => Arc::new(*loaned_bytes(base, n)),
-        PageData::Host => Arc::new(HOST_PAGE),
-        PageData::Zero | PageData::Owned(_) => Arc::new(ZERO_PAGE),
+        PageData::Loaned(n) => PageArc::new(*loaned_bytes(base, n)),
+        PageData::Host => PageArc::new(HOST_PAGE),
+        PageData::Zero | PageData::Owned(_) => PageArc::new(ZERO_PAGE),
     };
     page.data = PageData::Owned(data);
     *owned += 1;
@@ -802,7 +847,7 @@ impl Memory {
             pageno,
             Page {
                 attr: PageAttributes::default(),
-                data: PageData::Owned(Arc::new(ZERO_PAGE)),
+                data: PageData::Owned(PageArc::new(ZERO_PAGE)),
             },
         )))
     }
@@ -826,6 +871,94 @@ impl Memory {
     pub(super) fn writable_page(&mut self, pageno: u64) -> Result<&mut PageBytes> {
         let slot = self.create_writable_pageno(pageno)?;
         self.writable_bytes(pageno, slot)
+    }
+
+    /// Fill the native page cache for an access of `size` bytes at `addr`
+    /// that JIT code could not make (C++ asmjit's paged-memory helper):
+    /// the page becomes what the access would make it (created, or given
+    /// its own bytes, for a store), and true if the cache now has it. False
+    /// leaves the access to the interpreter, which also raises its fault: an
+    /// access across pages, an unreadable or unwritable page, or a store to a
+    /// page this machine cannot have to itself.
+    #[cfg(feature = "jit")]
+    pub(crate) fn native_fill(&mut self, addr: u64, size: u64, store: bool) -> bool {
+        let pageno = addr / PAGE_SIZE;
+        if self.arena_pages != 0 || (addr & PAGE_MASK) + size > PAGE_SIZE {
+            return false;
+        }
+        if !store {
+            return self.native_fill_load(pageno);
+        }
+        // Created, or made writable if copy-on-write; protections checked.
+        let Ok(Some(slot)) = self.create_writable_pageno(pageno) else {
+            return false;
+        };
+        let PageTable {
+            slots, owned, base, ..
+        } = &mut self.paging;
+        // Bytes it does not have to itself yet become its own, as the store
+        // would make them (a slot change: the snapshot and the cache entry
+        // go). Bytes it has already are taken as they are.
+        if slots.exclusive_bytes(slot).is_none() {
+            let Some(entry) = slots.get_mut(slot) else {
+                return false;
+            };
+            if private_bytes(&mut entry.page, owned, base.as_deref()).is_none() {
+                return false;
+            }
+        }
+        // The cache checks that only this machine holds them.
+        let Slots { v, native, .. } = slots;
+        let Some(Slot {
+            page:
+                Page {
+                    attr,
+                    data: PageData::Owned(data),
+                },
+            ..
+        }) = v.get_mut(slot)
+        else {
+            return false;
+        };
+        if !attr.write || !native.insert_store(pageno, data) {
+            return false;
+        }
+        // Loads may read them too, unless the page is write-only.
+        if attr.read {
+            native.insert_load(pageno, data);
+        }
+        true
+    }
+
+    /// The load half of [`native_fill`](Self::native_fill) (C++
+    /// `get_readable_pageno`): readable pages, and missing ones (zeroes).
+    #[cfg(feature = "jit")]
+    fn native_fill_load(&mut self, pageno: u64) -> bool {
+        let slot = self.paging.slot_of(pageno);
+        let PageTable { slots, base, .. } = &mut self.paging;
+        let Slots { v, native, .. } = slots;
+        let Some(slot) = slot else {
+            // A missing page: the copy-on-write zero page (no arena here).
+            native.insert_static(pageno, &ZERO_PAGE);
+            return true;
+        };
+        let Some(Slot { page, .. }) = v.get(slot) else {
+            return false;
+        };
+        if !page.attr.read {
+            return false;
+        }
+        match &page.data {
+            PageData::Owned(p) => native.insert_load(pageno, p),
+            PageData::Loaned(n) => match base.as_deref().and_then(|b| b.get(*n)) {
+                Some(p) => native.insert_load(pageno, p),
+                None => native.insert_static(pageno, &ZERO_PAGE),
+            },
+            PageData::Zero => native.insert_static(pageno, &ZERO_PAGE),
+            PageData::Host => native.insert_static(pageno, &HOST_PAGE),
+            PageData::Arena => return false,
+        }
+        true
     }
 
     /// Guest load outside the arena's read window (C++ `read<T>` with
@@ -1699,6 +1832,10 @@ impl Memory {
     /// useful.
     pub(super) fn fork_page_table(&self, minimal: bool) -> PageTable {
         let paging = &self.paging;
+        // The fork shares this table's bytes: JIT code must not write them
+        // in place any more (or cloning them for the snapshot copies them).
+        #[cfg(feature = "jit")]
+        paging.slots.native.clear_stores();
         if minimal {
             // Just the guard page at 0, which every machine has here.
             let mut index = BTreeMap::new();
@@ -1736,15 +1873,17 @@ impl Memory {
     fn snapshot(&self) -> Snapshot {
         let paging = &self.paging;
         let base = paging.base.as_deref();
-        let mut pages: Vec<Arc<PageBytes>> = Vec::new();
+        let mut pages: Vec<PageArc> = Vec::new();
         let mut loan = |pageno: u64, page: &Page| {
             let bytes = match &page.data {
-                PageData::Owned(b) => Some(Arc::clone(b)),
+                PageData::Owned(b) => Some(b.clone()),
                 PageData::Loaned(n) => Some(
                     base.and_then(|b| b.get(*n))
-                        .map_or_else(|| Arc::new(ZERO_PAGE), Arc::clone),
+                        .map_or_else(|| PageArc::new(ZERO_PAGE), PageArc::clone),
                 ),
-                PageData::Arena => Some(Arc::new(*self.arena_page(pageno).unwrap_or(&ZERO_PAGE))),
+                PageData::Arena => {
+                    Some(PageArc::new(*self.arena_page(pageno).unwrap_or(&ZERO_PAGE)))
+                }
                 PageData::Zero | PageData::Host => None,
             };
             let data = match bytes {

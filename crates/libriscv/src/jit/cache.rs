@@ -1036,6 +1036,7 @@ mod tests {
                 write: (0x3000, 0x400),
                 unlimited: false,
                 unguarded: false,
+                paged: false,
             },
         }
     }

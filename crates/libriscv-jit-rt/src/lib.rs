@@ -20,6 +20,13 @@
 //!
 //! The code generator must uphold these requirements:
 //!
+//! * Paged code ([`MemoryLayout::paged`]) reaches guest memory only through
+//!   the host's [`PageCache`], probed as described in `pages`: an access hits
+//!   only inside the page an entry names, using the load half for loads and
+//!   the store half for stores. On a miss it calls `page_fill` with the state
+//!   block, the address and `size | store << 8`, and probes once more; a
+//!   nonzero result, or a second miss, leaves native code for the
+//!   interpreter without touching guest memory.
 //! * Arena accesses are at most 8 bytes and use unsigned, wrapping checks:
 //!   `addr - read_base < read_len` for loads or
 //!   `addr - write_base < write_len` for stores. Compiled windows must fit
@@ -27,7 +34,7 @@
 //!   with `m` plus the widest access fitting the arena. [`CodeMemory::enter`]
 //!   validates both layouts.
 //! * Other memory accesses are limited to 32 integer registers, 32 FP registers,
-//!   and [`JitState`] fields.
+//!   [`JitState`] fields, and [`PageCache`] entries.
 //! * After host callbacks, code reloads the counter. A nonzero callback result
 //!   makes the code and all native callers exit without touching guest memory,
 //!   preserving the callback's [`JitState`] exit fields.
@@ -68,10 +75,15 @@ pub mod aot;
 mod arena;
 mod icache;
 mod linked;
+mod pages;
 pub use arena::{GuestArena, RodataImage, host_page_size, shared_rodata_supported};
 pub use linked::{
     CachedUnit, LinkedCode, RECORD_MAGIC, RECORD_WORDS, SECTION, SharedObject, TABLE_MAGIC,
     TABLE_SYMBOL, TABLE_WORDS, embedded_units, load_shared_object,
+};
+pub use pages::{
+    PAGE_CACHE_ENTRIES, PAGE_CACHE_ENTRY_SHIFT, PAGE_CACHE_STORES, PAGE_SIZE, PageArc, PageBytes,
+    PageCache, PageCacheEntry,
 };
 
 /// The process's effective user ID: `libriscv` only loads cached code from
@@ -103,6 +115,10 @@ pub struct MemoryLayout {
     /// Disable Spectre v1 guards on checked accesses and entry-table lookups.
     /// Intended for trusted guests. This setting is compiled into the code.
     pub unguarded: bool,
+    /// Guest memory is all pages, reached through the host's [`PageCache`]
+    /// (a machine without an arena, such as a fork). The mask and windows
+    /// are then unused.
+    pub paged: bool,
 }
 
 /// True if the window `inner` lies inside `outer`. An empty window lies
@@ -128,6 +144,15 @@ pub trait Host {
     /// Return true to continue, or false to exit with `call`'s outcome. Arena moves
     /// or incompatible windows also force an exit.
     fn call(&mut self, call: &mut HostCall) -> bool;
+
+    /// Fill the [`PageCache`] for an access of `size` bytes at `addr` that
+    /// missed it, as if the access ran: true if a probe for it now hits,
+    /// false to leave native code (the interpreter then performs the access,
+    /// raising its fault). Only paged code calls it.
+    fn fill_page(&mut self, addr: u64, size: u64, store: bool) -> bool {
+        let _ = (addr, size, store);
+        false
+    }
 }
 
 /// The parts of a [`Host`] that generated code accesses directly.
@@ -141,6 +166,10 @@ pub struct HostParts<'a> {
     pub write: (u64, u64),
     /// The dynamic floating-point rounding mode (FCSR.frm), read-only.
     pub frm: u64,
+    /// The page cache paged code reads, if the host has one, borrowed
+    /// exclusively while code runs. It must stay put: a host call that
+    /// moves it makes the code leave.
+    pub pages: Option<&'a mut PageCache>,
 }
 
 /// One host call: what generated code passed, and what it continues
@@ -201,6 +230,10 @@ pub struct JitState {
     exit_kind: u64,
     /// The host call: `host_trampoline::<H>`.
     host_call: HostCallFn,
+    /// The host's page cache entries (paged code), or null.
+    pages: *const PageCacheEntry,
+    /// The page cache miss call: `page_fill_trampoline::<H>`.
+    page_fill: HostCallFn,
     // Not accessed by generated code:
     /// The `H` of `host_trampoline::<H>`, a `&mut H` that outlives the call.
     host: *mut (),
@@ -226,6 +259,8 @@ impl JitState {
     pub const OFFSET_EXIT_PC: i32 = offset_of!(JitState, exit_pc) as i32;
     pub const OFFSET_EXIT_KIND: i32 = offset_of!(JitState, exit_kind) as i32;
     pub const OFFSET_HOST_CALL: i32 = offset_of!(JitState, host_call) as i32;
+    pub const OFFSET_PAGES: i32 = offset_of!(JitState, pages) as i32;
+    pub const OFFSET_PAGE_FILL: i32 = offset_of!(JitState, page_fill) as i32;
 
     /// [`Self::take`] after a host call, which may have changed anything:
     /// returns false if the code must leave, because the windows no
@@ -237,6 +272,21 @@ impl JitState {
             std::process::abort();
         }
         self.frm = parts.frm;
+        // Paged code keeps the page cache's address in registers.
+        if parts
+            .pages
+            .as_deref()
+            .map_or(std::ptr::null(), PageCache::as_ptr)
+            != self.pages
+        {
+            self.take(parts);
+            return false;
+        }
+        // Paged code needs nothing else (`take` leaves its windows empty).
+        if self.layout.paged {
+            self.arena = parts.arena.as_mut_ptr();
+            return true;
+        }
         let arena = parts.arena.as_mut_ptr();
         // Usually nothing changed: no need to validate it again.
         if arena == self.arena
@@ -259,6 +309,17 @@ impl JitState {
         self.fregs = parts.fregs.as_mut_ptr();
         self.arena = parts.arena.as_mut_ptr();
         self.frm = parts.frm;
+        self.pages = parts
+            .pages
+            .as_deref()
+            .map_or(std::ptr::null(), PageCache::as_ptr);
+        // Paged code touches no arena: it needs nothing but the page cache.
+        if self.layout.paged {
+            self.arena_len = 0;
+            (self.read_base, self.read_len) = (0, 0);
+            (self.write_base, self.write_len) = (0, 0);
+            return parts.pages.is_some();
+        }
         let Ok(arena_len) = u64::try_from(parts.arena.len()) else {
             return false;
         };
@@ -335,6 +396,33 @@ extern "C" fn host_trampoline<H: Host>(
     state.exit_kind = call.exit_kind;
     state.exit_pc = call.exit_pc;
     u64::from(!(go_on && fits))
+}
+
+/// The page cache miss call generated code makes through
+/// `JitState::page_fill`: [`Host::fill_page`], then the host's parts again.
+/// Returns non-zero if the code must leave (see the crate documentation).
+extern "C" fn page_fill_trampoline<H: Host>(
+    state: *mut JitState,
+    addr: u64,
+    arg: u64,
+    _: u64,
+) -> u64 {
+    // SAFETY: as in `host_trampoline`.
+    #[allow(unsafe_code)]
+    let state = unsafe { &mut *state };
+    // SAFETY: as in `host_trampoline`.
+    #[allow(unsafe_code)]
+    let host = unsafe { &mut *state.host.cast::<H>() };
+    let (size, store) = (arg & 0xFF, arg >> 8 & 1 != 0);
+    let filled = match catch_unwind(AssertUnwindSafe(|| host.fill_page(addr, size, store))) {
+        Ok(filled) => filled,
+        Err(payload) => {
+            state.panic = Some(payload);
+            false
+        }
+    };
+    let fits = state.retake(host.parts());
+    u64::from(!(filled && fits))
 }
 
 fn invalid(what: &'static str) -> io::Error {
@@ -526,6 +614,8 @@ impl CodeMemory {
             exit_pc: 0,
             exit_kind: 0,
             host_call: host_trampoline::<H>,
+            pages: std::ptr::null(),
+            page_fill: page_fill_trampoline::<H>,
             host: host.cast(),
             layout: self.layout,
             panic: None,
@@ -552,8 +642,11 @@ impl CodeMemory {
         // mask]`, at most `MAX_ACCESS` bytes) stays inside the arena, as
         // does a checked one: the code's windows are inside the host's
         // (checked by `take`), which `take` validated against the arena.
-        // What the generated code does with them is the contract in the
-        // crate documentation.
+        // Paged code reads the host's page cache instead (`take` requires
+        // one, borrowed exclusively), whose entries point at bytes the
+        // cache itself keeps alive, and store entries only at bytes nothing
+        // else shows (see `pages`). What the generated code does with
+        // them is the contract in the crate documentation.
         let trampoline = unsafe { std::mem::transmute::<*const u8, Trampoline>(code) };
         trampoline(&mut state, function, pc, counter);
         if let Some(payload) = state.panic.take() {
@@ -601,6 +694,7 @@ mod tests {
                 read: self.read,
                 write: self.write,
                 frm: 0,
+                pages: None,
             }
         }
         fn call(&mut self, _: &mut HostCall) -> bool {
@@ -627,6 +721,8 @@ mod tests {
             exit_pc: 0,
             exit_kind: 0,
             host_call: host_trampoline::<TestHost>,
+            pages: std::ptr::null(),
+            page_fill: page_fill_trampoline::<TestHost>,
             host: std::ptr::null_mut(),
             layout,
             panic: None,
@@ -697,6 +793,7 @@ mod tests {
             write,
             unlimited: false,
             unguarded: false,
+            paged: false,
         };
         for (read, write) in [
             ((0x1000, 0x1001), (0x1800, 0x800)),

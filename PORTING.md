@@ -504,9 +504,10 @@ libcalls. Cranelift x64 tail calls require `preserve_frame_pointers`.
 loads cached objects, validates entry tables and memory layouts, and calls a
 trampoline. Its `unsafe_code = "deny"` policy requires documented exceptions.
 
-Generated code must enforce arena bounds or address masking. External calls
+Generated code must enforce arena bounds or address masking, or with a paged
+layout reach memory only through the page cache. External calls
 are limited to region functions, floating-point rounding/FMA helpers on hosts
-without SSE4.1/FMA, and the host dyncall trampoline. Code is position-independent:
+without SSE4.1/FMA, and the host dyncall and page fill trampolines. Code is position-independent:
 JIT libcalls use an appended GOT pointing to Rust helpers; saved objects use
 the system linker's GOT and `libm`.
 
@@ -537,6 +538,63 @@ Block entry adds the decoder count; checks occur at interpreter-equivalent
 block ends. Mid-block exits subtract the target's count before continuation.
 Stale segments are interpreted. Native instructions cannot make a segment stale;
 host calls recheck staleness.
+
+### Paged memory
+
+Port of asmjit's `paged_memory` probe (`emit_page_cache_probe`). Machines
+without an arena (`use_memory_arena: false`: fork sources and forks) get
+`MemoryLayout::paged`; every load and store probes a direct-mapped
+`libriscv_jit_rt::PageCache` of 512 load and 512 store entries,
+`(vbase, host)` each. Entry `(addr >> 12) % 512` hits when
+`addr - vbase <= 4096 - size`, one comparison for both another page and an
+access across the page's end; the host address is `host + (addr - vbase)`.
+Empty entries name a page that maps to another entry and point at a static
+page, and with Spectre guards a miss selects offset 0, so a mispredicted
+probe reads only existing bytes.
+
+A miss calls `JitState::page_fill` (`Memory::native_fill`) without leaving
+native code: a load gets the page's readable bytes (the zero page for a
+missing page, a fork's loaned bytes), a store makes the page what the store
+would (created, or copied if copy-on-write) and caches its own bytes for
+stores, and for loads when the page is readable (a write-only page still
+faults on loads). Then the code probes once more. Accesses across pages,
+faults and memory limits make the fill fail, and the instruction exits with
+`EXIT_SLOW` for the interpreter. C++ uses 8 entries per half and a helper
+that performs the access.
+
+The cache keeps its memory safety by itself, in `libriscv-jit-rt`: a page's
+own bytes are a `libriscv_jit_rt::PageArc` (`Arc<PageBytes>` otherwise), and
+each entry holds a reference to the bytes it shows (or shows `'static`
+pages), taken on the miss path only. `PageCache::insert_store` refuses bytes
+held by anything but the caller and the cache, and cloning a `PageArc` with
+a store entry copies it, so native stores never reach bytes a fork shows.
+Inserts and generated code take the cache through `&mut`. The page table
+keeps entries current, which is now only about correctness (a stale entry
+shows old bytes, never freed ones): every slot change (`Slots::get_mut`,
+`iter_mut`, `push`, `PageTable::insert`) removes that page or everything,
+`fork_page_table` removes every store entry before the pages are shared (so
+the snapshot shares them rather than copying), and interpreter stores
+(`exclusive_bytes`) drop the cache's references to a page before
+`PageArc::get_mut`. Host calls that move the cache make the code leave. The
+JIT fingerprint covers the `JitState` page offsets and the cache's shape.
+`tests/jit.rs` (`paged_*`) checks forks not seeing each other's native
+stores, protection changes, discards and host writes reaching native code,
+and random programs against the interpreter; removing either invalidation
+fails them. The `paged_loads_and_stores_stay_native` unit test checks that
+a load/store loop has no interpreter exits, and
+`paged_write_only_pages_stay_unreadable` that a store fill does not make a
+write-only page readable.
+
+Entries are allocated on first native use and recycled per thread (16 per
+thread, cleared through a dirty bitmap), so forks that never run native code
+cost nothing, and those that do neither allocate nor initialise 16 KiB.
+
+`benches/fork.rs` with `FORK_BENCH_JIT=1` (static glibc master, 637 pages;
+2026-11-25, x86-64): reading 2 MiB in a fork 1.50 ms → 0.35 ms, random
+read-modify-write over 512 pages 21.2 → 3.6 ns per iteration (with 64
+entries per half: 23.1 ns). Fork + drop and copy-on-write of 64 pages
+measured within noise of the interpreter on a loaded machine; to measure
+again on an idle one.
 
 ### Floating point
 
@@ -1037,7 +1095,8 @@ recompiling repeatedly modified code; one fuzz case previously compiled
 
 Native checked accesses outside arena windows return `EXIT_SLOW` at the
 instruction. The interpreter performs the paged access and finishes the
-already-counted block. N-bit accesses bypass paging. Spectre guards and their
+already-counted block. N-bit accesses bypass paging. Machines without an
+arena use the paged native layout instead (see "Paged memory" under JIT). Spectre guards and their
 configuration are described under JIT.
 
 ### Dynamic executables
@@ -1256,9 +1315,10 @@ outlive its forks and can modify source pages in these cases.
 
 Forks share pending background compilations and receive their results.
 Later segments, including the VM-call exit page, can use the process-wide cache.
-Native code currently requires an arena, so forks and arena-free sources use
-the interpreter. Native page-table access is required before JIT execution can
-support them; master-specific N-bit layouts would also be rejected.
+Arena-free sources and their forks share one paged native layout, so forks run
+the master's JIT code, reaching pages through the native page cache (see
+"Paged memory" under JIT). Forks of an arena-backed master cannot use its
+arena-layout code and interpret it.
 
 ### Shared execute segments
 
@@ -1706,6 +1766,7 @@ and JIT. `rustguestfuzzer` exercises collection operations on supplied bytes.
 - [x] JIT: dyncall handlers called from native code (asmjit `emit_dyncall`); see "Dyncalls" under "JIT"
 - [x] AOT: translation to safe Rust (`aot`/`aot-dylib` features, `rvlinux --aot-save`/`--aot-save-shared`/`--aot-load`, `RVLINUX_AOT_EMBED`), structured control flow, region-to-region `become`, native calls (inlined when self-contained, devirtualized for address-taken functions); see "AOT"
 - [x] JIT: AArch64 hosts (instruction-cache maintenance in `libriscv-jit-rt`; code cache with `R_AARCH64_PREL64`)
+- [x] JIT: paged memory for machines without an arena, so forks run native code (asmjit `paged_memory`); see "Paged memory" under "JIT"
 - [ ] JIT: lazy compilation. Lazy compilation matters most for dynamic executables: `libc.so`'s whole executable mapping (1.5 MB) becomes one segment, and compiling it up front takes ~10 s (release)
 
 ### Phase 5 — Remaining features

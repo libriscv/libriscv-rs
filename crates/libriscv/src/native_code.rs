@@ -60,6 +60,8 @@ pub(crate) struct MemoryLayout {
     pub write: (u64, u64),
     pub unlimited: bool,
     pub unguarded: bool,
+    /// Guest memory through the JIT's page cache: never with AOT alone.
+    pub paged: bool,
 }
 
 /// What a call into native code ended with.

@@ -9,12 +9,48 @@
 //! own bytes are reference counted, so that a fork can share them with its
 //! master until either side writes (see `Memory::fork_page_table`).
 
+#[cfg(not(feature = "jit"))]
 use std::sync::Arc;
 
 use super::PAGE_SIZE;
 
 /// One page of guest memory.
 pub(crate) type PageBytes = [u8; PAGE_SIZE as usize];
+
+/// A page's own bytes, shared by forks until either side writes. With the
+/// JIT, `libriscv-jit-rt`'s, so that JIT code can reach them through its
+/// page cache, which then keeps them alive and refuses to write them while
+/// they are shared.
+#[cfg(feature = "jit")]
+pub(crate) use libriscv_jit_rt::PageArc;
+
+/// A page's own bytes, shared by forks until either side writes:
+/// `Arc<PageBytes>`, with the methods of the JIT's `PageArc`.
+#[cfg(not(feature = "jit"))]
+#[derive(Debug, Clone)]
+pub(crate) struct PageArc(Arc<PageBytes>);
+
+#[cfg(not(feature = "jit"))]
+impl PageArc {
+    pub(crate) fn new(bytes: PageBytes) -> Self {
+        Self(Arc::new(bytes))
+    }
+    pub(crate) fn get_mut(this: &mut Self) -> Option<&mut PageBytes> {
+        Arc::get_mut(&mut this.0)
+    }
+    pub(crate) fn make_mut(this: &mut Self) -> &mut PageBytes {
+        Arc::make_mut(&mut this.0)
+    }
+}
+
+#[cfg(not(feature = "jit"))]
+impl std::ops::Deref for PageArc {
+    type Target = PageBytes;
+    #[inline(always)]
+    fn deref(&self) -> &PageBytes {
+        &self.0
+    }
+}
 
 /// The shared zero page (C++ `Page::cow_page()`). The guard page shares its
 /// backing, as in C++.
@@ -125,7 +161,7 @@ pub(crate) enum PageData {
     /// A page of its own (C++: an owning page). Forks of this machine hold
     /// the same bytes until either side writes to them: a write to bytes
     /// that are shared makes a private copy first (`Arc::make_mut`).
-    Owned(Arc<PageBytes>),
+    Owned(PageArc),
     /// Another machine's page, loaned to a fork (C++: a non-owning page
     /// pointing at the master's data): page `n` of the fork's snapshot
     /// (`PageTable::base`). Never written in place: it becomes `Owned`

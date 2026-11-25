@@ -201,6 +201,10 @@ pub(crate) fn run(
     let Some(exit) = code.enter(&mut host, slot, pc, counter, max) else {
         return NativeExit::Unavailable;
     };
+    #[cfg(test)]
+    if exit.kind == crate::native_code::EXIT_SLOW {
+        tests::SLOW_EXITS.with(|n| n.set(n.get() + 1));
+    }
     if exit.kind != EXIT_HOST {
         return NativeExit::from_raw(exit.kind, exit.pc, exit.counter);
     }
@@ -243,14 +247,21 @@ impl Host for JitHost<'_, '_> {
         let MemoryLayout { read, write, .. } = self.m.memory.native_layout();
         let frm = u64::from(self.m.cpu.regs.fcsr().frm());
         let (regs, fregs) = self.m.cpu.regs.x_f_mut();
+        let (arena, pages) = self.m.memory.native_memory();
         HostParts {
             regs,
             fregs,
-            arena: self.m.memory.arena_mut(),
+            arena,
             read,
             write,
             frm,
+            pages,
         }
+    }
+
+    #[inline]
+    fn fill_page(&mut self, addr: u64, size: u64, store: bool) -> bool {
+        self.m.memory.native_fill(addr, size, store)
     }
 
     #[inline]
@@ -299,6 +310,9 @@ pub(crate) mod tests {
         /// The PC of every entry into native code on this thread.
         pub(crate) static ENTRIES: std::cell::RefCell<Vec<u64>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// Native exits for a load or store the interpreter makes, on this
+        /// thread.
+        pub(crate) static SLOW_EXITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Segments compiled on this thread.
         pub(crate) static COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -316,6 +330,13 @@ pub(crate) mod tests {
             | ((o >> 1 & 0xF) << 8)
             | ((o >> 11 & 1) << 7)
             | 0x63
+    }
+    const fn ld(rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xFFF) << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x03
+    }
+    const fn sd(rs1: u32, rs2: u32, imm: i32) -> u32 {
+        let i = imm as u32;
+        ((i >> 5 & 0x7F) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((i & 0x1F) << 7) | 0x23
     }
     const ECALL: u32 = 0x73;
     const JSELF: u32 = 0x6F;
@@ -1051,5 +1072,114 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Without an arena (forks and their masters), loads and stores go
+    /// through the native page cache: a loop over two pages stays in native
+    /// code, entered as often as with an arena (once per dispatch slice),
+    /// with a page cache fill per page and kind instead of an interpreter
+    /// exit per access.
+    #[test]
+    fn paged_loads_and_stores_stay_native() {
+        let data = 0x40000u64;
+        let code: Vec<u8> = [
+            addi(15, 0, 1000),
+            // loop: two pages, read and written
+            ld(10, 5, 0),
+            addi(10, 10, 1),
+            sd(5, 10, 0),
+            ld(11, 6, 8),
+            addi(11, 11, 2),
+            sd(6, 11, 8),
+            addi(15, 15, -1),
+            bne(15, 0, -28),
+            JSELF,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let run = |jit: bool, arena: bool| {
+            let mut m = Machine::new(
+                [].into(),
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    use_memory_arena: arena,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            m.cpu.set_reg(5, data);
+            m.cpu.set_reg(6, data + 0x1000);
+            m.cpu.jump(V).unwrap();
+            ENTRIES.with_borrow_mut(Vec::clear);
+            SLOW_EXITS.with(|n| n.set(0));
+            let r = m.try_simulate(20_000, 0);
+            let entries = (
+                ENTRIES.with_borrow(Vec::len),
+                SLOW_EXITS.with(std::cell::Cell::get),
+            );
+            let state = (
+                r.map_err(|e| e.to_string()),
+                *m.cpu.registers().all(),
+                m.instruction_counter(),
+                m.memory.read_u64(data).unwrap(),
+                m.memory.read_u64(data + 0x1008).unwrap(),
+            );
+            (state, entries)
+        };
+        let (expected, _) = run(false, false);
+        let (got, entries) = run(true, false);
+        assert_eq!(got, expected);
+        assert_eq!((got.3, got.4), (1000, 2000));
+        let (with_arena, arena_entries) = run(true, true);
+        assert_eq!(with_arena, expected);
+        if crate::jit::emit::HOST_SUPPORTED {
+            assert!(arena_entries.0 > 0);
+            assert_eq!(arena_entries.1, 0);
+            assert_eq!(entries, arena_entries);
+        }
+    }
+
+    /// A store to a write-only page fills the page cache's store half only:
+    /// a load from it then faults in JIT code as in the interpreter, rather
+    /// than reading the bytes the store made reachable.
+    #[test]
+    fn paged_write_only_pages_stay_unreadable() {
+        let data = 0x40000u64;
+        let code: Vec<u8> = [addi(10, 0, 42), sd(5, 10, 0), ld(11, 5, 0), JSELF]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let run = |jit: bool| {
+            let mut m = Machine::new(
+                [].into(),
+                MachineOptions {
+                    memory_max: 1 << 20,
+                    jit,
+                    use_memory_arena: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            m.init_execute_area(&code, V).unwrap();
+            let write_only = crate::memory::PageAttributes {
+                read: false,
+                ..crate::memory::PageAttributes::default()
+            };
+            m.memory.set_page_attr(data, 0x1000, write_only).unwrap();
+            m.cpu.set_reg(5, data);
+            m.cpu.jump(V).unwrap();
+            let r = m.try_simulate(1000, 0);
+            (
+                r.map_err(|e| (e.kind, e.to_string())),
+                *m.cpu.registers().all(),
+                m.instruction_counter(),
+            )
+        };
+        let expected = run(false);
+        assert!(expected.0.is_err(), "{expected:?}");
+        assert_eq!(run(true), expected);
     }
 }

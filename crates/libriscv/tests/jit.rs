@@ -97,6 +97,38 @@ fn compare_fp(code: &[u8], regs: &Regs, fuels: &[u64], what: &str) -> usize {
     entries
 }
 
+/// Without an arena (forks and the machines they are made from): every
+/// access goes through the page table, which JIT code reaches through its
+/// page cache.
+fn paged_machine(code: &[u8], jit: bool) -> Machine {
+    machine_with(
+        code,
+        MachineOptions {
+            jit,
+            use_memory_arena: false,
+            ..Default::default()
+        },
+    )
+}
+
+/// [`compare`] for machines without an arena.
+fn compare_paged(code: &[u8], regs: &Regs, fuels: &[u64], what: &str) -> usize {
+    let mut interp = paged_machine(code, false);
+    let mut jit = paged_machine(code, true);
+    let entries = jit.cpu.current_execute_segment().jit_entry_count();
+    for &fuel in fuels {
+        let expected = run(&mut interp, regs, fuel);
+        let got = run(&mut jit, regs, fuel);
+        if got != expected {
+            panic!(
+                "{what} (paged), fuel {fuel}:\n{}",
+                describe(&got, &expected)
+            );
+        }
+    }
+    entries
+}
+
 /// Run `code` in the interpreter and on `jit` at every limit in `fuels`.
 /// Returns the number of decoder entries `jit` enters native code at.
 fn compare_machines(
@@ -215,6 +247,155 @@ fn accesses_outside_the_arena_use_the_page_table() {
     assert_eq!(m.memory.read_u64(0x7000_0000_0802).unwrap(), 150);
     // The page of t1 and the next one, written by the SH.
     assert_eq!(m.memory.owned_pages_active(), 2);
+}
+
+/// The same accesses without an arena: page cache hits, fills, accesses
+/// across pages (which the interpreter makes), and pages created on the
+/// way, at every limit.
+#[test]
+fn paged_accesses_match_the_interpreter() {
+    const FAR: u32 = 6;
+    let program = [
+        itype(0x13, 0, 10, 0, 0),                 // 0x00: li a0, 0
+        itype(0x13, 0, 11, 0, 50),                // 0x04: li a1, 50
+        itype(0x03, 3, 12, FAR, 0),               // 0x08: loop: ld a2, 0(t1)
+        itype(0x13, 0, 12, 12, 3),                // 0x0C: addi a2, a2, 3
+        stype(3, FAR, 12, 0),                     // 0x10: sd a2, 0(t1)
+        stype(3, BASE, 12, 8),                    // 0x14: sd a2, 8(t0)
+        itype(0x03, 2, 13, FAR, 0xFFE),           // 0x18: lw a3, 0xFFE(t1): crosses pages
+        stype(1, FAR, 12, 0x7FE),                 // 0x1C: sh a2, 0x7FE(t1)
+        itype(0x03, 4, 14, BASE, 0x1FFF - 0x800), // 0x20: lbu a4, ...(t0)
+        rtype(0x33, 0, 0, 10, 10, 12),            // 0x24: add a0, a0, a2
+        itype(0x13, 0, 11, 11, -1),               // 0x28: addi a1, a1, -1
+        btype(1, 11, 0, -36),                     // 0x2C: bnez a1, loop
+        jtype(0, 0),                              // 0x30: j .
+    ];
+    let mut regs = [0u64; 64];
+    regs[BASE as usize] = SCRATCH + 0x800;
+    for far in [0x7000_0000_0802, SCRATCH + 0xFFA, 0x8000_0000_0000_0000] {
+        regs[FAR as usize] = far;
+        let entries = compare_paged(&words(&program), &regs, &fuels(), "paged");
+        assert!(entries > 0, "nothing was compiled");
+    }
+    let mut m = paged_machine(&words(&program), true);
+    regs[FAR as usize] = 0x7000_0000_0802;
+    let out = run(&mut m, &regs, 10_000);
+    assert_eq!(out.result, Ok(false)); // timed out in `j .`
+    assert_eq!(m.cpu.reg(10), 3 * (50 * 51 / 2));
+    assert_eq!(m.memory.read_u64(0x7000_0000_0802).unwrap(), 150);
+}
+
+/// Minimal state after running `m` from `V` for `fuel` instructions with
+/// `regs`, without touching memory first (unlike [`run`]).
+fn go(m: &mut Machine, regs: &[(u32, u64)], fuel: u64) -> (Result<bool, ExceptionKind>, u64, u64) {
+    for &(r, v) in regs {
+        m.cpu.set_reg(r, v);
+    }
+    m.cpu.jump(V).unwrap();
+    m.set_instruction_counter(0);
+    let r = m.try_simulate(fuel, 0).map_err(|e| e.kind);
+    (r, m.cpu.pc(), m.instruction_counter())
+}
+
+/// `memory[t0] += a0`, 100 times: a load and a store to one page.
+fn add_loop() -> Vec<u8> {
+    words(&[
+        itype(0x13, 0, 12, 0, 100),    // li a2, 100
+        itype(0x03, 3, 11, BASE, 0),   // loop: ld a1, 0(t0)
+        rtype(0x33, 0, 0, 11, 11, 10), // add a1, a1, a0
+        stype(3, BASE, 11, 0),         // sd a1, 0(t0)
+        itype(0x13, 0, 12, 12, -1),    // addi a2, a2, -1
+        btype(1, 12, 0, -16),          // bnez a2, loop
+        jtype(0, 0),                   // j .
+    ])
+}
+
+/// JIT code writes a page in place only while no one else holds it: a fork
+/// shares the master's pages, after which neither one's native stores
+/// reach the other (copy-on-write, as in the interpreter).
+#[test]
+fn paged_native_stores_stay_out_of_forks() {
+    let mut code = add_loop();
+    // Unique code: no segment shared with another test.
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x5A3)]));
+    let mut master = paged_machine(&code, true);
+    assert!(master.cpu.current_execute_segment().jit_entry_count() > 0);
+    master.copy_to_guest(SCRATCH, &0u64.to_le_bytes()).unwrap();
+    let a0 = |v| [(BASE, SCRATCH), (10, v)];
+    assert_eq!(go(&mut master, &a0(1), 10_000).0, Ok(false));
+    assert_eq!(master.memory.read_u64(SCRATCH).unwrap(), 100);
+    let mut fork = master.fork().unwrap();
+    // The master's store entry for the page must be gone: it is shared.
+    assert_eq!(go(&mut master, &a0(1), 10_000).0, Ok(false));
+    assert_eq!(master.memory.read_u64(SCRATCH).unwrap(), 200);
+    assert_eq!(fork.memory.read_u64(SCRATCH).unwrap(), 100);
+    assert_eq!(go(&mut fork, &a0(10), 10_000).0, Ok(false));
+    assert_eq!(fork.memory.read_u64(SCRATCH).unwrap(), 1100);
+    assert_eq!(master.memory.read_u64(SCRATCH).unwrap(), 200);
+    // Forks of forks, after the fork wrote natively.
+    let mut nested = fork.fork().unwrap();
+    assert_eq!(go(&mut fork, &a0(1), 10_000).0, Ok(false));
+    assert_eq!(go(&mut nested, &a0(1000), 10_000).0, Ok(false));
+    assert_eq!(fork.memory.read_u64(SCRATCH).unwrap(), 1200);
+    assert_eq!(nested.memory.read_u64(SCRATCH).unwrap(), 101_100);
+    assert_eq!(master.memory.read_u64(SCRATCH).unwrap(), 200);
+    let late = master.fork().unwrap();
+    assert_eq!(late.memory.read_u64(SCRATCH).unwrap(), 200);
+}
+
+/// What the host does to pages between runs reaches JIT code: protection
+/// changes, discarded and rewritten pages, exactly as in the interpreter.
+#[test]
+fn paged_page_changes_reach_native_code() {
+    use libriscv::memory::PageAttributes;
+    let mut code = add_loop();
+    code.extend(words(&[itype(0x13, 0, 12, 0, 0x5A4)]));
+    let steps = |jit: bool| {
+        let mut m = paged_machine(&code, jit);
+        let a0 = |v| [(BASE, SCRATCH), (10, v)];
+        let mut out = Vec::new();
+        let mut note = |m: &mut Machine, r| {
+            let mut mem = [0u8; 8];
+            let read = m.memory.memcpy_out(&mut mem, SCRATCH).map_err(|e| e.kind);
+            out.push((r, read.map(|()| u64::from_le_bytes(mem))));
+        };
+        let r = go(&mut m, &a0(1), 10_000);
+        note(&mut m, r);
+        // Host writes the page the code holds.
+        m.copy_to_guest(SCRATCH, &7u64.to_le_bytes()).unwrap();
+        let r = go(&mut m, &a0(1), 10_000);
+        note(&mut m, r);
+        // Read-only: the loads still run, the store faults.
+        let ro = PageAttributes {
+            write: false,
+            ..PageAttributes::default()
+        };
+        m.memory.set_page_attr(SCRATCH, 0x1000, ro).unwrap();
+        let r = go(&mut m, &a0(1), 10_000);
+        note(&mut m, r);
+        // Inaccessible: the load faults.
+        m.memory
+            .set_page_attr(SCRATCH, 0x1000, PageAttributes::NONE)
+            .unwrap();
+        let r = go(&mut m, &a0(1), 10_000);
+        note(&mut m, r);
+        // Writable again, then discarded: zeroes.
+        m.memory
+            .set_page_attr(SCRATCH, 0x1000, PageAttributes::default())
+            .unwrap();
+        let r = go(&mut m, &a0(2), 10_000);
+        note(&mut m, r);
+        m.memory.free_pages(SCRATCH, 0x1000);
+        let r = go(&mut m, &a0(3), 10_000);
+        note(&mut m, r);
+        out
+    };
+    let expected = steps(false);
+    assert_eq!(steps(true), expected);
+    assert_eq!(expected[0].1, Ok(100));
+    assert_eq!(expected[1].1, Ok(107));
+    assert!(expected[2].0.0.is_err() && expected[3].0.0.is_err());
+    assert_eq!(expected[5].1, Ok(300));
 }
 
 fn elf_machine(elf: &[u8], jit: bool) -> Machine {
@@ -731,6 +912,16 @@ fn background_compilation_matches_the_interpreter() {
 /// `LIBRISCV_JIT_FUZZ=<programs>[:<seed>]` runs a longer fuzzing session.
 #[test]
 fn random_programs_match_the_interpreter() {
+    random_programs(compare);
+}
+
+/// [`random_programs_match_the_interpreter`] without an arena.
+#[test]
+fn random_paged_programs_match_the_interpreter() {
+    random_programs(compare_paged);
+}
+
+fn random_programs(compare: fn(&[u8], &Regs, &[u64], &str) -> usize) {
     let config = std::env::var("LIBRISCV_JIT_FUZZ").unwrap_or_default();
     let mut parts = config.split(':');
     let programs: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(400);

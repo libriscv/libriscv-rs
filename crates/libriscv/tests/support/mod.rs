@@ -65,7 +65,12 @@ pub fn run(m: &mut Machine, regs: &Regs, fuel: u64) -> Outcome {
         fregs: *m.cpu.registers().all_fp(),
         pc: m.cpu.pc(),
         counter: m.instruction_counter(),
-        memory: m.memory.memview(SCRATCH, SCRATCH_LEN).unwrap().to_vec(),
+        memory: {
+            // Copied out: without an arena the pages are not contiguous.
+            let mut memory = vec![0; SCRATCH_LEN as usize];
+            m.memory.memcpy_out(&mut memory, SCRATCH).unwrap();
+            memory
+        },
     }
 }
 

@@ -15,6 +15,10 @@
 //! which makes each fork fault its pages in again. This bench raises them
 //! first, as a typical host program has; `FORK_BENCH_NO_WARMUP=1` skips
 //! that.
+//!
+//! `FORK_BENCH_JIT=1` runs the guest code with the JIT, which reaches the
+//! pages of machines without an arena through its page cache (compiled
+//! before the measurements).
 
 #![allow(
     clippy::panic,
@@ -73,11 +77,14 @@ fn main() {
         black_box(vec![1u8; 1 << 20]);
     }
     let binary = testutil::build_and_load(GUEST, "-O2 -static").unwrap();
+    let jit = std::env::var_os("FORK_BENCH_JIT").is_some();
     let options = MachineOptions {
         memory_max: 256 << 20,
         use_memory_arena: false,
+        jit,
         ..Default::default()
     };
+    println!("{}", if jit { "JIT" } else { "interpreter" });
     let mut master = Machine::new(binary.as_slice().into(), options).unwrap();
     master.setup_linux_syscalls(false, false);
     master.setup_linux(&["fork"], &["LC_ALL=C"]).unwrap();

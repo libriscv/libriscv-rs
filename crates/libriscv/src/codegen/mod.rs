@@ -76,7 +76,8 @@ impl NativeKey {
         let flags = u64::from(self.execute_only)
             | u64::from(self.libc_fastpath) << 1
             | u64::from(self.layout.unlimited) << 2
-            | u64::from(self.layout.unguarded) << 3;
+            | u64::from(self.layout.unguarded) << 3
+            | u64::from(self.layout.paged) << 4;
         let l = &self.layout;
         [
             self.build,
@@ -110,6 +111,7 @@ impl NativeKey {
                 write: (wb, wl),
                 unlimited: flags & 4 != 0,
                 unguarded: flags & 8 != 0,
+                paged: flags & 16 != 0,
             },
         })
     }
@@ -170,6 +172,7 @@ mod tests {
                 write: (0x3000, 0x400),
                 unlimited: true,
                 unguarded: true,
+                paged: true,
             },
         };
         assert_eq!(NativeKey::from_words(key.words()), Some(key));

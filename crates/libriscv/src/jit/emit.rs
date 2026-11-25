@@ -22,6 +22,9 @@
 //!
 //! Generated code accesses only its state, register files, and guest arena.
 //! Arena accesses use `Memory`'s read/write windows or an N-bit mask.
+//! Machines without an arena (forks) use a paged layout instead: each access
+//! probes the host's native page cache (C++ asmjit's `paged_memory`), and
+//! a miss calls the host to fill it; see `RegionEmitter::paged_addr`.
 //! `libriscv-jit-rt` validates the compiled layout against the host arena and
 //! windows before entry; see its crate documentation for the complete contract.
 //!
@@ -31,8 +34,8 @@
 //! the interpreter completes the block with identical results and counts.
 //!
 //! External calls are limited to floating-point helpers for hosts without
-//! SSE4.1 or FMA and the state block's dyncall trampoline; see
-//! `RegionEmitter::dyncall`.
+//! SSE4.1 or FMA and the state block's dyncall and page fill trampolines;
+//! see `RegionEmitter::dyncall` and `RegionEmitter::paged_addr`.
 //!
 //! # Floating point
 //!
@@ -201,9 +204,21 @@ pub(crate) fn build_fingerprint() -> Option<u64> {
             JitState::OFFSET_EXIT_PC,
             JitState::OFFSET_EXIT_KIND,
             JitState::OFFSET_HOST_CALL,
+            JitState::OFFSET_PAGES,
+            JitState::OFFSET_PAGE_FILL,
+            libriscv_jit_rt::PageCacheEntry::OFFSET_VBASE,
+            libriscv_jit_rt::PageCacheEntry::OFFSET_HOST,
+            libriscv_jit_rt::PAGE_CACHE_STORES,
         ] {
             text.push_str(&format!(" {offset}"));
         }
+        // The page cache's shape, which paged code bakes in.
+        text.push_str(&format!(
+            " {} {} {}",
+            libriscv_jit_rt::PAGE_SIZE,
+            libriscv_jit_rt::PAGE_CACHE_ENTRIES,
+            libriscv_jit_rt::PAGE_CACHE_ENTRY_SHIFT
+        ));
         // What decides the generated code, besides `codegen::SHARED_SOURCES`.
         Some(crate::codegen::fingerprint(
             text,
@@ -720,6 +735,7 @@ struct RegionEmitter<'a, 'f> {
     state: Value,
     regs_ptr: Value,
     fregs_ptr: Value,
+    /// The arena, or with a paged layout the page cache's entries.
     arena: Value,
     labels: HashMap<u64, Block>,
     /// Position in the region's instruction list of the instruction being
@@ -812,7 +828,14 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
             |b: &mut FunctionBuilder<'_>, off: i32| b.ins().load(I64, host_flags(), state, off);
         let regs_ptr = ld(&mut b, JitState::OFFSET_REGS);
         let fregs_ptr = ld(&mut b, JitState::OFFSET_FREGS);
-        let arena = ld(&mut b, JitState::OFFSET_ARENA);
+        let arena = ld(
+            &mut b,
+            if layout.paged {
+                JitState::OFFSET_PAGES
+            } else {
+                JitState::OFFSET_ARENA
+            },
+        );
         for (n, (&u, &var)) in used.iter().zip(&regs).enumerate() {
             if u {
                 let v = b.ins().load(I64, host_flags(), regs_ptr, (n * 8) as i32);
@@ -1280,8 +1303,12 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
     /// The check covers the accesses through `rs1` later in the run as well
     /// (see [`Self::check_span`] and the module documentation); one that an
     /// earlier check covers has none of its own.
-    fn guest_addr(&mut self, rs1: u32, imm: i64, write: bool, pc: u64) -> Value {
+    fn guest_addr(&mut self, rs1: u32, imm: i64, width: u8, write: bool, pc: u64) -> Value {
         let base = self.reg(rs1);
+        if self.layout.paged {
+            let addr = self.b.ins().iadd_imm_s(base, imm);
+            return self.paged_addr(addr, width, write, pc);
+        }
         let mask = self.layout.mask;
         if mask != 0 {
             let addr = self.b.ins().iadd_imm_s(base, imm);
@@ -1369,6 +1396,103 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
         self.b.ins().iadd(self.arena, addr)
     }
 
+    /// The host address of the `width`-byte access at `addr` with a paged
+    /// layout (C++ asmjit `emit_page_cache_probe`): entry `(addr >> 12) %
+    /// N` of the page cache's load or store half, which hits when `addr -
+    /// vbase <= PAGE_SIZE - width`, both another page and an access across
+    /// the page's end being a miss. A miss calls the host to fill the
+    /// entry (`JitState::page_fill`) and probes again; when that cannot
+    /// help, or the second probe misses too, the interpreter takes over at
+    /// the instruction at `pc`, as after a failed arena check.
+    ///
+    /// Spectre v1: the offset added to the entry's host address goes
+    /// through a conditional move on the probe's comparison, so a
+    /// mispredicted probe touches the first bytes of the page the entry
+    /// holds (every entry holds one, empty entries a static page).
+    fn paged_addr(&mut self, addr: Value, width: u8, write: bool, pc: u64) -> Value {
+        let hit = self.b.create_block();
+        self.b.append_block_param(hit, I64);
+        let first = self.page_probe(addr, width, write);
+        let fill = self.b.create_block();
+        self.b.set_cold_block(fill);
+        let (miss, host) = first;
+        self.b.ins().brif(miss, fill, &[], hit, &args(&[host]));
+
+        self.b.switch_to_block(fill);
+        let st = self.state;
+        let page_fill = self
+            .b
+            .ins()
+            .load(I64, host_flags(), st, JitState::OFFSET_PAGE_FILL);
+        let arg = self
+            .b
+            .ins()
+            .iconst(I64, i64::from(width) | i64::from(write) << 8);
+        let zero = self.b.ins().iconst(I64, 0);
+        let call = self
+            .b
+            .ins()
+            .call_indirect(self.host_sig, page_fill, &[st, addr, arg, zero]);
+        let leave = self.b.inst_results(call).first().copied();
+        let again = self.b.create_block();
+        self.b.set_cold_block(again);
+        if let Some(leave) = leave {
+            self.exit_if(leave, EXIT_SLOW, ExitPc::Const(pc));
+        }
+        self.b.ins().jump(again, &[]);
+        self.b.switch_to_block(again);
+        let (miss, host) = self.page_probe(addr, width, write);
+        self.exit_if(miss, EXIT_SLOW, ExitPc::Const(pc));
+        self.b.ins().jump(hit, &args(&[host]));
+
+        self.b.switch_to_block(hit);
+        self.b.block_params(hit).first().copied().unwrap_or(addr)
+    }
+
+    /// One page cache probe for [`Self::paged_addr`]: `(miss, host
+    /// address)`, the address only valid without a miss.
+    fn page_probe(&mut self, addr: Value, width: u8, write: bool) -> (Value, Value) {
+        use libriscv_jit_rt::{PAGE_CACHE_ENTRIES, PAGE_CACHE_ENTRY_SHIFT, PAGE_SIZE};
+        // (addr >> 12) % N * sizeof(entry), straight from the address.
+        let shift = PAGE_SIZE.trailing_zeros() - PAGE_CACHE_ENTRY_SHIFT;
+        let index = self.b.ins().ushr_imm_s(addr, i64::from(shift));
+        let index = self.b.ins().band_imm_s(
+            index,
+            ((PAGE_CACHE_ENTRIES as i64) - 1) << PAGE_CACHE_ENTRY_SHIFT,
+        );
+        let entry = self.b.ins().iadd(self.arena, index);
+        let half = if write {
+            libriscv_jit_rt::PAGE_CACHE_STORES
+        } else {
+            0
+        };
+        let vbase = self.b.ins().load(
+            I64,
+            host_flags(),
+            entry,
+            half + libriscv_jit_rt::PageCacheEntry::OFFSET_VBASE,
+        );
+        let page = self.b.ins().load(
+            I64,
+            host_flags(),
+            entry,
+            half + libriscv_jit_rt::PageCacheEntry::OFFSET_HOST,
+        );
+        let offset = self.b.ins().isub(addr, vbase);
+        let miss = self.b.ins().icmp_imm_s(
+            IntCC::UnsignedGreaterThan,
+            offset,
+            (PAGE_SIZE - u64::from(width)) as i64,
+        );
+        let offset = if self.layout.unguarded {
+            offset
+        } else {
+            let zero = self.b.ins().iconst(I64, 0);
+            self.b.ins().select_spectre_guard(miss, zero, offset)
+        };
+        (miss, self.b.ins().iadd(page, offset))
+    }
+
     /// The offset spans `(lo, hi)` of the loads and of the stores through
     /// `rs1` from the instruction at `self.pos` to the end of its
     /// straight-line run (the next label, or an instruction that does not
@@ -1452,7 +1576,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs1,
                 imm,
             } => {
-                let host = self.guest_addr(rs1, imm, false, ins.pc);
+                let host = self.guest_addr(rs1, imm, width, false, ins.pc);
                 if let Some(rd) = rd {
                     let v = self.load(width, signed, host);
                     self.set_reg(rd, v);
@@ -1465,7 +1589,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 imm,
             } => {
                 let value = self.reg(rs2);
-                let host = self.guest_addr(rs1, imm, true, ins.pc);
+                let host = self.guest_addr(rs1, imm, width, true, ins.pc);
                 self.store(width, value, host);
             }
             JOp::Branch {
@@ -1577,7 +1701,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 rs1,
                 imm,
             } => {
-                let host = self.guest_addr(rs1, imm, false, ins.pc);
+                let host = self.guest_addr(rs1, imm, width, false, ins.pc);
                 if width == 4 {
                     let w = self.b.ins().load(I32, guest_flags(), host, 0);
                     self.set_low_word(rd, w);
@@ -1593,7 +1717,7 @@ impl<'a, 'f> RegionEmitter<'a, 'f> {
                 imm,
             } => {
                 let value = self.freg(rs2);
-                let host = self.guest_addr(rs1, imm, true, ins.pc);
+                let host = self.guest_addr(rs1, imm, width, true, ins.pc);
                 self.store(width, value, host);
             }
             JOp::FBin {
